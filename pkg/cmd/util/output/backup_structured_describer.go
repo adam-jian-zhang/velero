@@ -21,13 +21,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
+	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/cacert"
@@ -54,6 +57,7 @@ func DescribeBackupInSF(
 
 		if backup.Spec.ResourcePolicy != nil {
 			DescribeResourcePoliciesInSF(d, backup.Spec.ResourcePolicy)
+			DescribeNamespaceScopedFilterPoliciesInSF(ctx, kbClient, d, backup)
 		}
 
 		status := backup.Status
@@ -220,6 +224,88 @@ func DescribeBackupSpecInSF(d *StructuredDescriber, spec velerov1api.BackupSpec)
 	}
 
 	d.Describe("spec", backupSpecInfo)
+}
+
+// DescribeNamespaceScopedFilterPoliciesInSF adds the clusterScopedFilterPolicy
+// and namespacedFilterPolicies sections to the structured describer output when present
+// in the ResourcePolicy ConfigMap referenced by the backup.
+func DescribeNamespaceScopedFilterPoliciesInSF(ctx context.Context, kbClient kbclient.Client, d *StructuredDescriber, backup *velerov1api.Backup) {
+	if backup.Spec.ResourcePolicy == nil {
+		return
+	}
+
+	discardLogger := logrus.New()
+	discardLogger.Out = io.Discard
+
+	resPolicies, err := resourcepolicies.GetResourcePoliciesFromBackup(*backup, kbClient, discardLogger)
+	if err != nil || resPolicies == nil {
+		return
+	}
+
+	fgPolicy := resPolicies.GetClusterScopedFilterPolicy()
+	if fgPolicy != nil {
+		var fgFilters []map[string]any
+		for _, rf := range fgPolicy.ResourceFilters {
+			entry := map[string]any{
+				"kinds": rf.Kinds,
+			}
+			if len(rf.LabelSelector) > 0 {
+				entry["labelSelector"] = rf.LabelSelector
+			}
+			if len(rf.OrLabelSelectors) > 0 {
+				entry["orLabelSelectors"] = rf.OrLabelSelectors
+			}
+			if len(rf.Names) > 0 {
+				entry["names"] = rf.Names
+			}
+			if len(rf.ExcludedNames) > 0 {
+				entry["excludedNames"] = rf.ExcludedNames
+			}
+			fgFilters = append(fgFilters, entry)
+		}
+		d.Describe("clusterScopedFilterPolicy", map[string]any{
+			"resourceFilters": fgFilters,
+		})
+	}
+
+	nfPolicies := resPolicies.GetNamespacedFilterPolicies()
+	if len(nfPolicies) == 0 {
+		return
+	}
+
+	var structuredPolicies []map[string]any
+	for _, policy := range nfPolicies {
+		for _, ns := range policy.Namespaces {
+			var rfEntries []map[string]any
+			for _, rf := range policy.ResourceFilters {
+				entry := map[string]any{}
+				if rf.IsCatchAll() {
+					entry["kinds"] = []string{}
+					entry["isCatchAll"] = true
+				} else {
+					entry["kinds"] = rf.Kinds
+				}
+				if len(rf.LabelSelector) > 0 {
+					entry["labelSelector"] = rf.LabelSelector
+				}
+				if len(rf.OrLabelSelectors) > 0 {
+					entry["orLabelSelectors"] = rf.OrLabelSelectors
+				}
+				if len(rf.Names) > 0 {
+					entry["names"] = rf.Names
+				}
+				if len(rf.ExcludedNames) > 0 {
+					entry["excludedNames"] = rf.ExcludedNames
+				}
+				rfEntries = append(rfEntries, entry)
+			}
+			structuredPolicies = append(structuredPolicies, map[string]any{
+				"namespace":       ns,
+				"resourceFilters": rfEntries,
+			})
+		}
+	}
+	d.Describe("namespacedFilterPolicies", structuredPolicies)
 }
 
 // DescribeBackupStatusInSF describes a backup status in structured format.

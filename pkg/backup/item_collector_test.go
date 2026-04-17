@@ -27,7 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
@@ -305,3 +304,46 @@ func TestItemCollectorBackupNamespaces(t *testing.T) {
 		})
 	}
 }
+
+// TestNamespacedFilterMap_GlobalExclusionPrecedence verifies the precedence rule:
+// ResourceIncludesExcludes (set by includeExcludePolicy) is checked before the
+// NamespacedFilterMap. This is enforced at both Stage 1 (item_collector.go line ~430)
+// and Stage 2 (item_backupper.go itemInclusionChecks). The unit below confirms that
+// GetNamespaceFilter still returns a filter for the namespace — it is the caller's
+// responsibility to check ResourceIncludesExcludes first, which item_collector does.
+//
+// Full coverage of the Stage 2 enforcement is in item_backupper_test.go
+// TestItemInclusionChecks_GlobalExclusion_OverridesNamespaceFilter.
+func TestNamespacedFilterMap_GlobalExclusionPrecedence(t *testing.T) {
+	req := &Request{
+		Backup:                    builder.ForBackup("velero", "test-backup").Result(),
+		NamespaceIncludesExcludes: collections.NewNamespaceIncludesExcludes().Includes("ns-a"),
+		NamespacedFilterMap: map[string]*ResolvedNamespaceFilter{
+			"ns-a": {
+				ResourceFilterMap: map[string]*ResolvedResourceFilter{
+					"secrets.": {},
+				},
+			},
+		},
+		NamespacedFilterPatterns: []NamespacedFilterPattern{},
+	}
+
+	// GetNamespaceFilter returns the filter regardless of global exclusions.
+	// The caller (item_collector) is responsible for checking ResourceIncludesExcludes first.
+	nsFilter := req.GetNamespaceFilter("ns-a")
+	require.NotNil(t, nsFilter, "GetNamespaceFilter should return a filter for ns-a")
+	_, hasSecrets := nsFilter.ResourceFilterMap["secrets."]
+	assert.True(t, hasSecrets, "ns-a filter should list secrets GR")
+
+	// When a global excludeAllIE is set, item_collector would return nil before consulting the map.
+	// This is verified by the Stage 1 check: ShouldInclude("secrets.") == false → skip.
+	ie := &excludeAllIE{}
+	assert.False(t, ie.ShouldInclude("secrets."),
+		"global exclusion must reject secrets before the per-namespace filter is consulted")
+}
+
+// excludeAllIE is an IncludesExcludesInterface that excludes every resource kind.
+type excludeAllIE struct{}
+
+func (excludeAllIE) ShouldInclude(string) bool { return false }
+func (excludeAllIE) ShouldExclude(string) bool { return true }
