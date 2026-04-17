@@ -142,6 +142,21 @@ func (ib *itemBackupper) itemInclusionChecks(log logrus.FieldLogger, mustInclude
 			log.Info("Excluding item because resource is excluded")
 			return false
 		}
+
+		// Per-kind name filter from ResourcePolicy namespace filter
+		if nsFilter := ib.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
+			rf := nsFilter.ResourceFilterMap[groupResource.String()]
+			if rf == nil {
+				rf = nsFilter.CatchAllFilter
+			}
+			if rf != nil && rf.NameIE != nil {
+				if !rf.NameIE.ShouldInclude(metadata.GetName()) {
+					log.Infof("Excluding item: name does not match resource filter for kind %s",
+						groupResource)
+					return false
+				}
+			}
+		}
 	}
 
 	if metadata.GetDeletionTimestamp() != nil {
