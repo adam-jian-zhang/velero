@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
@@ -43,6 +44,7 @@ import (
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	"github.com/vmware-tanzu/velero/internal/volumehelper"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -331,6 +333,20 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 			srie.CombineWithPolicy(backupRequest.ResPolicies.GetIncludeExcludePolicy())
 		}
 		backupRequest.ResourceIncludesExcludes = srie
+	}
+
+	if backupRequest.ResPolicies != nil {
+		nfPolicies := backupRequest.ResPolicies.GetNamespacedFilterPolicies()
+		if len(nfPolicies) > 0 {
+		backupRequest.NamespacedFilterMap, backupRequest.NamespacedFilterPatterns, err = resolveNamespacedFilterPolicies(
+			nfPolicies,
+			kb.discoveryHelper,
+			log,
+		)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	log.Infof("Backing up all volumes using pod volume backup: %t", boolptr.IsSetToTrue(backupRequest.Backup.Spec.DefaultVolumesToFsBackup))
@@ -1321,4 +1337,88 @@ func putVolumeInfos(
 	}
 
 	return backupStore.PutBackupVolumeInfos(backupName, backupVolumeInfoBuf)
+}
+
+func resolveNamespacedFilterPolicies(
+	policies []resourcepolicies.NamespacedFilterPolicy,
+	helper discovery.Helper,
+	log logrus.FieldLogger,
+) (map[string]*ResolvedNamespaceFilter, []string, error) {
+	result := make(map[string]*ResolvedNamespaceFilter)
+	var patternOrder []string
+
+	for _, policy := range policies {
+		rfMap := make(map[string]*ResolvedResourceFilter)
+		var nsFilter *ResolvedNamespaceFilter
+
+		for _, rf := range policy.ResourceFilters {
+			// Resolve label selector with validation
+			var selector labels.Selector
+			if len(rf.LabelSelector) > 0 {
+				var err error
+				selector, err = labels.ValidatedSelectorFromSet(labels.Set(rf.LabelSelector))
+				if err != nil {
+					return nil, nil, fmt.Errorf("invalid label selector in resource filter: %w", err)
+				}
+			}
+
+			// Resolve OR label selectors with validation
+			var orSelectors []labels.Selector
+			for _, ols := range rf.OrLabelSelectors {
+				s, err := labels.ValidatedSelectorFromSet(labels.Set(ols))
+				if err != nil {
+					return nil, nil, fmt.Errorf("invalid OR label selector in resource filter: %w", err)
+				}
+				orSelectors = append(orSelectors, s)
+			}
+
+			// Resolve name includes/excludes using existing collections infrastructure
+			var nameIE *collections.IncludesExcludes
+			if len(rf.Names) > 0 || len(rf.ExcludedNames) > 0 {
+				nameIE = collections.NewIncludesExcludes()
+				nameIE.Includes(rf.Names...)
+				nameIE.Excludes(rf.ExcludedNames...)
+			}
+
+			resolved := &ResolvedResourceFilter{
+				LabelSelector:    selector,
+				OrLabelSelectors: orSelectors,
+				NameIE:           nameIE,
+			}
+
+			if len(rf.Kinds) == 0 {
+				if nsFilter == nil {
+					nsFilter = &ResolvedNamespaceFilter{ResourceFilterMap: rfMap}
+				}
+				nsFilter.CatchAllFilter = resolved
+			} else {
+				// Resolve each kind to a fully-qualified group-resource string with improved error handling
+				for _, kind := range rf.Kinds {
+					gr, _, err := helper.ResourceFor(
+						schema.GroupVersionResource{Resource: kind},
+					)
+					if err != nil {
+						// Log warning but continue - allows for forward compatibility
+						log.WithField("kind", kind).Warnf(
+							"Cannot resolve kind via discovery, using as-is: %v", err)
+						rfMap[kind] = resolved
+						continue
+					}
+					rfMap[gr.GroupResource().String()] = resolved
+				}
+			}
+		}
+
+		if nsFilter == nil {
+			nsFilter = &ResolvedNamespaceFilter{ResourceFilterMap: rfMap}
+		} else {
+			nsFilter.ResourceFilterMap = rfMap
+		}
+		for _, nsPattern := range policy.Namespaces {
+			result[nsPattern] = nsFilter
+			// Preserve pattern order for first-match semantics
+			patternOrder = append(patternOrder, nsPattern)
+		}
+	}
+	return result, patternOrder, nil
 }
