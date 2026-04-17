@@ -588,6 +588,11 @@ func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *vel
 		request.Status.ValidationErrors = append(request.Status.ValidationErrors, "include-resources, exclude-resources and include-cluster-resources are old filter parameters.\n"+
 			"They cannot be used with include-exclude policies.")
 	}
+	// namespacedFilterPolicies incompatible with old-style filters
+	if resourcePolicies != nil && len(resourcePolicies.GetNamespacedFilterPolicies()) > 0 && collections.UseOldResourceFilters(request.Spec) {
+		request.Status.ValidationErrors = append(request.Status.ValidationErrors, "include-resources, exclude-resources and include-cluster-resources are old filter parameters.\n"+
+			"They cannot be used with namespace-scoped filter policies.")
+	}
 	request.ResPolicies = resourcePolicies
 	return request
 }
