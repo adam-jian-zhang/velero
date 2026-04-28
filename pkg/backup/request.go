@@ -89,10 +89,14 @@ type Request struct {
 	VolumesInformation        volume.BackupVolumesInformation
 	WorkerPool                *ItemBlockWorkerPool
 
+	// ClusterScopedFilterMap holds resolved global filters for cluster-scoped resources.
+	// Key is the resolved group-resource string.
+	ClusterScopedFilterMap map[string]*ResolvedResourceFilter
+
 	// NamespacedFilterMap holds resolved per-namespace filters.
 	// Key is either an exact namespace name or a glob pattern.
 	NamespacedFilterMap map[string]*ResolvedNamespaceFilter
-	
+
 	// NamespacedFilterPatterns preserves the order of patterns for first-match semantics
 	NamespacedFilterPatterns []string
 }
@@ -140,12 +144,12 @@ func (r *Request) GetNamespaceFilter(namespace string) *ResolvedNamespaceFilter 
 	if r.NamespacedFilterMap == nil {
 		return nil
 	}
-	
+
 	// First check for exact match
 	if f, ok := r.NamespacedFilterMap[namespace]; ok {
 		return f
 	}
-	
+
 	// Then check patterns in order for first-match semantics
 	for _, pattern := range r.NamespacedFilterPatterns {
 		g, err := glob.Compile(pattern)

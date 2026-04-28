@@ -462,6 +462,13 @@ func (r *itemCollector) getResourceItems(
 	}
 
 	clusterScoped := !resource.Namespaced
+	if clusterScoped && r.backupRequest.ClusterScopedFilterMap != nil {
+		if _, ok := r.backupRequest.ClusterScopedFilterMap[gr.String()]; !ok {
+			log.Debugf("Skipping cluster-scoped resource %s: not in fineGrainedGlobalFilterPolicy resourceFilters", gr)
+			return nil, nil
+		}
+	}
+
 	namespacesToList := getNamespacesToList(r.backupRequest.NamespaceIncludesExcludes)
 
 	// If we get here, we're backing up something other than namespaces
@@ -541,7 +548,19 @@ func (r *itemCollector) listResourceByLabelsPerNamespace(
 	var orLabelSelectors []string
 	var labelSelector string
 
-	if nsFilter := r.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
+	if !resource.Namespaced && r.backupRequest.ClusterScopedFilterMap != nil {
+		rf := r.backupRequest.ClusterScopedFilterMap[gr.String()]
+		if rf != nil {
+			if rf.LabelSelector != nil {
+				labelSelector = rf.LabelSelector.String()
+			}
+			if len(rf.OrLabelSelectors) > 0 {
+				for _, s := range rf.OrLabelSelectors {
+					orLabelSelectors = append(orLabelSelectors, s.String())
+				}
+			}
+		}
+	} else if nsFilter := r.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
 		rf := nsFilter.ResourceFilterMap[gr.String()]
 		if rf == nil {
 			rf = nsFilter.CatchAllFilter

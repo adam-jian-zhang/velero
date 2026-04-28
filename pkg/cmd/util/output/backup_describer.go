@@ -156,6 +156,43 @@ func DescribeNamespaceScopedFilterPolicies(ctx context.Context, kbClient kbclien
 		return
 	}
 
+	fgPolicy := resourcePolicies.GetFineGrainedGlobalFilterPolicy()
+	if fgPolicy != nil {
+		d.Printf("\nFine-Grained Global Filter Policy:\n")
+		d.Printf("  Resource Filters:\n")
+		for _, rf := range fgPolicy.ResourceFilters {
+			kindsStr := strings.Join(rf.Kinds, ", ")
+			d.Printf("    %s:\n", kindsStr)
+
+			// Label selector
+			if len(rf.LabelSelector) > 0 {
+				selectorStr := formatLabelMap(rf.LabelSelector)
+				d.Printf("      Label selector:     %s\n", selectorStr)
+			} else if len(rf.OrLabelSelectors) > 0 {
+				var orStrs []string
+				for _, ols := range rf.OrLabelSelectors {
+					orStrs = append(orStrs, formatLabelMap(ols))
+				}
+				d.Printf("      OR label selectors: [%s]\n", strings.Join(orStrs, ", "))
+			} else {
+				d.Printf("      Label selector:     <none>\n")
+			}
+
+			// Name patterns
+			if len(rf.Names) > 0 {
+				d.Printf("      Included names:     [%s]\n", strings.Join(rf.Names, ", "))
+			} else {
+				d.Printf("      Included names:     <none>\n")
+			}
+
+			if len(rf.ExcludedNames) > 0 {
+				d.Printf("      Excluded names:     [%s]\n", strings.Join(rf.ExcludedNames, ", "))
+			} else {
+				d.Printf("      Excluded names:     <none>\n")
+			}
+		}
+	}
+
 	nfPolicies := resourcePolicies.GetNamespacedFilterPolicies()
 	if len(nfPolicies) > 0 {
 		d.Printf("\nNamespace-Scoped Filter Policies:\n")

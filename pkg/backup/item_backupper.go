@@ -144,16 +144,28 @@ func (ib *itemBackupper) itemInclusionChecks(log logrus.FieldLogger, mustInclude
 		}
 
 		// Per-kind name filter from ResourcePolicy namespace filter
-		if nsFilter := ib.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
-			rf := nsFilter.ResourceFilterMap[groupResource.String()]
-			if rf == nil {
-				rf = nsFilter.CatchAllFilter
+		if namespace != "" {
+			if nsFilter := ib.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
+				rf := nsFilter.ResourceFilterMap[groupResource.String()]
+				if rf == nil {
+					rf = nsFilter.CatchAllFilter
+				}
+				if rf != nil && rf.NameIE != nil {
+					if !rf.NameIE.ShouldInclude(metadata.GetName()) {
+						log.Infof("Excluding item: name does not match resource filter for kind %s",
+							groupResource)
+						return false
+					}
+				}
 			}
-			if rf != nil && rf.NameIE != nil {
-				if !rf.NameIE.ShouldInclude(metadata.GetName()) {
-					log.Infof("Excluding item: name does not match resource filter for kind %s",
-						groupResource)
-					return false
+		} else {
+			// Cluster-scoped resource name filter
+			if ib.backupRequest.ClusterScopedFilterMap != nil {
+				if rf, ok := ib.backupRequest.ClusterScopedFilterMap[groupResource.String()]; ok && rf.NameIE != nil {
+					if !rf.NameIE.ShouldInclude(metadata.GetName()) {
+						log.Infof("Excluding item: name does not match fineGrainedGlobalFilterPolicy for kind %s", groupResource)
+						return false
+					}
 				}
 			}
 		}
