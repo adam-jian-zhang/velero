@@ -336,13 +336,25 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 	}
 
 	if backupRequest.ResPolicies != nil {
+		fgPolicy := backupRequest.ResPolicies.GetFineGrainedGlobalFilterPolicy()
+		if fgPolicy != nil {
+			backupRequest.ClusterScopedFilterMap, err = resolveClusterScopedFilterPolicy(
+				fgPolicy,
+				kb.discoveryHelper,
+				log,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
 		nfPolicies := backupRequest.ResPolicies.GetNamespacedFilterPolicies()
 		if len(nfPolicies) > 0 {
-		backupRequest.NamespacedFilterMap, backupRequest.NamespacedFilterPatterns, err = resolveNamespacedFilterPolicies(
-			nfPolicies,
-			kb.discoveryHelper,
-			log,
-		)
+			backupRequest.NamespacedFilterMap, backupRequest.NamespacedFilterPatterns, err = resolveNamespacedFilterPolicies(
+				nfPolicies,
+				kb.discoveryHelper,
+				log,
+			)
 			if err != nil {
 				return err
 			}
@@ -1339,6 +1351,69 @@ func putVolumeInfos(
 	return backupStore.PutBackupVolumeInfos(backupName, backupVolumeInfoBuf)
 }
 
+func resolveClusterScopedFilterPolicy(
+	policy *resourcepolicies.FineGrainedGlobalFilterPolicy,
+	helper discovery.Helper,
+	log logrus.FieldLogger,
+) (map[string]*ResolvedResourceFilter, error) {
+	rfMap := make(map[string]*ResolvedResourceFilter)
+
+	for _, rf := range policy.ResourceFilters {
+		resolved, err := resolveResourceFilter(rf)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, kind := range rf.Kinds {
+			gr, _, err := helper.ResourceFor(
+				schema.GroupVersionResource{Resource: kind},
+			)
+			if err != nil {
+				log.WithField("kind", kind).Warnf(
+					"Cannot resolve kind via discovery, using as-is: %v", err)
+				rfMap[kind] = resolved
+				continue
+			}
+			rfMap[gr.GroupResource().String()] = resolved
+		}
+	}
+
+	return rfMap, nil
+}
+
+func resolveResourceFilter(rf resourcepolicies.ResourceFilter) (*ResolvedResourceFilter, error) {
+	var selector labels.Selector
+	if len(rf.LabelSelector) > 0 {
+		var err error
+		selector, err = labels.ValidatedSelectorFromSet(labels.Set(rf.LabelSelector))
+		if err != nil {
+			return nil, fmt.Errorf("invalid label selector in resource filter: %w", err)
+		}
+	}
+
+	var orSelectors []labels.Selector
+	for _, ols := range rf.OrLabelSelectors {
+		s, err := labels.ValidatedSelectorFromSet(labels.Set(ols))
+		if err != nil {
+			return nil, fmt.Errorf("invalid OR label selector in resource filter: %w", err)
+		}
+		orSelectors = append(orSelectors, s)
+	}
+
+	var nameIE *collections.IncludesExcludes
+	if len(rf.Names) > 0 || len(rf.ExcludedNames) > 0 {
+		nameIE = collections.NewIncludesExcludes()
+		nameIE.Includes(rf.Names...)
+		nameIE.Excludes(rf.ExcludedNames...)
+	}
+
+	return &ResolvedResourceFilter{
+		LabelSelector:    selector,
+		OrLabelSelectors: orSelectors,
+		NameIE:           nameIE,
+	}, nil
+}
+
 func resolveNamespacedFilterPolicies(
 	policies []resourcepolicies.NamespacedFilterPolicy,
 	helper discovery.Helper,
@@ -1352,38 +1427,9 @@ func resolveNamespacedFilterPolicies(
 		var nsFilter *ResolvedNamespaceFilter
 
 		for _, rf := range policy.ResourceFilters {
-			// Resolve label selector with validation
-			var selector labels.Selector
-			if len(rf.LabelSelector) > 0 {
-				var err error
-				selector, err = labels.ValidatedSelectorFromSet(labels.Set(rf.LabelSelector))
-				if err != nil {
-					return nil, nil, fmt.Errorf("invalid label selector in resource filter: %w", err)
-				}
-			}
-
-			// Resolve OR label selectors with validation
-			var orSelectors []labels.Selector
-			for _, ols := range rf.OrLabelSelectors {
-				s, err := labels.ValidatedSelectorFromSet(labels.Set(ols))
-				if err != nil {
-					return nil, nil, fmt.Errorf("invalid OR label selector in resource filter: %w", err)
-				}
-				orSelectors = append(orSelectors, s)
-			}
-
-			// Resolve name includes/excludes using existing collections infrastructure
-			var nameIE *collections.IncludesExcludes
-			if len(rf.Names) > 0 || len(rf.ExcludedNames) > 0 {
-				nameIE = collections.NewIncludesExcludes()
-				nameIE.Includes(rf.Names...)
-				nameIE.Excludes(rf.ExcludedNames...)
-			}
-
-			resolved := &ResolvedResourceFilter{
-				LabelSelector:    selector,
-				OrLabelSelectors: orSelectors,
-				NameIE:           nameIE,
+			resolved, err := resolveResourceFilter(rf)
+			if err != nil {
+				return nil, nil, err
 			}
 
 			if len(rf.Kinds) == 0 {
