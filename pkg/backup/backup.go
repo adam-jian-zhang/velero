@@ -26,9 +26,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/gobwas/glob"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
@@ -353,6 +355,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 			backupRequest.NamespacedFilterMap, backupRequest.NamespacedFilterPatterns, err = resolveNamespacedFilterPolicies(
 				nfPolicies,
 				kb.discoveryHelper,
+				kb.kbClient,
 				log,
 			)
 			if err != nil {
@@ -1417,14 +1420,21 @@ func resolveResourceFilter(rf resourcepolicies.ResourceFilter) (*ResolvedResourc
 func resolveNamespacedFilterPolicies(
 	policies []resourcepolicies.NamespacedFilterPolicy,
 	helper discovery.Helper,
+	kubeClient kbclient.Client,
 	log logrus.FieldLogger,
 ) (map[string]*ResolvedNamespaceFilter, []string, error) {
 	result := make(map[string]*ResolvedNamespaceFilter)
 	var patternOrder []string
 
+	// 1. Fetch all namespaces once for label evaluation
+	allNamespaces := &corev1api.NamespaceList{}
+	err := kubeClient.List(context.Background(), allNamespaces)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to list namespaces for label resolution: %w", err)
+	}
+
 	for _, policy := range policies {
 		rfMap := make(map[string]*ResolvedResourceFilter)
-		var nsFilter *ResolvedNamespaceFilter
 
 		for _, rf := range policy.ResourceFilters {
 			resolved, err := resolveResourceFilter(rf)
@@ -1432,38 +1442,73 @@ func resolveNamespacedFilterPolicies(
 				return nil, nil, err
 			}
 
-			if len(rf.Kinds) == 0 {
-				if nsFilter == nil {
-					nsFilter = &ResolvedNamespaceFilter{ResourceFilterMap: rfMap}
+			// Resolve each kind to a fully-qualified group-resource string with improved error handling
+			for _, kind := range rf.Kinds {
+				gr, _, err := helper.ResourceFor(
+					schema.GroupVersionResource{Resource: kind},
+				)
+				if err != nil {
+					// Log warning but continue - allows for forward compatibility
+					log.WithField("kind", kind).Warnf(
+						"Cannot resolve kind via discovery, using as-is: %v", err)
+					rfMap[kind] = resolved
+					continue
 				}
-				nsFilter.CatchAllFilter = resolved
-			} else {
-				// Resolve each kind to a fully-qualified group-resource string with improved error handling
-				for _, kind := range rf.Kinds {
-					gr, _, err := helper.ResourceFor(
-						schema.GroupVersionResource{Resource: kind},
-					)
-					if err != nil {
-						// Log warning but continue - allows for forward compatibility
-						log.WithField("kind", kind).Warnf(
-							"Cannot resolve kind via discovery, using as-is: %v", err)
-						rfMap[kind] = resolved
-						continue
-					}
-					rfMap[gr.GroupResource().String()] = resolved
-				}
+				rfMap[gr.GroupResource().String()] = resolved
 			}
 		}
 
-		if nsFilter == nil {
-			nsFilter = &ResolvedNamespaceFilter{ResourceFilterMap: rfMap}
-		} else {
-			nsFilter.ResourceFilterMap = rfMap
+		nsFilter := &ResolvedNamespaceFilter{
+			ResourceFilterMap: rfMap,
+			Empty:             len(policy.ResourceFilters) == 0,
+			SkipEntirely:      strings.EqualFold(policy.Action, "Skip"),
 		}
-		for _, nsPattern := range policy.Namespaces {
-			result[nsPattern] = nsFilter
-			// Preserve pattern order for first-match semantics
-			patternOrder = append(patternOrder, nsPattern)
+
+		var includeSelector, excludeSelector labels.Selector
+		if len(policy.NamespaceLabelSelector) > 0 {
+			includeSelector = labels.SelectorFromSet(labels.Set(policy.NamespaceLabelSelector))
+		}
+		if len(policy.ExcludedNamespaceLabelSelector) > 0 {
+			excludeSelector = labels.SelectorFromSet(labels.Set(policy.ExcludedNamespaceLabelSelector))
+		}
+
+		// We need to build the final list of namespaces that match this policy
+		var matchedNamespaces []string
+
+		// Find all namespaces that match either the explicit patterns or the include label selector
+		for _, ns := range allNamespaces.Items {
+			// 1. Check exclusion first - if it matches exclude label, skip entirely
+			if excludeSelector != nil && excludeSelector.Matches(labels.Set(ns.Labels)) {
+				continue
+			}
+
+			// 2. Check if it matches inclusion label
+			matchesIncludeLabel := includeSelector != nil && includeSelector.Matches(labels.Set(ns.Labels))
+
+			// 3. Check if it matches any pattern in Namespaces
+			matchesPattern := false
+			for _, pattern := range policy.Namespaces {
+				g, err := glob.Compile(pattern)
+				if err == nil && g.Match(ns.Name) {
+					matchesPattern = true
+					break
+				}
+			}
+
+			// If it matches either inclusion criteria, add it
+			if matchesIncludeLabel || matchesPattern {
+				matchedNamespaces = append(matchedNamespaces, ns.Name)
+			}
+		}
+
+		// Store in the result map (preserving first-match semantics)
+		for _, nsName := range matchedNamespaces {
+			// Only add if it hasn't been claimed by a previous policy in the YAML
+			if _, exists := result[nsName]; !exists {
+				result[nsName] = nsFilter
+				// Preserve exact name order for first-match semantics
+				patternOrder = append(patternOrder, nsName)
+			}
 		}
 	}
 	return result, patternOrder, nil

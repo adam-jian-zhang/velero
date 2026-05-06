@@ -19,7 +19,6 @@ package backup
 import (
 	"sync"
 
-	"github.com/gobwas/glob"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
@@ -49,7 +48,8 @@ type ResolvedResourceFilter struct {
 // ResourceFilterMap is keyed by the resolved group-resource string.
 type ResolvedNamespaceFilter struct {
 	ResourceFilterMap map[string]*ResolvedResourceFilter
-	CatchAllFilter    *ResolvedResourceFilter
+	Empty             bool
+	SkipEntirely      bool
 }
 
 type SynchronizedVSList struct {
@@ -145,17 +145,5 @@ func (r *Request) GetNamespaceFilter(namespace string) *ResolvedNamespaceFilter 
 		return nil
 	}
 
-	// First check for exact match
-	if f, ok := r.NamespacedFilterMap[namespace]; ok {
-		return f
-	}
-
-	// Then check patterns in order for first-match semantics
-	for _, pattern := range r.NamespacedFilterPatterns {
-		g, err := glob.Compile(pattern)
-		if err == nil && g.Match(namespace) {
-			return r.NamespacedFilterMap[pattern]
-		}
-	}
-	return nil
+	return r.NamespacedFilterMap[namespace]
 }

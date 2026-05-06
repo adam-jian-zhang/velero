@@ -481,11 +481,16 @@ func (r *itemCollector) getResourceItems(
 	for _, namespace := range namespacesToList {
 		// Check per-namespace resource type filter from ResourcePolicy
 		if nsFilter := r.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
-			_, hasSpecific := nsFilter.ResourceFilterMap[gr.String()]
-			if !hasSpecific && nsFilter.CatchAllFilter == nil {
-				log.Debugf("Skipping resource %s in namespace %s: not in resourceFilters",
-					gr, namespace)
+			if nsFilter.SkipEntirely {
+				log.Debugf("Skipping namespace %s entirely due to action: Skip", namespace)
 				continue
+			}
+			if !nsFilter.Empty {
+				if _, ok := nsFilter.ResourceFilterMap[gr.String()]; !ok {
+					log.Debugf("Skipping resource %s in namespace %s: not in resourceFilters",
+						gr, namespace)
+					continue
+				}
 			}
 		}
 
@@ -561,17 +566,16 @@ func (r *itemCollector) listResourceByLabelsPerNamespace(
 			}
 		}
 	} else if nsFilter := r.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
-		rf := nsFilter.ResourceFilterMap[gr.String()]
-		if rf == nil {
-			rf = nsFilter.CatchAllFilter
-		}
-		if rf != nil {
-			if rf.LabelSelector != nil {
-				labelSelector = rf.LabelSelector.String()
-			}
-			if len(rf.OrLabelSelectors) > 0 {
-				for _, s := range rf.OrLabelSelectors {
-					orLabelSelectors = append(orLabelSelectors, s.String())
+		if !nsFilter.Empty {
+			rf := nsFilter.ResourceFilterMap[gr.String()]
+			if rf != nil {
+				if rf.LabelSelector != nil {
+					labelSelector = rf.LabelSelector.String()
+				}
+				if len(rf.OrLabelSelectors) > 0 {
+					for _, s := range rf.OrLabelSelectors {
+						orLabelSelectors = append(orLabelSelectors, s.String())
+					}
 				}
 			}
 		}

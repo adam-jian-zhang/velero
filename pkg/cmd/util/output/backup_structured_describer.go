@@ -21,13 +21,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/sirupsen/logrus"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/cacert"
@@ -54,6 +57,7 @@ func DescribeBackupInSF(
 
 		if backup.Spec.ResourcePolicy != nil {
 			DescribeResourcePoliciesInSF(d, backup.Spec.ResourcePolicy)
+			DescribeNamespaceScopedFilterPoliciesInSF(ctx, kbClient, d, backup)
 		}
 
 		status := backup.Status
@@ -611,6 +615,102 @@ func DescribeResourcePoliciesInSF(d *StructuredDescriber, resPolicies *corev1api
 	policiesInfo["type"] = resPolicies.Kind
 	policiesInfo["name"] = resPolicies.Name
 	d.Describe("resourcePolicies", policiesInfo)
+}
+
+// DescribeNamespaceScopedFilterPoliciesInSF describes namespace-scoped filter policies in structured format.
+func DescribeNamespaceScopedFilterPoliciesInSF(ctx context.Context, kbClient kbclient.Client, d *StructuredDescriber, backup *velerov1api.Backup) {
+	if backup.Spec.ResourcePolicy == nil {
+		return
+	}
+
+	// Create a discard logger for the resource policies function since this is CLI output context
+	discardLogger := logrus.New()
+	discardLogger.Out = io.Discard
+
+	resourcePolicies, err := resourcepolicies.GetResourcePoliciesFromBackup(*backup, kbClient, discardLogger)
+	if err != nil {
+		// Don't fail the describe if we can't read policies, just skip
+		return
+	}
+
+	if resourcePolicies == nil {
+		return
+	}
+
+	fgPolicy := resourcePolicies.GetFineGrainedGlobalFilterPolicy()
+	if fgPolicy != nil {
+		fgPolicyInfo := make(map[string]any)
+		resourceFilters := make([]map[string]any, 0)
+		for _, rf := range fgPolicy.ResourceFilters {
+			rfInfo := make(map[string]any)
+			rfInfo["kinds"] = rf.Kinds
+			if len(rf.LabelSelector) > 0 {
+				rfInfo["labelSelector"] = formatLabelMap(rf.LabelSelector)
+			} else if len(rf.OrLabelSelectors) > 0 {
+				var orStrs []string
+				for _, ols := range rf.OrLabelSelectors {
+					orStrs = append(orStrs, formatLabelMap(ols))
+				}
+				rfInfo["orLabelSelectors"] = orStrs
+			}
+			if len(rf.Names) > 0 {
+				rfInfo["includedNames"] = rf.Names
+			}
+			if len(rf.ExcludedNames) > 0 {
+				rfInfo["excludedNames"] = rf.ExcludedNames
+			}
+			resourceFilters = append(resourceFilters, rfInfo)
+		}
+		fgPolicyInfo["resourceFilters"] = resourceFilters
+		d.Describe("fineGrainedGlobalFilterPolicy", fgPolicyInfo)
+	}
+
+	nfPolicies := resourcePolicies.GetNamespacedFilterPolicies()
+	if len(nfPolicies) > 0 {
+		nfPoliciesInfo := make([]map[string]any, 0)
+		for _, policy := range nfPolicies {
+			policyInfo := make(map[string]any)
+			if len(policy.Namespaces) > 0 {
+				policyInfo["namespaces"] = policy.Namespaces
+			}
+			if policy.Action != "" {
+				policyInfo["action"] = policy.Action
+			}
+			if len(policy.NamespaceLabelSelector) > 0 {
+				policyInfo["namespaceLabelSelector"] = formatLabelMap(policy.NamespaceLabelSelector)
+			}
+			if len(policy.ExcludedNamespaceLabelSelector) > 0 {
+				policyInfo["excludedNamespaceLabelSelector"] = formatLabelMap(policy.ExcludedNamespaceLabelSelector)
+			}
+
+			if len(policy.ResourceFilters) > 0 {
+				resourceFilters := make([]map[string]any, 0)
+				for _, rf := range policy.ResourceFilters {
+					rfInfo := make(map[string]any)
+					rfInfo["kinds"] = rf.Kinds
+					if len(rf.LabelSelector) > 0 {
+						rfInfo["labelSelector"] = formatLabelMap(rf.LabelSelector)
+					} else if len(rf.OrLabelSelectors) > 0 {
+						var orStrs []string
+						for _, ols := range rf.OrLabelSelectors {
+							orStrs = append(orStrs, formatLabelMap(ols))
+						}
+						rfInfo["orLabelSelectors"] = orStrs
+					}
+					if len(rf.Names) > 0 {
+						rfInfo["includedNames"] = rf.Names
+					}
+					if len(rf.ExcludedNames) > 0 {
+						rfInfo["excludedNames"] = rf.ExcludedNames
+					}
+					resourceFilters = append(resourceFilters, rfInfo)
+				}
+				policyInfo["resourceFilters"] = resourceFilters
+			}
+			nfPoliciesInfo = append(nfPoliciesInfo, policyInfo)
+		}
+		d.Describe("namespaceScopedFilterPolicies", nfPoliciesInfo)
+	}
 }
 
 func describeResultInSF(m map[string]any, result results.Result) {

@@ -146,15 +146,18 @@ func (ib *itemBackupper) itemInclusionChecks(log logrus.FieldLogger, mustInclude
 		// Per-kind name filter from ResourcePolicy namespace filter
 		if namespace != "" {
 			if nsFilter := ib.backupRequest.GetNamespaceFilter(namespace); nsFilter != nil {
-				rf := nsFilter.ResourceFilterMap[groupResource.String()]
-				if rf == nil {
-					rf = nsFilter.CatchAllFilter
+				if nsFilter.SkipEntirely {
+					log.Infof("Excluding item: namespace %s is skipped entirely", namespace)
+					return false
 				}
-				if rf != nil && rf.NameIE != nil {
-					if !rf.NameIE.ShouldInclude(metadata.GetName()) {
-						log.Infof("Excluding item: name does not match resource filter for kind %s",
-							groupResource)
-						return false
+				if !nsFilter.Empty {
+					rf := nsFilter.ResourceFilterMap[groupResource.String()]
+					if rf != nil && rf.NameIE != nil {
+						if !rf.NameIE.ShouldInclude(metadata.GetName()) {
+							log.Infof("Excluding item: name does not match resource filter for kind %s",
+								groupResource)
+							return false
+						}
 					}
 				}
 			}

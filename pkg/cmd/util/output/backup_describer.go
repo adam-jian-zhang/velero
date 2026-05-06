@@ -196,9 +196,23 @@ func DescribeNamespaceScopedFilterPolicies(ctx context.Context, kbClient kbclien
 	nfPolicies := resourcePolicies.GetNamespacedFilterPolicies()
 	if len(nfPolicies) > 0 {
 		d.Printf("\nNamespace-Scoped Filter Policies:\n")
-		for _, policy := range nfPolicies {
-			for _, ns := range policy.Namespaces {
-				d.Printf("  %s:\n", ns)
+		for i, policy := range nfPolicies {
+			d.Printf("  Policy %d:\n", i+1)
+
+			if len(policy.Namespaces) > 0 {
+				d.Printf("    Namespaces: %s\n", strings.Join(policy.Namespaces, ", "))
+			}
+			if policy.Action != "" {
+				d.Printf("    Action: %s\n", policy.Action)
+			}
+			if len(policy.NamespaceLabelSelector) > 0 {
+				d.Printf("    Namespace label selector: %s\n", formatLabelMap(policy.NamespaceLabelSelector))
+			}
+			if len(policy.ExcludedNamespaceLabelSelector) > 0 {
+				d.Printf("    Excluded namespace label selector: %s\n", formatLabelMap(policy.ExcludedNamespaceLabelSelector))
+			}
+
+			if len(policy.ResourceFilters) > 0 {
 				d.Printf("    Resource Filters:\n")
 				for _, rf := range policy.ResourceFilters {
 					kindsStr := strings.Join(rf.Kinds, ", ")

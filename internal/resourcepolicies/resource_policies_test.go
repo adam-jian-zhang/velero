@@ -1289,23 +1289,62 @@ namespacedFilterPolicies:
 			wantErr: false,
 		},
 		{
-			name: "invalid - no namespaces",
+			name: "valid namespacedFilterPolicies with action Skip",
 			yamlData: `version: v1
 namespacedFilterPolicies:
-- namespaces: []
-  resourceFilters:
-  - kinds: ["Pod"]`,
-			wantErr: true,
-			errMsg: "at least one namespace must be specified",
+- namespaces: ["temp-*"]
+  action: Skip`,
+			wantErr: false,
 		},
 		{
-			name: "invalid - no resourceFilters",
+			name: "valid namespacedFilterPolicies with namespace label selectors",
+			yamlData: `version: v1
+namespacedFilterPolicies:
+- namespaceLabelSelector:
+    env: prod
+  excludedNamespaceLabelSelector:
+    skip: "true"
+  resourceFilters:
+  - kinds: ["Pod"]`,
+			wantErr: false,
+		},
+		{
+			name: "invalid - no namespaces and no namespaceLabelSelector",
+			yamlData: `version: v1
+namespacedFilterPolicies:
+- action: Skip`,
+			wantErr: true,
+			errMsg: "at least one of 'namespaces' or 'namespaceLabelSelector' must be specified",
+		},
+		{
+			name: "invalid - action with resourceFilters",
 			yamlData: `version: v1
 namespacedFilterPolicies:
 - namespaces: ["test"]
-  resourceFilters: []`,
+  action: Skip
+  resourceFilters:
+  - kinds: ["Pod"]`,
 			wantErr: true,
-			errMsg: "at least one resourceFilter must be specified",
+			errMsg: "resourceFilters must be empty when action is 'Skip'",
+		},
+		{
+			name: "invalid - invalid action",
+			yamlData: `version: v1
+namespacedFilterPolicies:
+- namespaces: ["test"]
+  action: Unknown`,
+			wantErr: true,
+			errMsg: "action must be either 'Include' or 'Skip'",
+		},
+		{
+			name: "invalid - invalid namespaceLabelSelector",
+			yamlData: `version: v1
+namespacedFilterPolicies:
+- namespaceLabelSelector:
+    "invalid label key!": "value"
+  action: Skip`,
+			wantErr: true,
+			errMsg: "invalid namespaceLabelSelector",
 		},
 		{
 			name: "invalid - multiple empty kinds",

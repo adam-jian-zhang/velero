@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/gobwas/glob"
@@ -72,8 +73,11 @@ type FineGrainedGlobalFilterPolicy struct {
 
 // NamespacedFilterPolicy defines backup filters scoped to specific namespaces.
 type NamespacedFilterPolicy struct {
-	Namespaces      []string         `yaml:"namespaces"`
-	ResourceFilters []ResourceFilter `yaml:"resourceFilters"`
+	Action                         string            `yaml:"action,omitempty"`
+	Namespaces                     []string          `yaml:"namespaces,omitempty"`
+	NamespaceLabelSelector         map[string]string `yaml:"namespaceLabelSelector,omitempty"`
+	ExcludedNamespaceLabelSelector map[string]string `yaml:"excludedNamespaceLabelSelector,omitempty"`
+	ResourceFilters                []ResourceFilter  `yaml:"resourceFilters"`
 }
 
 // IncludeExcludePolicy defined policy to include or exclude resources based on the names
@@ -387,11 +391,26 @@ func (p *Policies) validateFineGrainedGlobalFilterPolicy() error {
 func (p *Policies) validateNamespacedFilterPolicies() error {
 	// Rule 1-7: Basic validation rules
 	for i, nfp := range p.namespacedFilterPolicies {
-		if len(nfp.Namespaces) == 0 {
-			return fmt.Errorf("namespacedFilterPolicies[%d]: at least one namespace must be specified", i)
+		if len(nfp.Namespaces) == 0 && len(nfp.NamespaceLabelSelector) == 0 {
+			return fmt.Errorf("namespacedFilterPolicies[%d]: at least one of 'namespaces' or 'namespaceLabelSelector' must be specified", i)
 		}
-		if len(nfp.ResourceFilters) == 0 {
-			return fmt.Errorf("namespacedFilterPolicies[%d]: at least one resourceFilter must be specified", i)
+		if len(nfp.NamespaceLabelSelector) > 0 {
+			if _, err := labels.ValidatedSelectorFromSet(labels.Set(nfp.NamespaceLabelSelector)); err != nil {
+				return fmt.Errorf("namespacedFilterPolicies[%d]: invalid namespaceLabelSelector: %w", i, err)
+			}
+		}
+		if len(nfp.ExcludedNamespaceLabelSelector) > 0 {
+			if _, err := labels.ValidatedSelectorFromSet(labels.Set(nfp.ExcludedNamespaceLabelSelector)); err != nil {
+				return fmt.Errorf("namespacedFilterPolicies[%d]: invalid excludedNamespaceLabelSelector: %w", i, err)
+			}
+		}
+
+		// Action validation
+		if nfp.Action != "" && !strings.EqualFold(nfp.Action, "Include") && !strings.EqualFold(nfp.Action, "Skip") {
+			return fmt.Errorf("namespacedFilterPolicies[%d]: action must be either 'Include' or 'Skip'", i)
+		}
+		if strings.EqualFold(nfp.Action, "Skip") && len(nfp.ResourceFilters) > 0 {
+			return fmt.Errorf("namespacedFilterPolicies[%d]: resourceFilters must be empty when action is 'Skip'", i)
 		}
 
 		seenKinds := make(map[string]int)
