@@ -65,6 +65,11 @@ type ResourceFilter struct {
 	ExcludedNames    []string            `yaml:"excludedNames,omitempty"`
 }
 
+// IsCatchAll returns true if the filter is a catch-all entry (empty kinds or ["*"])
+func (rf *ResourceFilter) IsCatchAll() bool {
+	return len(rf.Kinds) == 0 || (len(rf.Kinds) == 1 && rf.Kinds[0] == "*")
+}
+
 // FineGrainedGlobalFilterPolicy defines backup filters scoped globally to cluster-scoped resources.
 type FineGrainedGlobalFilterPolicy struct {
 	ResourceFilters []ResourceFilter `yaml:"resourceFilters"`
@@ -354,8 +359,8 @@ func (p *Policies) validateFineGrainedGlobalFilterPolicy() error {
 
 	seenKinds := make(map[string]int)
 	for j, rf := range p.fineGrainedGlobalFilterPolicy.ResourceFilters {
-		if len(rf.Kinds) == 0 {
-			return fmt.Errorf("fineGrainedGlobalFilterPolicy.resourceFilters[%d]: kinds must be specified", j)
+		if rf.IsCatchAll() {
+			return fmt.Errorf("fineGrainedGlobalFilterPolicy.resourceFilters[%d]: kinds must be specified (catch-all is not supported)", j)
 		}
 
 		for _, kind := range rf.Kinds {
@@ -397,20 +402,20 @@ func (p *Policies) validateNamespacedFilterPolicies() error {
 		seenKinds := make(map[string]int)
 		hasCatchAll := false
 		for j, rf := range nfp.ResourceFilters {
-			if len(rf.Kinds) == 0 {
+			if rf.IsCatchAll() {
 				if hasCatchAll {
-					return fmt.Errorf("namespacedFilterPolicies[%d]: only one resource filter with empty kinds is allowed", i)
+					return fmt.Errorf("namespacedFilterPolicies[%d]: only one catch-all resource filter is allowed", i)
 				}
 				hasCatchAll = true
 				if len(rf.Names) > 0 || len(rf.ExcludedNames) > 0 {
-					return fmt.Errorf("namespacedFilterPolicies[%d].resourceFilters[%d]: names or excludedNames cannot be specified when kinds is empty", i, j)
-				}
-				if len(rf.LabelSelector) == 0 && len(rf.OrLabelSelectors) == 0 {
-					return fmt.Errorf("namespacedFilterPolicies[%d].resourceFilters[%d]: labelSelector or orLabelSelectors must be specified when kinds is empty", i, j)
+					return fmt.Errorf("namespacedFilterPolicies[%d].resourceFilters[%d]: names or excludedNames cannot be specified for catch-all filters", i, j)
 				}
 			}
 
 			for _, kind := range rf.Kinds {
+				if kind == "*" {
+					continue // "*" is handled by IsCatchAll, no need to check duplicates against other kinds
+				}
 				if prevJ, ok := seenKinds[kind]; ok {
 					return fmt.Errorf("namespacedFilterPolicies[%d]: kind %q appears in both resourceFilters[%d] and resourceFilters[%d]", i, kind, prevJ, j)
 				}

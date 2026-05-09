@@ -201,7 +201,12 @@ func DescribeNamespaceScopedFilterPolicies(ctx context.Context, kbClient kbclien
 				d.Printf("  %s:\n", ns)
 				d.Printf("    Resource Filters:\n")
 				for _, rf := range policy.ResourceFilters {
-					kindsStr := strings.Join(rf.Kinds, ", ")
+					var kindsStr string
+					if rf.IsCatchAll() {
+						kindsStr = "<catch-all> (all other kinds)"
+					} else {
+						kindsStr = strings.Join(rf.Kinds, ", ")
+					}
 					d.Printf("      %s:\n", kindsStr)
 
 					// Label selector

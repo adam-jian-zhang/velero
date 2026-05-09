@@ -98,7 +98,17 @@ type Request struct {
 	NamespacedFilterMap map[string]*ResolvedNamespaceFilter
 
 	// NamespacedFilterPatterns preserves the order of patterns for first-match semantics
-	NamespacedFilterPatterns []string
+	// and caches pre-compiled globs to avoid repeated compilation in the hot path.
+	NamespacedFilterPatterns []NamespacedFilterPattern
+}
+
+// NamespacedFilterPattern pairs a namespace pattern string with its pre-compiled
+// glob so that GetNamespaceFilter does not recompile on every call.
+// Compiled is nil for exact-match (non-glob) patterns, which are looked up
+// directly in NamespacedFilterMap.
+type NamespacedFilterPattern struct {
+	Pattern  string
+	Compiled glob.Glob
 }
 
 // BackupVolumesInformation contains the information needs by generating
@@ -150,11 +160,10 @@ func (r *Request) GetNamespaceFilter(namespace string) *ResolvedNamespaceFilter 
 		return f
 	}
 
-	// Then check patterns in order for first-match semantics
-	for _, pattern := range r.NamespacedFilterPatterns {
-		g, err := glob.Compile(pattern)
-		if err == nil && g.Match(namespace) {
-			return r.NamespacedFilterMap[pattern]
+	// Walk patterns in definition order using pre-compiled globs (no allocation per call)
+	for _, p := range r.NamespacedFilterPatterns {
+		if p.Compiled != nil && p.Compiled.Match(namespace) {
+			return r.NamespacedFilterMap[p.Pattern]
 		}
 	}
 	return nil

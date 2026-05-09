@@ -1308,6 +1308,47 @@ namespacedFilterPolicies:
 			errMsg: "at least one resourceFilter must be specified",
 		},
 		{
+			name: "valid - asterisk catch-all",
+			yamlData: `version: v1
+namespacedFilterPolicies:
+- namespaces: ["test"]
+  resourceFilters:
+  - kinds: ["*"]
+    labelSelector:
+      app: web`,
+			wantErr: false,
+		},
+		{
+			name: "invalid - multiple asterisk kinds",
+			yamlData: `version: v1
+namespacedFilterPolicies:
+- namespaces: ["test"]
+  resourceFilters:
+  - kinds: ["*"]
+    labelSelector:
+      app: web
+  - kinds: ["*"]
+    labelSelector:
+      app: db`,
+			wantErr: true,
+			errMsg: "only one catch-all resource filter is allowed",
+		},
+		{
+			name: "invalid - empty and asterisk kinds",
+			yamlData: `version: v1
+namespacedFilterPolicies:
+- namespaces: ["test"]
+  resourceFilters:
+  - kinds: []
+    labelSelector:
+      app: web
+  - kinds: ["*"]
+    labelSelector:
+      app: db`,
+			wantErr: true,
+			errMsg: "only one catch-all resource filter is allowed",
+		},
+		{
 			name: "invalid - multiple empty kinds",
 			yamlData: `version: v1
 namespacedFilterPolicies:
@@ -1320,7 +1361,7 @@ namespacedFilterPolicies:
     labelSelector:
       app: db`,
 			wantErr: true,
-			errMsg: "only one resource filter with empty kinds is allowed",
+			errMsg: "only one catch-all resource filter is allowed",
 		},
 		{
 			name: "invalid - names with empty kinds",
@@ -1333,7 +1374,7 @@ namespacedFilterPolicies:
     labelSelector:
       app: web`,
 			wantErr: true,
-			errMsg: "names or excludedNames cannot be specified when kinds is empty",
+			errMsg: "names or excludedNames cannot be specified for catch-all filters",
 		},
 		{
 			name: "invalid - excludedNames with empty kinds",
@@ -1346,17 +1387,16 @@ namespacedFilterPolicies:
     labelSelector:
       app: web`,
 			wantErr: true,
-			errMsg: "names or excludedNames cannot be specified when kinds is empty",
+			errMsg: "names or excludedNames cannot be specified for catch-all filters",
 		},
 		{
-			name: "invalid - no label selectors with empty kinds",
+			name: "valid - no label selectors with catch-all",
 			yamlData: `version: v1
 namespacedFilterPolicies:
 - namespaces: ["test"]
   resourceFilters:
-  - kinds: []`,
-			wantErr: true,
-			errMsg: "labelSelector or orLabelSelectors must be specified when kinds is empty",
+  - kinds: ["*"]`,
+			wantErr: false,
 		},
 		{
 			name: "invalid - duplicate kinds",
@@ -1492,7 +1532,140 @@ namespacedFilterPolicies:
 	assert.Equal(t, []string{"Pod", "ConfigMap", "Secret"}, policy1.ResourceFilters[0].Kinds)
 	
 	// Verify the second policy has the broader patterns
-	policy2 := nfPolicies[1] 
+	policy2 := nfPolicies[1]
 	assert.Equal(t, []string{"team-*", "another-pattern"}, policy2.Namespaces)
 	assert.Equal(t, []string{"Deployment", "Service"}, policy2.ResourceFilters[0].Kinds)
+}
+
+func TestFineGrainedGlobalFilterPolicies(t *testing.T) {
+	testCases := []struct {
+		name     string
+		yamlData string
+		wantErr  bool
+		errMsg   string
+	}{
+		{
+			name: "valid - single kind with names",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["my-app-*"]`,
+			wantErr: false,
+		},
+		{
+			name: "valid - multi-kind with labelSelector",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole", "ClusterRoleBinding"]
+    labelSelector:
+      app: my-app`,
+			wantErr: false,
+		},
+		{
+			name: "valid - orLabelSelectors",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["CustomResourceDefinition"]
+    orLabelSelectors:
+    - app: my-app
+    - app: other-app`,
+			wantErr: false,
+		},
+		{
+			name: "valid - excludedNames",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["my-*"]
+    excludedNames: ["my-debug-*"]`,
+			wantErr: false,
+		},
+		{
+			name: "invalid - empty resourceFilters",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters: []`,
+			wantErr: true,
+			errMsg:  "at least one resourceFilter must be specified",
+		},
+		{
+			name: "invalid - empty kinds in fineGrainedGlobalFilterPolicy",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: []
+    names: ["my-app-*"]`,
+			wantErr: true,
+			errMsg:  "kinds must be specified",
+		},
+		{
+			name: "invalid - duplicate kinds across entries",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["my-app-*"]
+  - kinds: ["ClusterRole"]
+    labelSelector:
+      app: other`,
+			wantErr: true,
+			errMsg:  `kind "ClusterRole" appears in both`,
+		},
+		{
+			name: "invalid - labelSelector and orLabelSelectors co-exist",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    labelSelector:
+      app: my-app
+    orLabelSelectors:
+    - app: other`,
+			wantErr: true,
+			errMsg:  "labelSelector and orLabelSelectors cannot co-exist",
+		},
+		{
+			name: "invalid - bad glob in names",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["[invalid"]`,
+			wantErr: true,
+			errMsg:  "invalid glob pattern",
+		},
+		{
+			name: "invalid - bad glob in excludedNames",
+			yamlData: `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    excludedNames: ["[bad"]`,
+			wantErr: true,
+			errMsg:  "invalid glob pattern",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resPolicies, err := unmarshalResourcePolicies(&tc.yamlData)
+			require.NoError(t, err)
+
+			policies := &Policies{}
+			err = policies.BuildPolicy(resPolicies)
+			require.NoError(t, err)
+
+			err = policies.Validate()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errMsg)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

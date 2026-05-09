@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -2019,4 +2020,113 @@ func TestPatchResourceWorksWithStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPrepareBackupRequest_NamespacedFilterPoliciesIncompatibleWithOldFilters verifies
+// that a backup referencing a ResourcePolicy ConfigMap with namespacedFilterPolicies
+// produces a validation error when old-style resource filters are also set on the spec.
+func TestPrepareBackupRequest_NamespacedFilterPoliciesIncompatibleWithOldFilters(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+namespacedFilterPolicies:
+- namespaces: ["production"]
+  resourceFilters:
+  - kinds: ["Deployment"]
+    names: ["api-server"]
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-filter-policy",
+			Namespace: velerov1api.DefaultNamespace,
+		},
+		Data: map[string]string{"policy": policyYAML},
+	}
+
+	backup := defaultBackup().IncludedResources("deployments").Result()
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{
+		Kind: "configmap",
+		Name: "my-filter-policy",
+	}
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		logger:          logger,
+		discoveryHelper: discoveryHelper,
+		kbClient:        fakeClient,
+		clock:           &clock.RealClock{},
+		formatFlag:      formatFlag,
+	}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+
+	require.NotEmpty(t, res.Status.ValidationErrors)
+	assert.True(t, func() bool {
+		for _, e := range res.Status.ValidationErrors {
+			if strings.Contains(e, "namespace-scoped or fine-grained global filter policies") {
+				return true
+			}
+		}
+		return false
+	}(), "expected validation error about namespacedFilterPolicies incompatibility with old-style filters, got: %v", res.Status.ValidationErrors)
+}
+
+// TestPrepareBackupRequest_FineGrainedGlobalFilterPolicyIncompatibleWithOldFilters verifies
+// that a backup referencing a ResourcePolicy ConfigMap with fineGrainedGlobalFilterPolicy
+// produces a validation error when old-style resource filters are also set on the spec.
+func TestPrepareBackupRequest_FineGrainedGlobalFilterPolicyIncompatibleWithOldFilters(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+fineGrainedGlobalFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["my-app-*"]
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-cluster-filter-policy",
+			Namespace: velerov1api.DefaultNamespace,
+		},
+		Data: map[string]string{"policy": policyYAML},
+	}
+
+	backup := defaultBackup().IncludedResources("clusterroles").Result()
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{
+		Kind: "configmap",
+		Name: "my-cluster-filter-policy",
+	}
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		logger:          logger,
+		discoveryHelper: discoveryHelper,
+		kbClient:        fakeClient,
+		clock:           &clock.RealClock{},
+		formatFlag:      formatFlag,
+	}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+
+	require.NotEmpty(t, res.Status.ValidationErrors)
+	assert.True(t, func() bool {
+		for _, e := range res.Status.ValidationErrors {
+			if strings.Contains(e, "namespace-scoped or fine-grained global filter policies") {
+				return true
+			}
+		}
+		return false
+	}(), "expected validation error about fineGrainedGlobalFilterPolicy incompatibility with old-style filters, got: %v", res.Status.ValidationErrors)
 }

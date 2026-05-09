@@ -462,12 +462,6 @@ func (r *itemCollector) getResourceItems(
 	}
 
 	clusterScoped := !resource.Namespaced
-	if clusterScoped && r.backupRequest.ClusterScopedFilterMap != nil {
-		if _, ok := r.backupRequest.ClusterScopedFilterMap[gr.String()]; !ok {
-			log.Debugf("Skipping cluster-scoped resource %s: not in fineGrainedGlobalFilterPolicy resourceFilters", gr)
-			return nil, nil
-		}
-	}
 
 	namespacesToList := getNamespacesToList(r.backupRequest.NamespaceIncludesExcludes)
 

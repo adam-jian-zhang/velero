@@ -26,9 +26,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/gobwas/glob"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
@@ -365,6 +367,8 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 			if err != nil {
 				return err
 			}
+			log.Infof("Resolved fineGrainedGlobalFilterPolicy: %d kind group(s) in cluster-scoped filter map",
+				len(backupRequest.ClusterScopedFilterMap))
 		}
 
 		nfPolicies := backupRequest.ResPolicies.GetNamespacedFilterPolicies()
@@ -376,6 +380,16 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 			)
 			if err != nil {
 				return err
+			}
+			log.Infof("Resolved namespacedFilterPolicies: %d namespace pattern(s) registered",
+				len(backupRequest.NamespacedFilterPatterns))
+			for _, p := range backupRequest.NamespacedFilterPatterns {
+				nsf := backupRequest.NamespacedFilterMap[p.Pattern]
+				log.WithFields(logrus.Fields{
+					"namespacePattern": p.Pattern,
+					"kindCount":        len(nsf.ResourceFilterMap),
+					"hasCatchAll":      nsf.CatchAllFilter != nil,
+				}).Debug("namespacedFilterPolicies: namespace pattern registered")
 			}
 		}
 	}
@@ -1384,7 +1398,7 @@ func resolveClusterScopedFilterPolicy(
 		}
 
 		for _, kind := range rf.Kinds {
-			gr, _, err := helper.ResourceFor(
+			gr, apiResource, err := helper.ResourceFor(
 				schema.GroupVersionResource{Resource: kind},
 			)
 			if err != nil {
@@ -1392,6 +1406,11 @@ func resolveClusterScopedFilterPolicy(
 					"Cannot resolve kind via discovery, using as-is: %v", err)
 				rfMap[kind] = resolved
 				continue
+			}
+			if apiResource.Namespaced {
+				log.WithField("kind", kind).Warnf(
+					"kind %q in fineGrainedGlobalFilterPolicy is namespace-scoped; "+
+						"it will never match in a cluster-scoped filter — did you mean namespacedFilterPolicies?", kind)
 			}
 			rfMap[gr.GroupResource().String()] = resolved
 		}
@@ -1437,9 +1456,9 @@ func resolveNamespacedFilterPolicies(
 	policies []resourcepolicies.NamespacedFilterPolicy,
 	helper discovery.Helper,
 	log logrus.FieldLogger,
-) (map[string]*ResolvedNamespaceFilter, []string, error) {
+) (map[string]*ResolvedNamespaceFilter, []NamespacedFilterPattern, error) {
 	result := make(map[string]*ResolvedNamespaceFilter)
-	var patternOrder []string
+	var patternOrder []NamespacedFilterPattern
 
 	for _, policy := range policies {
 		rfMap := make(map[string]*ResolvedResourceFilter)
@@ -1451,7 +1470,7 @@ func resolveNamespacedFilterPolicies(
 				return nil, nil, err
 			}
 
-			if len(rf.Kinds) == 0 {
+			if rf.IsCatchAll() {
 				if nsFilter == nil {
 					nsFilter = &ResolvedNamespaceFilter{ResourceFilterMap: rfMap}
 				}
@@ -1459,7 +1478,7 @@ func resolveNamespacedFilterPolicies(
 			} else {
 				// Resolve each kind to a fully-qualified group-resource string with improved error handling
 				for _, kind := range rf.Kinds {
-					gr, _, err := helper.ResourceFor(
+					gr, apiResource, err := helper.ResourceFor(
 						schema.GroupVersionResource{Resource: kind},
 					)
 					if err != nil {
@@ -1468,6 +1487,11 @@ func resolveNamespacedFilterPolicies(
 							"Cannot resolve kind via discovery, using as-is: %v", err)
 						rfMap[kind] = resolved
 						continue
+					}
+					if !apiResource.Namespaced {
+						log.WithField("kind", kind).Warnf(
+							"kind %q in namespacedFilterPolicies is cluster-scoped; "+
+								"it will never match in a namespace-scoped filter — did you mean fineGrainedGlobalFilterPolicy?", kind)
 					}
 					rfMap[gr.GroupResource().String()] = resolved
 				}
@@ -1481,8 +1505,18 @@ func resolveNamespacedFilterPolicies(
 		}
 		for _, nsPattern := range policy.Namespaces {
 			result[nsPattern] = nsFilter
-			// Preserve pattern order for first-match semantics
-			patternOrder = append(patternOrder, nsPattern)
+			// Pre-compile glob patterns once here; exact names are matched via map
+			// and never reach the pattern loop, so only wildcard patterns need Compiled set.
+			entry := NamespacedFilterPattern{Pattern: nsPattern}
+			if strings.ContainsAny(nsPattern, "*?[") {
+				if compiled, cerr := glob.Compile(nsPattern); cerr == nil {
+					entry.Compiled = compiled
+				} else {
+					// Pattern already validated; this branch should not be reached
+					log.WithField("pattern", nsPattern).Warnf("Failed to pre-compile glob pattern: %v", cerr)
+				}
+			}
+			patternOrder = append(patternOrder, entry)
 		}
 	}
 	return result, patternOrder, nil
