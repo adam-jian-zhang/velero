@@ -691,6 +691,78 @@ func TestItemInclusionChecks_GlobalExclusion_OverridesNamespaceFilter(t *testing
 			"even though namespacedFilterPolicies lists it")
 }
 
+// TestItemInclusionChecks_PluginItem_UnlistedKind_NoCatchAll_PassesThrough verifies the
+// intentional permissive passthrough at Stage 2 for plugin-injected additional items.
+// When a namespace has a namespacedFilterPolicies entry but the item's kind is not listed
+// in that policy and there is no catch-all entry, itemInclusionChecks must still allow
+// the item through.
+//
+// Rationale: plugin-injected additional items (returned by BackupItemAction) must be able
+// to reach the archive even when their kind was not explicitly listed in the filter policy,
+// because rejecting them here would break backup completeness. For example, a CSI plugin
+// may inject a VolumeSnapshotContent that is required for a correct restore.
+// Kind-level exclusion for the primary collection pass is enforced at Stage 1 in
+// item_collector.go, not at Stage 2 here.
+func TestItemInclusionChecks_PluginItem_UnlistedKind_NoCatchAll_PassesThrough(t *testing.T) {
+	req := baseRequest()
+	// Namespace filter only lists ConfigMaps; Secrets are not listed and there is no catch-all.
+	req.NamespacedFilterMap = map[string]*ResolvedNamespaceFilter{
+		"ns-a": {
+			ResourceFilterMap: map[string]*ResolvedResourceFilter{
+				configMapsGR.String(): {},
+			},
+			CatchAllFilter: nil,
+		},
+	}
+	req.NamespacedFilterPatterns = []NamespacedFilterPattern{}
+
+	ib := newTestItemBackupper(req)
+	log := logrus.New()
+
+	secretsGR := schema.GroupResource{Group: "", Resource: "secrets"}
+	obj := makeTestUnstructured("ns-a", "plugin-injected-secret", nil)
+
+	result := ib.itemInclusionChecks(log, false, obj, obj, secretsGR)
+	assert.True(t, result,
+		"plugin-injected additional item of an unlisted kind must pass through Stage 2 "+
+			"even when its namespace has a namespacedFilterPolicies entry with no catch-all; "+
+			"kind exclusion is enforced at Stage 1 (item_collector.go), not here")
+}
+
+// TestItemInclusionChecks_PluginItem_UnlistedKind_WithCatchAll_PassesThrough verifies that
+// a plugin-injected additional item of a kind not listed in the namespace filter also passes
+// through Stage 2 when a catch-all entry is present. The catch-all is validated to never
+// carry a NameIE (names/excludedNames are prohibited on catch-all entries), so the name
+// check is always a no-op for catch-all-matched items and the item is included.
+func TestItemInclusionChecks_PluginItem_UnlistedKind_WithCatchAll_PassesThrough(t *testing.T) {
+	req := baseRequest()
+	// Namespace filter lists ConfigMaps explicitly; a catch-all covers everything else.
+	// The catch-all has no NameIE — this is enforced by validation.
+	req.NamespacedFilterMap = map[string]*ResolvedNamespaceFilter{
+		"ns-a": {
+			ResourceFilterMap: map[string]*ResolvedResourceFilter{
+				configMapsGR.String(): {},
+			},
+			CatchAllFilter: &ResolvedResourceFilter{
+				// NameIE intentionally nil: validation forbids names/excludedNames on catch-all
+				NameIE: nil,
+			},
+		},
+	}
+	req.NamespacedFilterPatterns = []NamespacedFilterPattern{}
+
+	ib := newTestItemBackupper(req)
+	log := logrus.New()
+
+	secretsGR := schema.GroupResource{Group: "", Resource: "secrets"}
+	obj := makeTestUnstructured("ns-a", "plugin-injected-secret", nil)
+
+	result := ib.itemInclusionChecks(log, false, obj, obj, secretsGR)
+	assert.True(t, result,
+		"plugin-injected additional item matched by catch-all must pass through Stage 2; "+
+			"the catch-all has no NameIE so the name check is a no-op")
+}
+
 // excludeResourceIE is an IncludesExcludesInterface that excludes a single resource
 // type and includes everything else. Used to simulate includeExcludePolicy global exclusions.
 type excludeResourceIE struct {

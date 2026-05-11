@@ -126,7 +126,7 @@ type ResourcePolicies struct {
 	VolumePolicies                []VolumePolicy                 `yaml:"volumePolicies"`
 	IncludeExcludePolicy          *IncludeExcludePolicy          `yaml:"includeExcludePolicy"`
 	FineGrainedGlobalFilterPolicy *FineGrainedGlobalFilterPolicy `yaml:"fineGrainedGlobalFilterPolicy,omitempty"`
-	NamespacedFilterPolicies      []NamespacedFilterPolicy       `yaml:"namespacedFilterPolicies"`
+	NamespacedFilterPolicies      []NamespacedFilterPolicy       `yaml:"namespacedFilterPolicies,omitempty"`
 	// we may support other resource policies in the future, and they could be added separately
 	// OtherResourcePolicies []OtherResourcePolicy
 }
