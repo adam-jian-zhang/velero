@@ -591,7 +591,7 @@ func TestItemInclusionChecks_ExcludeLabel_OverridesCatchAll(t *testing.T) {
 }
 
 // TestItemInclusionChecks_ExcludeLabel_OverridesClusterScopedFilter verifies that
-// velero.io/exclude-from-backup=true takes precedence over fineGrainedGlobalFilterPolicy.
+// velero.io/exclude-from-backup=true takes precedence over clusterScopedFilterPolicy.
 func TestItemInclusionChecks_ExcludeLabel_OverridesClusterScopedFilter(t *testing.T) {
 	req := baseRequest()
 	req.ClusterScopedFilterMap = map[string]*ResolvedResourceFilter{
@@ -607,7 +607,7 @@ func TestItemInclusionChecks_ExcludeLabel_OverridesClusterScopedFilter(t *testin
 	})
 
 	result := ib.itemInclusionChecks(log, false, obj, obj, clusterRolesGR)
-	assert.False(t, result, "cluster-scoped resource with exclude-from-backup=true must be excluded even when in fineGrainedGlobalFilterPolicy")
+	assert.False(t, result, "cluster-scoped resource with exclude-from-backup=true must be excluded even when in clusterScopedFilterPolicy")
 }
 
 // TestItemInclusionChecks_ClusterScoped_NotInFilterMap_PassesThrough verifies that

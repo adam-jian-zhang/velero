@@ -1547,7 +1547,7 @@ func TestFineGrainedGlobalFilterPolicies(t *testing.T) {
 		{
 			name: "valid - single kind with names",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole"]
     names: ["my-app-*"]`,
@@ -1556,7 +1556,7 @@ fineGrainedGlobalFilterPolicy:
 		{
 			name: "valid - multi-kind with labelSelector",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole", "ClusterRoleBinding"]
     labelSelector:
@@ -1566,7 +1566,7 @@ fineGrainedGlobalFilterPolicy:
 		{
 			name: "valid - orLabelSelectors",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["CustomResourceDefinition"]
     orLabelSelectors:
@@ -1577,7 +1577,7 @@ fineGrainedGlobalFilterPolicy:
 		{
 			name: "valid - excludedNames",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole"]
     names: ["my-*"]
@@ -1587,15 +1587,15 @@ fineGrainedGlobalFilterPolicy:
 		{
 			name: "invalid - empty resourceFilters",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters: []`,
 			wantErr: true,
 			errMsg:  "at least one resourceFilter must be specified",
 		},
 		{
-			name: "invalid - empty kinds in fineGrainedGlobalFilterPolicy",
+			name: "invalid - empty kinds in clusterScopedFilterPolicy",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: []
     names: ["my-app-*"]`,
@@ -1603,9 +1603,20 @@ fineGrainedGlobalFilterPolicy:
 			errMsg:  "kinds must be specified",
 		},
 		{
+			name: "invalid - asterisk kinds (explicit catch-all) in clusterScopedFilterPolicy",
+			yamlData: `version: v1
+clusterScopedFilterPolicy:
+  resourceFilters:
+  - kinds: ["*"]
+    labelSelector:
+      app: my-app`,
+			wantErr: true,
+			errMsg:  "kinds must be specified",
+		},
+		{
 			name: "invalid - duplicate kinds across entries",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole"]
     names: ["my-app-*"]
@@ -1618,7 +1629,7 @@ fineGrainedGlobalFilterPolicy:
 		{
 			name: "invalid - labelSelector and orLabelSelectors co-exist",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole"]
     labelSelector:
@@ -1631,7 +1642,7 @@ fineGrainedGlobalFilterPolicy:
 		{
 			name: "invalid - bad glob in names",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole"]
     names: ["[invalid"]`,
@@ -1641,7 +1652,7 @@ fineGrainedGlobalFilterPolicy:
 		{
 			name: "invalid - bad glob in excludedNames",
 			yamlData: `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole"]
     excludedNames: ["[bad"]`,

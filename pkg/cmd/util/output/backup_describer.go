@@ -156,7 +156,7 @@ func DescribeNamespaceScopedFilterPolicies(ctx context.Context, kbClient kbclien
 		return
 	}
 
-	fgPolicy := resourcePolicies.GetFineGrainedGlobalFilterPolicy()
+	fgPolicy := resourcePolicies.GetClusterScopedFilterPolicy()
 	if fgPolicy != nil {
 		d.Printf("\nFine-Grained Global Filter Policy:\n")
 		d.Printf("  Resource Filters:\n")

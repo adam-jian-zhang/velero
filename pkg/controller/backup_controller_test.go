@@ -2077,15 +2077,15 @@ namespacedFilterPolicies:
 	}(), "expected validation error about namespacedFilterPolicies incompatibility with old-style filters, got: %v", res.Status.ValidationErrors)
 }
 
-// TestPrepareBackupRequest_FineGrainedGlobalFilterPolicyIncompatibleWithOldFilters verifies
-// that a backup referencing a ResourcePolicy ConfigMap with fineGrainedGlobalFilterPolicy
+// TestPrepareBackupRequest_ClusterScopedFilterPolicyIncompatibleWithOldFilters verifies
+// that a backup referencing a ResourcePolicy ConfigMap with clusterScopedFilterPolicy
 // produces a validation error when old-style resource filters are also set on the spec.
-func TestPrepareBackupRequest_FineGrainedGlobalFilterPolicyIncompatibleWithOldFilters(t *testing.T) {
+func TestPrepareBackupRequest_ClusterScopedFilterPolicyIncompatibleWithOldFilters(t *testing.T) {
 	formatFlag := logging.FormatText
 	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
 
 	policyYAML := `version: v1
-fineGrainedGlobalFilterPolicy:
+clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["ClusterRole"]
     names: ["my-app-*"]
@@ -2128,5 +2128,5 @@ fineGrainedGlobalFilterPolicy:
 			}
 		}
 		return false
-	}(), "expected validation error about fineGrainedGlobalFilterPolicy incompatibility with old-style filters, got: %v", res.Status.ValidationErrors)
+	}(), "expected validation error about clusterScopedFilterPolicy incompatibility with old-style filters, got: %v", res.Status.ValidationErrors)
 }

@@ -226,7 +226,7 @@ func DescribeBackupSpecInSF(d *StructuredDescriber, spec velerov1api.BackupSpec)
 	d.Describe("spec", backupSpecInfo)
 }
 
-// DescribeNamespaceScopedFilterPoliciesInSF adds the fineGrainedGlobalFilterPolicy
+// DescribeNamespaceScopedFilterPoliciesInSF adds the clusterScopedFilterPolicy
 // and namespacedFilterPolicies sections to the structured describer output when present
 // in the ResourcePolicy ConfigMap referenced by the backup.
 func DescribeNamespaceScopedFilterPoliciesInSF(ctx context.Context, kbClient kbclient.Client, d *StructuredDescriber, backup *velerov1api.Backup) {
@@ -242,7 +242,7 @@ func DescribeNamespaceScopedFilterPoliciesInSF(ctx context.Context, kbClient kbc
 		return
 	}
 
-	fgPolicy := resPolicies.GetFineGrainedGlobalFilterPolicy()
+	fgPolicy := resPolicies.GetClusterScopedFilterPolicy()
 	if fgPolicy != nil {
 		var fgFilters []map[string]any
 		for _, rf := range fgPolicy.ResourceFilters {
@@ -263,7 +263,7 @@ func DescribeNamespaceScopedFilterPoliciesInSF(ctx context.Context, kbClient kbc
 			}
 			fgFilters = append(fgFilters, entry)
 		}
-		d.Describe("fineGrainedGlobalFilterPolicy", map[string]any{
+		d.Describe("clusterScopedFilterPolicy", map[string]any{
 			"resourceFilters": fgFilters,
 		})
 	}

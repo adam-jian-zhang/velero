@@ -595,9 +595,9 @@ func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *vel
 		request.Status.ValidationErrors = append(request.Status.ValidationErrors, "include-resources, exclude-resources and include-cluster-resources are old filter parameters.\n"+
 			"They cannot be used with include-exclude policies.")
 	}
-	// namespacedFilterPolicies and fineGrainedGlobalFilterPolicy incompatible with old-style filters
+	// namespacedFilterPolicies and clusterScopedFilterPolicy incompatible with old-style filters
 	if resourcePolicies != nil &&
-		(len(resourcePolicies.GetNamespacedFilterPolicies()) > 0 || resourcePolicies.GetFineGrainedGlobalFilterPolicy() != nil) &&
+		(len(resourcePolicies.GetNamespacedFilterPolicies()) > 0 || resourcePolicies.GetClusterScopedFilterPolicy() != nil) &&
 		collections.UseOldResourceFilters(request.Spec) {
 		request.Status.ValidationErrors = append(request.Status.ValidationErrors, "include-resources, exclude-resources and include-cluster-resources are old filter parameters.\n"+
 			"They cannot be used with namespace-scoped or fine-grained global filter policies.")

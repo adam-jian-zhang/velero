@@ -172,7 +172,7 @@ func (ib *itemBackupper) itemInclusionChecks(log logrus.FieldLogger, mustInclude
 			if ib.backupRequest.ClusterScopedFilterMap != nil {
 				if rf, ok := ib.backupRequest.ClusterScopedFilterMap[groupResource.String()]; ok && rf.NameIE != nil {
 					if !rf.NameIE.ShouldInclude(metadata.GetName()) {
-						log.Infof("Excluding item: name does not match fineGrainedGlobalFilterPolicy for kind %s", groupResource)
+						log.Infof("Excluding item: name does not match clusterScopedFilterPolicy for kind %s", groupResource)
 						return false
 					}
 				}

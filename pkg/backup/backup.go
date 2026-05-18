@@ -357,7 +357,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 	}
 
 	if backupRequest.ResPolicies != nil {
-		fgPolicy := backupRequest.ResPolicies.GetFineGrainedGlobalFilterPolicy()
+		fgPolicy := backupRequest.ResPolicies.GetClusterScopedFilterPolicy()
 		if fgPolicy != nil {
 			backupRequest.ClusterScopedFilterMap, err = resolveClusterScopedFilterPolicy(
 				fgPolicy,
@@ -367,7 +367,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 			if err != nil {
 				return err
 			}
-			log.Infof("Resolved fineGrainedGlobalFilterPolicy: %d kind group(s) in cluster-scoped filter map",
+			log.Infof("Resolved clusterScopedFilterPolicy: %d kind group(s) in cluster-scoped filter map",
 				len(backupRequest.ClusterScopedFilterMap))
 		}
 
@@ -390,6 +390,14 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 					"kindCount":        len(nsf.ResourceFilterMap),
 					"hasCatchAll":      nsf.CatchAllFilter != nil,
 				}).Debug("namespacedFilterPolicies: namespace pattern registered")
+				for kind := range nsf.ResourceFilterMap {
+					if backupRequest.ResourceIncludesExcludes.ShouldExclude(kind) {
+						log.WithFields(logrus.Fields{
+							"namespacePattern": p.Pattern,
+							"kind":             kind,
+						}).Warn("namespacedFilterPolicies entry lists a kind that is globally excluded by includeExcludePolicy; the per-namespace filter entry has no effect")
+					}
+				}
 			}
 		}
 	}
@@ -1385,7 +1393,7 @@ func putVolumeInfos(
 }
 
 func resolveClusterScopedFilterPolicy(
-	policy *resourcepolicies.FineGrainedGlobalFilterPolicy,
+	policy *resourcepolicies.ClusterScopedFilterPolicy,
 	helper discovery.Helper,
 	log logrus.FieldLogger,
 ) (map[string]*ResolvedResourceFilter, error) {
@@ -1409,7 +1417,7 @@ func resolveClusterScopedFilterPolicy(
 			}
 			if apiResource.Namespaced {
 				log.WithField("kind", kind).Warnf(
-					"kind %q in fineGrainedGlobalFilterPolicy is namespace-scoped; "+
+					"kind %q in clusterScopedFilterPolicy is namespace-scoped; "+
 						"it will never match in a cluster-scoped filter — did you mean namespacedFilterPolicies?", kind)
 			}
 			rfMap[gr.GroupResource().String()] = resolved
@@ -1491,7 +1499,7 @@ func resolveNamespacedFilterPolicies(
 					if !apiResource.Namespaced {
 						log.WithField("kind", kind).Warnf(
 							"kind %q in namespacedFilterPolicies is cluster-scoped; "+
-								"it will never match in a namespace-scoped filter — did you mean fineGrainedGlobalFilterPolicy?", kind)
+								"it will never match in a namespace-scoped filter — did you mean clusterScopedFilterPolicy?", kind)
 					}
 					rfMap[gr.GroupResource().String()] = resolved
 				}

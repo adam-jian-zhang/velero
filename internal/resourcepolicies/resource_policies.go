@@ -70,8 +70,8 @@ func (rf *ResourceFilter) IsCatchAll() bool {
 	return len(rf.Kinds) == 0 || (len(rf.Kinds) == 1 && rf.Kinds[0] == "*")
 }
 
-// FineGrainedGlobalFilterPolicy defines backup filters scoped globally to cluster-scoped resources.
-type FineGrainedGlobalFilterPolicy struct {
+// ClusterScopedFilterPolicy defines backup filters scoped globally to cluster-scoped resources.
+type ClusterScopedFilterPolicy struct {
 	ResourceFilters []ResourceFilter `yaml:"resourceFilters"`
 }
 
@@ -122,21 +122,21 @@ type VolumePolicy struct {
 
 // ResourcePolicies currently defined slice of volume policies to handle backup
 type ResourcePolicies struct {
-	Version                       string                         `yaml:"version"`
-	VolumePolicies                []VolumePolicy                 `yaml:"volumePolicies"`
-	IncludeExcludePolicy          *IncludeExcludePolicy          `yaml:"includeExcludePolicy"`
-	FineGrainedGlobalFilterPolicy *FineGrainedGlobalFilterPolicy `yaml:"fineGrainedGlobalFilterPolicy,omitempty"`
-	NamespacedFilterPolicies      []NamespacedFilterPolicy       `yaml:"namespacedFilterPolicies,omitempty"`
+	Version                   string                     `yaml:"version"`
+	VolumePolicies            []VolumePolicy             `yaml:"volumePolicies"`
+	IncludeExcludePolicy      *IncludeExcludePolicy      `yaml:"includeExcludePolicy"`
+	ClusterScopedFilterPolicy *ClusterScopedFilterPolicy `yaml:"clusterScopedFilterPolicy,omitempty"`
+	NamespacedFilterPolicies  []NamespacedFilterPolicy   `yaml:"namespacedFilterPolicies,omitempty"`
 	// we may support other resource policies in the future, and they could be added separately
 	// OtherResourcePolicies []OtherResourcePolicy
 }
 
 type Policies struct {
-	version                       string
-	volumePolicies                []volPolicy
-	includeExcludePolicy          *IncludeExcludePolicy
-	fineGrainedGlobalFilterPolicy *FineGrainedGlobalFilterPolicy
-	namespacedFilterPolicies      []NamespacedFilterPolicy
+	version                   string
+	volumePolicies            []volPolicy
+	includeExcludePolicy      *IncludeExcludePolicy
+	clusterScopedFilterPolicy *ClusterScopedFilterPolicy
+	namespacedFilterPolicies  []NamespacedFilterPolicy
 	// OtherPolicies
 }
 
@@ -189,7 +189,7 @@ func (p *Policies) BuildPolicy(resPolicies *ResourcePolicies) error {
 
 	p.version = resPolicies.Version
 	p.includeExcludePolicy = resPolicies.IncludeExcludePolicy
-	p.fineGrainedGlobalFilterPolicy = resPolicies.FineGrainedGlobalFilterPolicy
+	p.clusterScopedFilterPolicy = resPolicies.ClusterScopedFilterPolicy
 	p.namespacedFilterPolicies = resPolicies.NamespacedFilterPolicies
 	return nil
 }
@@ -261,7 +261,7 @@ func (p *Policies) Validate() error {
 		}
 	}
 
-	if err := p.validateFineGrainedGlobalFilterPolicy(); err != nil {
+	if err := p.validateClusterScopedFilterPolicy(); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -276,8 +276,8 @@ func (p *Policies) GetIncludeExcludePolicy() *IncludeExcludePolicy {
 	return p.includeExcludePolicy
 }
 
-func (p *Policies) GetFineGrainedGlobalFilterPolicy() *FineGrainedGlobalFilterPolicy {
-	return p.fineGrainedGlobalFilterPolicy
+func (p *Policies) GetClusterScopedFilterPolicy() *ClusterScopedFilterPolicy {
+	return p.clusterScopedFilterPolicy
 }
 
 func (p *Policies) GetNamespacedFilterPolicies() []NamespacedFilterPolicy {
@@ -348,40 +348,40 @@ func getResourcePoliciesFromConfig(cm *corev1api.ConfigMap) (*Policies, error) {
 	return policies, nil
 }
 
-func (p *Policies) validateFineGrainedGlobalFilterPolicy() error {
-	if p.fineGrainedGlobalFilterPolicy == nil {
+func (p *Policies) validateClusterScopedFilterPolicy() error {
+	if p.clusterScopedFilterPolicy == nil {
 		return nil
 	}
 
-	if len(p.fineGrainedGlobalFilterPolicy.ResourceFilters) == 0 {
-		return fmt.Errorf("fineGrainedGlobalFilterPolicy: at least one resourceFilter must be specified")
+	if len(p.clusterScopedFilterPolicy.ResourceFilters) == 0 {
+		return fmt.Errorf("clusterScopedFilterPolicy: at least one resourceFilter must be specified")
 	}
 
 	seenKinds := make(map[string]int)
-	for j, rf := range p.fineGrainedGlobalFilterPolicy.ResourceFilters {
+	for j, rf := range p.clusterScopedFilterPolicy.ResourceFilters {
 		if rf.IsCatchAll() {
-			return fmt.Errorf("fineGrainedGlobalFilterPolicy.resourceFilters[%d]: kinds must be specified (catch-all is not supported)", j)
+			return fmt.Errorf("clusterScopedFilterPolicy.resourceFilters[%d]: kinds must be specified (catch-all is not supported)", j)
 		}
 
 		for _, kind := range rf.Kinds {
 			if prevJ, ok := seenKinds[kind]; ok {
-				return fmt.Errorf("fineGrainedGlobalFilterPolicy: kind %q appears in both resourceFilters[%d] and resourceFilters[%d]", kind, prevJ, j)
+				return fmt.Errorf("clusterScopedFilterPolicy: kind %q appears in both resourceFilters[%d] and resourceFilters[%d]", kind, prevJ, j)
 			}
 			seenKinds[kind] = j
 		}
 
 		if len(rf.LabelSelector) > 0 && len(rf.OrLabelSelectors) > 0 {
-			return fmt.Errorf("fineGrainedGlobalFilterPolicy.resourceFilters[%d]: labelSelector and orLabelSelectors cannot co-exist", j)
+			return fmt.Errorf("clusterScopedFilterPolicy.resourceFilters[%d]: labelSelector and orLabelSelectors cannot co-exist", j)
 		}
 
 		for k, pattern := range rf.Names {
 			if _, err := glob.Compile(pattern); err != nil {
-				return fmt.Errorf("fineGrainedGlobalFilterPolicy.resourceFilters[%d].names[%d]: invalid glob pattern %q: %v", j, k, pattern, err)
+				return fmt.Errorf("clusterScopedFilterPolicy.resourceFilters[%d].names[%d]: invalid glob pattern %q: %v", j, k, pattern, err)
 			}
 		}
 		for k, pattern := range rf.ExcludedNames {
 			if _, err := glob.Compile(pattern); err != nil {
-				return fmt.Errorf("fineGrainedGlobalFilterPolicy.resourceFilters[%d].excludedNames[%d]: invalid glob pattern %q: %v", j, k, pattern, err)
+				return fmt.Errorf("clusterScopedFilterPolicy.resourceFilters[%d].excludedNames[%d]: invalid glob pattern %q: %v", j, k, pattern, err)
 			}
 		}
 	}
