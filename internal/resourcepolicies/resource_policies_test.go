@@ -909,6 +909,49 @@ namespacedFilterPolicies:
 	}
 }
 
+func TestGetResourcePoliciesFromRestore(t *testing.T) {
+	// Create a test ConfigMap
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-configmap",
+			Namespace: "test-namespace",
+		},
+		Data: map[string]string{
+			"test-data": `version: v1
+volumePolicies:
+  - conditions:
+      capacity: '0,10Gi'
+      csi:
+        driver: disks.csi.driver
+    action:
+      type: skip
+`,
+		},
+	}
+
+	// Create a fake client
+	client := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(cm).Build()
+	logger := logrus.New()
+
+	restore := velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-namespace",
+			Name:      "test-restore",
+		},
+		Spec: velerov1api.RestoreSpec{
+			ResourcePolicy: &corev1api.TypedLocalObjectReference{
+				Kind: ConfigmapRefType,
+				Name: "test-configmap",
+			},
+		},
+	}
+
+	resPolicies, err := GetResourcePoliciesFromRestore(context.Background(), &restore, client, logger)
+	require.NoError(t, err)
+	assert.Equal(t, "v1", resPolicies.version)
+	assert.Len(t, resPolicies.volumePolicies, 1)
+}
+
 func TestGetMatchAction(t *testing.T) {
 	testCases := []struct {
 		name     string

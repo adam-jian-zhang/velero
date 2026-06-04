@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/gobwas/glob"
 	"github.com/google/uuid"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
@@ -55,6 +56,7 @@ import (
 	"github.com/vmware-tanzu/velero/internal/credentials"
 	"github.com/vmware-tanzu/velero/internal/hook"
 	"github.com/vmware-tanzu/velero/internal/resourcemodifiers"
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/archive"
@@ -237,6 +239,43 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		Includes(req.Restore.Spec.IncludedNamespaces...).
 		Excludes(req.Restore.Spec.ExcludedNamespaces...)
 
+	var clusterScopedFilterMap map[string]*resolvedResourceFilter
+	var namespacedFilterMap map[string]*resolvedNamespaceFilter
+	var namespacedFilterPatterns []namespacedFilterPattern
+
+	if req.ResPolicies != nil {
+		if kr.discoveryHelper == nil {
+			return results.Result{}, results.Result{Velero: []string{"failed to resolve namespace filter policies: discovery client unavailable"}}
+		}
+
+		// Resolve clusterScopedFilterPolicy
+		csPolicy := req.ResPolicies.GetClusterScopedFilterPolicy()
+		if csPolicy != nil {
+			clusterScopedFilterMap, err = resolveRestoreClusterScopedFilterPolicy(
+				csPolicy,
+				kr.discoveryHelper,
+				req.Log,
+			)
+			if err != nil {
+				return results.Result{}, results.Result{Velero: []string{err.Error()}}
+			}
+		}
+
+		// Resolve namespacedFilterPolicies
+		nfPolicies := req.ResPolicies.GetNamespacedFilterPolicies()
+		if len(nfPolicies) > 0 {
+			namespacedFilterMap, namespacedFilterPatterns, err = resolveRestoreNamespacedFilterPolicies(
+				nfPolicies,
+				req.Restore.Spec.ExcludedResources,
+				kr.discoveryHelper,
+				req.Log,
+			)
+			if err != nil {
+				return results.Result{}, results.Result{Velero: []string{err.Error()}}
+			}
+		}
+	}
+
 	resolvedActions, err := restoreItemActionResolver.ResolveActions(kr.discoveryHelper, kr.logger)
 	if err != nil {
 		return results.Result{}, results.Result{Velero: []string{err.Error()}}
@@ -333,6 +372,10 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		restoreVolumeInfoTracker:       req.RestoreVolumeInfoTracker,
 		hooksWaitExecutor:              hooksWaitExecutor,
 		resourceDeletionStatusTracker:  req.ResourceDeletionStatusTracker,
+		clusterScopedFilterMap:         clusterScopedFilterMap,
+		namespacedFilterMap:            namespacedFilterMap,
+		namespacedFilterPatterns:       namespacedFilterPatterns,
+		namespaceFilterCache:           make(map[string]*resolvedNamespaceFilter),
 	}
 
 	return restoreCtx.execute()
@@ -382,6 +425,216 @@ type restoreContext struct {
 	restoreVolumeInfoTracker       *volume.RestoreVolumeInfoTracker
 	hooksWaitExecutor              *hooksWaitExecutor
 	resourceDeletionStatusTracker  kube.ResourceDeletionStatusTracker
+
+	// clusterScopedFilterMap holds resolved per-kind filters for cluster-scoped resources.
+	// Key is the resolved group-resource string.
+	clusterScopedFilterMap map[string]*resolvedResourceFilter
+
+	// namespacedFilterMap holds resolved per-namespace filters.
+	// Key is either an exact namespace name or a glob pattern string.
+	namespacedFilterMap map[string]*resolvedNamespaceFilter
+
+	// namespacedFilterPatterns preserves the order of patterns for first-match
+	// semantics and caches pre-compiled globs to avoid repeated compilation.
+	namespacedFilterPatterns []namespacedFilterPattern
+
+	// namespaceFilterCache memoizes the resolved filter for a given namespace
+	// to avoid re-evaluating glob patterns on every call.
+	namespaceFilterCache map[string]*resolvedNamespaceFilter
+}
+
+type resolvedResourceFilter struct {
+	labelSelector    labels.Selector
+	orLabelSelectors []labels.Selector
+	nameIE           *collections.IncludesExcludes
+}
+
+type resolvedNamespaceFilter struct {
+	// resourceFilterMap is keyed by the resolved group-resource string
+	resourceFilterMap map[string]*resolvedResourceFilter
+	// catchAllFilter holds the resolved filter for a catch-all entry (empty kinds or ["*"]).
+	// nil when no catch-all entry is defined.
+	catchAllFilter *resolvedResourceFilter
+}
+
+// namespacedFilterPattern pairs a namespace pattern string with its pre-compiled
+// glob so that getNamespaceFilter does not recompile on every call.
+type namespacedFilterPattern struct {
+	pattern  string
+	compiled glob.Glob // compiled once at restore start; nil for exact-match patterns
+}
+
+func (ctx *restoreContext) getNamespaceFilter(namespace string) *resolvedNamespaceFilter {
+	if ctx.namespacedFilterMap == nil {
+		return nil
+	}
+
+	// 1. Check the cache first
+	if filter, ok := ctx.namespaceFilterCache[namespace]; ok {
+		return filter
+	}
+
+	// 2. Walk patterns in definition order (first-match semantics)
+	for _, p := range ctx.namespacedFilterPatterns {
+		if p.compiled != nil {
+			if p.compiled.Match(namespace) {
+				filter := ctx.namespacedFilterMap[p.pattern]
+				ctx.namespaceFilterCache[namespace] = filter
+				return filter
+			}
+		} else if p.pattern == namespace {
+			filter := ctx.namespacedFilterMap[p.pattern]
+			ctx.namespaceFilterCache[namespace] = filter
+			return filter
+		}
+	}
+
+	// 3. Cache the miss so we don't re-evaluate failed matches
+	ctx.namespaceFilterCache[namespace] = nil
+	return nil
+}
+
+// resolveRestoreClusterScopedFilterPolicy resolves the cluster-scoped filter policy
+// into a map keyed by group-resource string. Note: catch-all entries (empty or ["*"] kinds)
+// are NOT supported in clusterScopedFilterPolicy — validation rejects them earlier.
+// Cluster-scoped filtering is a refinement overlay; unlisted kinds fall back to global
+// filters via the existing pipeline, so there is no catchAllFilter field on this map.
+func resolveRestoreClusterScopedFilterPolicy(
+	policy *resourcepolicies.ClusterScopedFilterPolicy,
+	helper discovery.Helper,
+	log logrus.FieldLogger,
+) (map[string]*resolvedResourceFilter, error) {
+	result := make(map[string]*resolvedResourceFilter)
+	for _, rf := range policy.ResourceFilters {
+		resolved, err := resolveResourceFilter(rf)
+		if err != nil {
+			return nil, err
+		}
+		for _, kind := range rf.Kinds {
+			gr, resource, err := helper.ResourceFor(schema.GroupVersionResource{Resource: kind})
+			if err != nil {
+				log.WithField("kind", kind).Warnf("Cannot resolve kind via discovery, using as-is")
+				result[kind] = resolved
+				continue
+			}
+			if resource.Namespaced {
+				log.Warnf("kind %q in clusterScopedFilterPolicy is a namespace-scoped resource; it will never match in a cluster-scoped filter — did you mean namespacedFilterPolicies?", kind)
+			}
+			result[gr.GroupResource().String()] = resolved
+		}
+	}
+	return result, nil
+}
+
+func resolveRestoreNamespacedFilterPolicies(
+	policies []resourcepolicies.NamespacedFilterPolicy,
+	excludedResources []string,
+	helper discovery.Helper,
+	log logrus.FieldLogger,
+) (map[string]*resolvedNamespaceFilter, []namespacedFilterPattern, error) {
+	result := make(map[string]*resolvedNamespaceFilter)
+	var patternOrder []namespacedFilterPattern
+
+	// Build a quick lookup map for globally excluded resources
+	globalExcludes := make(map[string]bool)
+	for _, ex := range excludedResources {
+		globalExcludes[ex] = true
+	}
+
+	for _, policy := range policies {
+		rfMap := make(map[string]*resolvedResourceFilter)
+		var catchAll *resolvedResourceFilter
+
+		for _, rf := range policy.ResourceFilters {
+			resolved, err := resolveResourceFilter(rf)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			if rf.IsCatchAll() {
+				catchAll = resolved
+				continue
+			}
+
+			for _, kind := range rf.Kinds {
+				gr, resource, err := helper.ResourceFor(
+					schema.GroupVersionResource{Resource: kind},
+				)
+				if err != nil {
+					log.WithField("kind", kind).Warnf(
+						"Cannot resolve kind via discovery, using as-is")
+					rfMap[kind] = resolved
+					continue
+				}
+
+				if !resource.Namespaced {
+					log.Warnf("kind %q in namespacedFilterPolicies is a cluster-scoped resource; it will never match in a namespace-scoped filter — did you mean clusterScopedFilterPolicy?", kind)
+				}
+
+				if globalExcludes[kind] || globalExcludes[gr.GroupResource().String()] {
+					log.WithFields(logrus.Fields{
+						"kind":             kind,
+						"namespacePattern": strings.Join(policy.Namespaces, ","),
+					}).Warn("namespacedFilterPolicies entry lists a kind that is globally excluded by RestoreSpec.ExcludedResources; the per-namespace filter entry has no effect")
+				}
+
+				rfMap[gr.GroupResource().String()] = resolved
+			}
+		}
+
+		nsFilter := &resolvedNamespaceFilter{
+			resourceFilterMap: rfMap,
+			catchAllFilter:    catchAll,
+		}
+		for _, nsPattern := range policy.Namespaces {
+			result[nsPattern] = nsFilter
+			var compiled glob.Glob
+			if strings.ContainsAny(nsPattern, "*?[") {
+				var err error
+				compiled, err = glob.Compile(nsPattern)
+				if err != nil {
+					log.WithError(err).Warnf("Failed to compile namespace glob pattern %q, falling back to exact match", nsPattern)
+				}
+			}
+			patternOrder = append(patternOrder, namespacedFilterPattern{
+				pattern:  nsPattern,
+				compiled: compiled,
+			})
+		}
+	}
+	return result, patternOrder, nil
+}
+
+// resolveResourceFilter converts a ResourceFilter's label selectors and name patterns
+// into their runtime representations.
+func resolveResourceFilter(
+	rf resourcepolicies.ResourceFilter,
+) (*resolvedResourceFilter, error) {
+	var selector labels.Selector
+	if len(rf.LabelSelector) > 0 {
+		var err error
+		selector, err = labels.ValidatedSelectorFromSet(labels.Set(rf.LabelSelector))
+		if err != nil {
+			return nil, fmt.Errorf("invalid label selector in resource filter: %w", err)
+		}
+	}
+	var orSelectors []labels.Selector
+	for _, ols := range rf.OrLabelSelectors {
+		s, err := labels.ValidatedSelectorFromSet(labels.Set(ols))
+		if err != nil {
+			return nil, fmt.Errorf("invalid OR label selector in resource filter: %w", err)
+		}
+		orSelectors = append(orSelectors, s)
+	}
+	var nameIE *collections.IncludesExcludes
+	if len(rf.Names) > 0 || len(rf.ExcludedNames) > 0 {
+		nameIE = collections.NewIncludesExcludes().Includes(rf.Names...).Excludes(rf.ExcludedNames...)
+	}
+	return &resolvedResourceFilter{
+		labelSelector:    selector,
+		orLabelSelectors: orSelectors,
+		nameIE:           nameIE,
+	}, nil
 }
 
 type resourceClientKey struct {
@@ -1128,6 +1381,10 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	// and should be excluded. Note that we're checking the object's namespace (
 	// via obj.GetNamespace()) instead of the namespace parameter, because we want
 	// to check the *original* namespace, not the remapped one if it's been remapped.
+	//
+	// Note: Additional items intentionally bypass fine-grained resource filter policies
+	// (like per-namespace label/name selectors) to avoid breaking semantic dependencies,
+	// but they must still pass the global exclusions enforced below.
 	if namespace != "" {
 		if !ctx.namespaceIncludesExcludes.ShouldInclude(obj.GetNamespace()) && !ctx.resourceMustHave.Has(groupResource.String()) {
 			restoreLogger.Info("Not restoring item because namespace is excluded")
@@ -2277,6 +2534,18 @@ func (ctx *restoreContext) getOrderedResourceCollection(
 				continue
 			}
 
+			// Per-namespace resource type check from restore filter policy
+			if namespace != "" && !ctx.resourceMustHave.Has(groupResource.String()) {
+				if nsFilter := ctx.getNamespaceFilter(namespace); nsFilter != nil {
+					_, kindListed := nsFilter.resourceFilterMap[groupResource.String()]
+					if !kindListed && nsFilter.catchAllFilter == nil {
+						ctx.log.Infof("Skipping resource %s in namespace %s: not in resourceFilters",
+							resource, namespace)
+						continue
+					}
+				}
+			}
+
 			res, w, e := ctx.getSelectedRestoreableItems(groupResource.String(), namespace, items)
 			warnings.Merge(&w)
 			errs.Merge(&e)
@@ -2330,6 +2599,30 @@ func (ctx *restoreContext) getSelectedRestoreableItems(resource string, original
 		resourceForPath = filepath.Join(resource, cgv.Dir)
 	}
 
+	var rf *resolvedResourceFilter
+	var useFilterPolicy bool
+
+	if !ctx.resourceMustHave.Has(resource) {
+		if originalNamespace != "" {
+			// Namespace-scoped path
+			if nsFilter := ctx.getNamespaceFilter(originalNamespace); nsFilter != nil {
+				// Resolve effective filter: kind-specific takes precedence over catch-all
+				rf = nsFilter.resourceFilterMap[resource]
+				if rf == nil {
+					rf = nsFilter.catchAllFilter // may be nil if no catch-all
+				}
+				useFilterPolicy = true
+			}
+		} else if ctx.clusterScopedFilterMap != nil {
+			// Cluster-scoped path: only applies if kind is listed (refinement overlay)
+			if listedRF, ok := ctx.clusterScopedFilterMap[resource]; ok {
+				rf = listedRF
+				useFilterPolicy = true
+			}
+			// If kind not listed, fall through to global selectors below
+		}
+	}
+
 	for _, item := range items {
 		itemPath := archive.GetItemFilePath(ctx.restoreDir, resourceForPath, originalNamespace, item)
 
@@ -2347,29 +2640,58 @@ func (ctx *restoreContext) getSelectedRestoreableItems(resource string, original
 		}
 
 		if !ctx.resourceMustHave.Has(resource) {
-			if !ctx.selector.Matches(labels.Set(obj.GetLabels())) {
-				continue
-			}
-
-			// Processing OrLabelSelectors when specified in the restore request. LabelSelectors as well as OrLabelSelectors
-			// cannot co-exist, only one of them can be specified
-			var skipItem = false
-			var skip = 0
-			ctx.log.Debugf("orSelectors specified: %s for item: %s", ctx.OrSelectors, item)
-			for _, s := range ctx.OrSelectors {
-				if !s.Matches(labels.Set(obj.GetLabels())) {
-					skip++
+			if useFilterPolicy {
+				if rf != nil {
+					// Per-kind label selector
+					if rf.labelSelector != nil && !rf.labelSelector.Matches(labels.Set(obj.GetLabels())) {
+						continue
+					}
+					// Per-kind OR label selectors
+					if len(rf.orLabelSelectors) > 0 {
+						matched := false
+						for _, s := range rf.orLabelSelectors {
+							if s.Matches(labels.Set(obj.GetLabels())) {
+								matched = true
+								break
+							}
+						}
+						if !matched {
+							ctx.log.Infof("Excluding item %s: no OR label selector matched (restore filter policy)", item)
+							continue
+						}
+					}
+					// Per-kind name filter
+					if rf.nameIE != nil && !rf.nameIE.ShouldInclude(obj.GetName()) {
+						ctx.log.Infof("Excluding item %s: name does not match restore filter policy", obj.GetName())
+						continue
+					}
+				}
+			} else {
+				// Existing global selector logic
+				if !ctx.selector.Matches(labels.Set(obj.GetLabels())) {
+					continue
 				}
 
-				if len(ctx.OrSelectors) == skip && skip > 0 {
-					ctx.log.Infof("setting skip flag to true for item: %s", item)
-					skipItem = true
-				}
-			}
+				// Processing OrLabelSelectors when specified in the restore request. LabelSelectors as well as OrLabelSelectors
+				// cannot co-exist, only one of them can be specified
+				var skipItem = false
+				var skip = 0
+				ctx.log.Debugf("orSelectors specified: %s for item: %s", ctx.OrSelectors, item)
+				for _, s := range ctx.OrSelectors {
+					if !s.Matches(labels.Set(obj.GetLabels())) {
+						skip++
+					}
 
-			if skipItem {
-				ctx.log.Infof("restore orSelector labels did not match, skipping restore of item: %s", skipItem, item)
-				continue
+					if len(ctx.OrSelectors) == skip && skip > 0 {
+						ctx.log.Infof("setting skip flag to true for item: %s", item)
+						skipItem = true
+					}
+				}
+
+				if skipItem {
+					ctx.log.Infof("restore orSelector labels did not match, skipping restore of item: %s", skipItem, item)
+					continue
+				}
 			}
 		}
 
