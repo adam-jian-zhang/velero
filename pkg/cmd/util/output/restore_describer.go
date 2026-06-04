@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
 	"github.com/vmware-tanzu/velero/internal/volume"
 
 	corev1api "k8s.io/api/core/v1"
@@ -217,6 +216,11 @@ func DescribeRestore(
 		if restore.Spec.ResourceModifier != nil {
 			d.Println()
 			DescribeResourceModifier(d, restore.Spec.ResourceModifier)
+		}
+
+		if restore.Spec.ResourcePolicy != nil {
+			d.Println()
+			DescribeResourcePolicies(d, restore.Spec.ResourcePolicy)
 		}
 
 		describeUploaderConfigForRestore(d, restore.Spec)
