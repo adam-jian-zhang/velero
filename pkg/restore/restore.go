@@ -1345,39 +1345,10 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	// and should be excluded. Note that we're checking the object's namespace (
 	// via obj.GetNamespace()) instead of the namespace parameter, because we want
 	// to check the *original* namespace, not the remapped one if it's been remapped.
-	if !ctx.resourceMustHave.Has(groupResource.String()) {
-		ns := obj.GetNamespace()
-		if ns != "" {
-			// Namespace-scoped path
-			if nsFilter := ctx.getNamespaceFilter(ns); nsFilter != nil {
-				_, kindListed := nsFilter.resourceFilterMap[groupResource.String()]
-				if !kindListed && nsFilter.catchAllFilter == nil {
-					restoreLogger.Info("Not restoring item because resource excluded by restore filter policy")
-					return warnings, errs, itemExists
-				}
-				// Resolve effective filter for name check
-				rf := nsFilter.resourceFilterMap[groupResource.String()]
-				if rf == nil {
-					rf = nsFilter.catchAllFilter
-				}
-				if rf != nil && rf.nameIE != nil &&
-					!rf.nameIE.ShouldInclude(obj.GetName()) {
-					restoreLogger.Info("Not restoring item because name excluded by restore filter policy")
-					return warnings, errs, itemExists
-				}
-			}
-		} else if ctx.clusterScopedFilterMap != nil {
-			// Cluster-scoped path: only enforce filters when the kind is listed (refinement overlay)
-			if rf, ok := ctx.clusterScopedFilterMap[groupResource.String()]; ok {
-				if rf != nil && rf.nameIE != nil &&
-					!rf.nameIE.ShouldInclude(obj.GetName()) {
-					restoreLogger.Info("Not restoring cluster-scoped item because name excluded by clusterScopedFilterPolicy")
-					return warnings, errs, itemExists
-				}
-			}
-		}
-	}
-
+	//
+	// Note: Additional items intentionally bypass fine-grained resource filter policies
+	// (like per-namespace label/name selectors) to avoid breaking semantic dependencies,
+	// but they must still pass the global exclusions enforced below.
 	if namespace != "" {
 		if !ctx.namespaceIncludesExcludes.ShouldInclude(obj.GetNamespace()) && !ctx.resourceMustHave.Has(groupResource.String()) {
 			restoreLogger.Info("Not restoring item because namespace is excluded")
