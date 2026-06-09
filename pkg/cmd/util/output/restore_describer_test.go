@@ -2,6 +2,7 @@ package output
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"testing"
 	"text/tabwriter"
@@ -10,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -414,4 +417,86 @@ func TestDescribeResourceModifier(t *testing.T) {
 
 	fmt.Println(d.buf.String())
 	require.Equal(t, expectOutput, d.buf.String())
+}
+
+func TestDescribeRestoreFineGrainedFilterPolicies(t *testing.T) {
+	yamlData := `
+version: v1
+clusterScopedFilterPolicy:
+  resourceFilters:
+  - kinds: ["StorageClass"]
+    labelSelector: {"app": "velero"}
+  - kinds: ["ClusterRole"]
+    orLabelSelectors:
+    - {"app": "velero"}
+    - {"app": "test"}
+    names: ["role1"]
+    excludedNames: ["role2"]
+namespacedFilterPolicies:
+- namespaces: ["ns1", "ns2"]
+  resourceFilters:
+  - kinds: ["Pod", "ConfigMap"]
+    labelSelector: {"app": "velero"}
+  - kinds: ["*"]
+`
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-policy",
+			Namespace: "velero",
+		},
+		Data: map[string]string{
+			"policy.yaml": yamlData,
+		},
+	}
+
+	client := fake.NewClientBuilder().WithRuntimeObjects(cm).Build()
+
+	restore := builder.ForRestore("velero", "test-restore").
+		ResourcePoliciesConfigmap("test-policy").Result()
+
+	d := &Describer{
+		Prefix: "",
+		out:    &tabwriter.Writer{},
+		buf:    &bytes.Buffer{},
+	}
+	d.out.Init(d.buf, 0, 8, 2, ' ', 0)
+
+	DescribeRestoreFineGrainedFilterPolicies(context.Background(), client, d, restore)
+	d.out.Flush()
+
+	expected := `
+Cluster-Scoped Filter Policy:
+  Resource Filters:
+    StorageClass:
+      Label selector:     app=velero
+      Included names:     <none>
+      Excluded names:     <none>
+    ClusterRole:
+      OR label selectors: [app=velero, app=test]
+      Included names:     [role1]
+      Excluded names:     [role2]
+
+Namespace-Scoped Filter Policies:
+  ns1:
+    Resource Filters:
+      Pod, ConfigMap:
+        Label selector:     app=velero
+        Included names:     <none>
+        Excluded names:     <none>
+      <catch-all> (all other kinds):
+        Label selector:     <none>
+        Included names:     <none>
+        Excluded names:     <none>
+  ns2:
+    Resource Filters:
+      Pod, ConfigMap:
+        Label selector:     app=velero
+        Included names:     <none>
+        Excluded names:     <none>
+      <catch-all> (all other kinds):
+        Label selector:     <none>
+        Included names:     <none>
+        Excluded names:     <none>
+`
+	assert.Equal(t, expected, d.buf.String())
 }
