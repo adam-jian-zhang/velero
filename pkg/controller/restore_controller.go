@@ -408,7 +408,7 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 		restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
 			fmt.Sprintf("backup %q is in phase %q and cannot be used as a restore source",
 				info.backup.Name, info.backup.Status.Phase))
-		return backupInfo{}, nil
+		return backupInfo{}, nil, nil
 	}
 
 	// Fill in the ScheduleName so it's easier to consume for metrics.
