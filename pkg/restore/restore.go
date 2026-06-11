@@ -375,6 +375,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		clusterScopedFilterMap:         clusterScopedFilterMap,
 		namespacedFilterMap:            namespacedFilterMap,
 		namespacedFilterPatterns:       namespacedFilterPatterns,
+		namespaceFilterCache:           make(map[string]*resolvedNamespaceFilter),
 	}
 
 	return restoreCtx.execute()
@@ -436,6 +437,10 @@ type restoreContext struct {
 	// namespacedFilterPatterns preserves the order of patterns for first-match
 	// semantics and caches pre-compiled globs to avoid repeated compilation.
 	namespacedFilterPatterns []namespacedFilterPattern
+
+	// namespaceFilterCache memoizes the resolved filter for a given namespace
+	// to avoid re-evaluating glob patterns on every call.
+	namespaceFilterCache map[string]*resolvedNamespaceFilter
 }
 
 type resolvedResourceFilter struct {
@@ -463,16 +468,29 @@ func (ctx *restoreContext) getNamespaceFilter(namespace string) *resolvedNamespa
 	if ctx.namespacedFilterMap == nil {
 		return nil
 	}
-	// Walk patterns in definition order (first-match semantics)
+
+	// 1. Check the cache first
+	if filter, ok := ctx.namespaceFilterCache[namespace]; ok {
+		return filter
+	}
+
+	// 2. Walk patterns in definition order (first-match semantics)
 	for _, p := range ctx.namespacedFilterPatterns {
 		if p.compiled != nil {
 			if p.compiled.Match(namespace) {
-				return ctx.namespacedFilterMap[p.pattern]
+				filter := ctx.namespacedFilterMap[p.pattern]
+				ctx.namespaceFilterCache[namespace] = filter
+				return filter
 			}
 		} else if p.pattern == namespace {
-			return ctx.namespacedFilterMap[p.pattern]
+			filter := ctx.namespacedFilterMap[p.pattern]
+			ctx.namespaceFilterCache[namespace] = filter
+			return filter
 		}
 	}
+
+	// 3. Cache the miss so we don't re-evaluate failed matches
+	ctx.namespaceFilterCache[namespace] = nil
 	return nil
 }
 
@@ -2583,6 +2601,30 @@ func (ctx *restoreContext) getSelectedRestoreableItems(resource string, original
 		resourceForPath = filepath.Join(resource, cgv.Dir)
 	}
 
+	var rf *resolvedResourceFilter
+	var useFilterPolicy bool
+
+	if !ctx.resourceMustHave.Has(resource) {
+		if originalNamespace != "" {
+			// Namespace-scoped path
+			if nsFilter := ctx.getNamespaceFilter(originalNamespace); nsFilter != nil {
+				// Resolve effective filter: kind-specific takes precedence over catch-all
+				rf = nsFilter.resourceFilterMap[resource]
+				if rf == nil {
+					rf = nsFilter.catchAllFilter // may be nil if no catch-all
+				}
+				useFilterPolicy = true
+			}
+		} else if ctx.clusterScopedFilterMap != nil {
+			// Cluster-scoped path: only applies if kind is listed (refinement overlay)
+			if listedRF, ok := ctx.clusterScopedFilterMap[resource]; ok {
+				rf = listedRF
+				useFilterPolicy = true
+			}
+			// If kind not listed, fall through to global selectors below
+		}
+	}
+
 	for _, item := range items {
 		itemPath := archive.GetItemFilePath(ctx.restoreDir, resourceForPath, originalNamespace, item)
 
@@ -2600,28 +2642,6 @@ func (ctx *restoreContext) getSelectedRestoreableItems(resource string, original
 		}
 
 		if !ctx.resourceMustHave.Has(resource) {
-			var rf *resolvedResourceFilter
-			var useFilterPolicy bool
-
-			if originalNamespace != "" {
-				// Namespace-scoped path
-				if nsFilter := ctx.getNamespaceFilter(originalNamespace); nsFilter != nil {
-					// Resolve effective filter: kind-specific takes precedence over catch-all
-					rf = nsFilter.resourceFilterMap[resource]
-					if rf == nil {
-						rf = nsFilter.catchAllFilter // may be nil if no catch-all
-					}
-					useFilterPolicy = true
-				}
-			} else if ctx.clusterScopedFilterMap != nil {
-				// Cluster-scoped path: only applies if kind is listed (refinement overlay)
-				if listedRF, ok := ctx.clusterScopedFilterMap[resource]; ok {
-					rf = listedRF
-					useFilterPolicy = true
-				}
-				// If kind not listed, fall through to global selectors below
-			}
-
 			if useFilterPolicy {
 				if rf != nil {
 					// Per-kind label selector
