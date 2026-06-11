@@ -251,22 +251,28 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		// Resolve clusterScopedFilterPolicy
 		csPolicy := req.ResPolicies.GetClusterScopedFilterPolicy()
 		if csPolicy != nil {
-			clusterScopedFilterMap = resolveRestoreClusterScopedFilterPolicy(
+			clusterScopedFilterMap, err = resolveRestoreClusterScopedFilterPolicy(
 				csPolicy,
 				kr.discoveryHelper,
 				req.Log,
 			)
+			if err != nil {
+				return results.Result{}, results.Result{Velero: []string{err.Error()}}
+			}
 		}
 
 		// Resolve namespacedFilterPolicies
 		nfPolicies := req.ResPolicies.GetNamespacedFilterPolicies()
 		if len(nfPolicies) > 0 {
-			namespacedFilterMap, namespacedFilterPatterns = resolveRestoreNamespacedFilterPolicies(
+			namespacedFilterMap, namespacedFilterPatterns, err = resolveRestoreNamespacedFilterPolicies(
 				nfPolicies,
 				req.Restore.Spec.ExcludedResources,
 				kr.discoveryHelper,
 				req.Log,
 			)
+			if err != nil {
+				return results.Result{}, results.Result{Velero: []string{err.Error()}}
+			}
 		}
 	}
 
@@ -479,10 +485,13 @@ func resolveRestoreClusterScopedFilterPolicy(
 	policy *resourcepolicies.ClusterScopedFilterPolicy,
 	helper discovery.Helper,
 	log logrus.FieldLogger,
-) map[string]*resolvedResourceFilter {
+) (map[string]*resolvedResourceFilter, error) {
 	result := make(map[string]*resolvedResourceFilter)
 	for _, rf := range policy.ResourceFilters {
-		resolved := resolveResourceFilter(rf)
+		resolved, err := resolveResourceFilter(rf)
+		if err != nil {
+			return nil, err
+		}
 		for _, kind := range rf.Kinds {
 			gr, resource, err := helper.ResourceFor(schema.GroupVersionResource{Resource: kind})
 			if err != nil {
@@ -496,7 +505,7 @@ func resolveRestoreClusterScopedFilterPolicy(
 			result[gr.GroupResource().String()] = resolved
 		}
 	}
-	return result
+	return result, nil
 }
 
 func resolveRestoreNamespacedFilterPolicies(
@@ -504,7 +513,7 @@ func resolveRestoreNamespacedFilterPolicies(
 	excludedResources []string,
 	helper discovery.Helper,
 	log logrus.FieldLogger,
-) (map[string]*resolvedNamespaceFilter, []namespacedFilterPattern) {
+) (map[string]*resolvedNamespaceFilter, []namespacedFilterPattern, error) {
 	result := make(map[string]*resolvedNamespaceFilter)
 	var patternOrder []namespacedFilterPattern
 
@@ -519,7 +528,10 @@ func resolveRestoreNamespacedFilterPolicies(
 		var catchAll *resolvedResourceFilter
 
 		for _, rf := range policy.ResourceFilters {
-			resolved := resolveResourceFilter(rf)
+			resolved, err := resolveResourceFilter(rf)
+			if err != nil {
+				return nil, nil, err
+			}
 
 			isCatchAll := len(rf.Kinds) == 0 ||
 				(len(rf.Kinds) == 1 && rf.Kinds[0] == "*")
@@ -574,21 +586,29 @@ func resolveRestoreNamespacedFilterPolicies(
 			})
 		}
 	}
-	return result, patternOrder
+	return result, patternOrder, nil
 }
 
 // resolveResourceFilter converts a ResourceFilter's label selectors and name patterns
 // into their runtime representations.
 func resolveResourceFilter(
 	rf resourcepolicies.ResourceFilter,
-) *resolvedResourceFilter {
+) (*resolvedResourceFilter, error) {
 	var selector labels.Selector
 	if len(rf.LabelSelector) > 0 {
-		selector = labels.SelectorFromSet(labels.Set(rf.LabelSelector))
+		var err error
+		selector, err = labels.ValidatedSelectorFromSet(labels.Set(rf.LabelSelector))
+		if err != nil {
+			return nil, fmt.Errorf("invalid label selector in resource filter: %w", err)
+		}
 	}
 	var orSelectors []labels.Selector
 	for _, ols := range rf.OrLabelSelectors {
-		orSelectors = append(orSelectors, labels.SelectorFromSet(labels.Set(ols)))
+		s, err := labels.ValidatedSelectorFromSet(labels.Set(ols))
+		if err != nil {
+			return nil, fmt.Errorf("invalid OR label selector in resource filter: %w", err)
+		}
+		orSelectors = append(orSelectors, s)
 	}
 	var nameIE *collections.IncludesExcludes
 	if len(rf.Names) > 0 || len(rf.ExcludedNames) > 0 {
@@ -598,7 +618,7 @@ func resolveResourceFilter(
 		labelSelector:    selector,
 		orLabelSelectors: orSelectors,
 		nameIE:           nameIE,
-	}
+	}, nil
 }
 
 type resourceClientKey struct {
