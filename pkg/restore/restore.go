@@ -551,9 +551,7 @@ func resolveRestoreNamespacedFilterPolicies(
 				return nil, nil, err
 			}
 
-			isCatchAll := len(rf.Kinds) == 0 ||
-				(len(rf.Kinds) == 1 && rf.Kinds[0] == "*")
-			if isCatchAll {
+			if rf.IsCatchAll() {
 				catchAll = resolved
 				continue
 			}
