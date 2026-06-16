@@ -351,9 +351,10 @@ func GetResourcePoliciesFromBackup(
 	return resourcePolicies, nil
 }
 
+// GetResourcePoliciesFromRestore retrieves the resource policies from the ConfigMap referenced in the Restore spec.
 func GetResourcePoliciesFromRestore(
 	ctx context.Context,
-	restore velerov1api.Restore,
+	restore *velerov1api.Restore,
 	client crclient.Client,
 	logger logrus.FieldLogger,
 ) (resourcePolicies *Policies, err error) {

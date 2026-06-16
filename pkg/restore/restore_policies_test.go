@@ -180,7 +180,7 @@ namespacedFilterPolicies:
 					Name: "test-policies",
 				}
 				var err error
-				resPolicies, err = resourcepolicies.GetResourcePoliciesFromRestore(context.Background(), *restore, client, logrus.New())
+				resPolicies, err = resourcepolicies.GetResourcePoliciesFromRestore(context.Background(), restore, client, logrus.New())
 				require.NoError(t, err)
 			}
 

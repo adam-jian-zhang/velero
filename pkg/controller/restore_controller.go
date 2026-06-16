@@ -420,7 +420,7 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 	if restore.Spec.ResourcePolicy != nil {
 		var err error
 		restoreResPolicies, err = resourcepolicies.GetResourcePoliciesFromRestore(
-			ctx, *restore, r.kbClient, r.logger,
+			ctx, restore, r.kbClient, r.logger,
 		)
 		if err != nil {
 			restore.Status.ValidationErrors = append(

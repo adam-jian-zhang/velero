@@ -533,7 +533,7 @@ volumePolicies:
 		},
 	}
 
-	resPolicies, err := GetResourcePoliciesFromRestore(context.Background(), restore, client, logger)
+	resPolicies, err := GetResourcePoliciesFromRestore(context.Background(), &restore, client, logger)
 	require.NoError(t, err)
 	assert.Equal(t, "v1", resPolicies.version)
 	assert.Len(t, resPolicies.volumePolicies, 1)

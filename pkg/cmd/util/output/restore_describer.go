@@ -553,7 +553,7 @@ func DescribeRestoreFineGrainedFilterPolicies(ctx context.Context, kbClient kbcl
 	discardLogger := logrus.New()
 	discardLogger.Out = io.Discard
 
-	resourcePolicies, err := resourcepolicies.GetResourcePoliciesFromRestore(ctx, *restore, kbClient, discardLogger)
+	resourcePolicies, err := resourcepolicies.GetResourcePoliciesFromRestore(ctx, restore, kbClient, discardLogger)
 	if err != nil {
 		// Don't fail the describe if we can't read policies, just skip
 		return
