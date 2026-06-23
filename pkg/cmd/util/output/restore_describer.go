@@ -22,13 +22,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
-
-	"github.com/sirupsen/logrus"
-
-	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 
 	corev1api "k8s.io/api/core/v1"
@@ -226,7 +221,6 @@ func DescribeRestore(
 		if restore.Spec.ResourcePolicy != nil {
 			d.Println()
 			DescribeResourcePolicies(d, restore.Spec.ResourcePolicy)
-			DescribeRestoreFineGrainedFilterPolicies(ctx, kbClient, d, restore)
 		}
 
 		describeUploaderConfigForRestore(d, restore.Spec)
@@ -541,109 +535,4 @@ func DescribeResourceModifier(d *Describer, resModifier *corev1api.TypedLocalObj
 	d.Printf("Resource modifier:\n")
 	d.Printf("\tType:\t%s\n", resModifier.Kind)
 	d.Printf("\tName:\t%s\n", resModifier.Name)
-}
-
-// DescribeRestoreFineGrainedFilterPolicies describes cluster-scoped and namespace-scoped filter policies if present
-func DescribeRestoreFineGrainedFilterPolicies(ctx context.Context, kbClient kbclient.Client, d *Describer, restore *velerov1api.Restore) {
-	if restore.Spec.ResourcePolicy == nil {
-		return
-	}
-
-	// Create a discard logger for the resource policies function since this is CLI output context
-	discardLogger := logrus.New()
-	discardLogger.Out = io.Discard
-
-	resourcePolicies, err := resourcepolicies.GetResourcePoliciesFromRestore(ctx, restore, kbClient, discardLogger)
-	if err != nil {
-		// Don't fail the describe if we can't read policies, just skip
-		return
-	}
-
-	if resourcePolicies == nil {
-		return
-	}
-
-	clusterScopedFilterPolicy := resourcePolicies.GetClusterScopedFilterPolicy()
-	if clusterScopedFilterPolicy != nil {
-		d.Printf("\nCluster-Scoped Filter Policy:\n")
-		d.Printf("  Resource Filters:\n")
-		for _, rf := range clusterScopedFilterPolicy.ResourceFilters {
-			kindsStr := strings.Join(rf.Kinds, ", ")
-			d.Printf("    %s:\n", kindsStr)
-
-			// Label selector
-			if len(rf.LabelSelector) > 0 {
-				selectorStr := formatLabelMap(rf.LabelSelector)
-				d.Printf("      Label selector:     %s\n", selectorStr)
-			} else if len(rf.OrLabelSelectors) > 0 {
-				var orStrs []string
-				for _, ols := range rf.OrLabelSelectors {
-					orStrs = append(orStrs, formatLabelMap(ols))
-				}
-				d.Printf("      OR label selectors: [%s]\n", strings.Join(orStrs, ", "))
-			} else {
-				d.Printf("      Label selector:     <none>\n")
-			}
-
-			// Name patterns
-			if len(rf.Names) > 0 {
-				d.Printf("      Included names:     [%s]\n", strings.Join(rf.Names, ", "))
-			} else {
-				d.Printf("      Included names:     <none>\n")
-			}
-
-			if len(rf.ExcludedNames) > 0 {
-				d.Printf("      Excluded names:     [%s]\n", strings.Join(rf.ExcludedNames, ", "))
-			} else {
-				d.Printf("      Excluded names:     <none>\n")
-			}
-		}
-	}
-
-	nfPolicies := resourcePolicies.GetNamespacedFilterPolicies()
-	if len(nfPolicies) > 0 {
-		d.Printf("\nNamespace-Scoped Filter Policies:\n")
-		for _, policy := range nfPolicies {
-			for _, ns := range policy.Namespaces {
-				d.Printf("  %s:\n", ns)
-				d.Printf("    Resource Filters:\n")
-				for _, rf := range policy.ResourceFilters {
-					var kindsStr string
-					if rf.IsCatchAll() {
-						kindsStr = "<catch-all> (all other kinds)"
-					} else {
-						kindsStr = strings.Join(rf.Kinds, ", ")
-					}
-					d.Printf("      %s:\n", kindsStr)
-
-					// Label selector
-					if len(rf.LabelSelector) > 0 {
-						selectorStr := formatLabelMap(rf.LabelSelector)
-						d.Printf("        Label selector:     %s\n", selectorStr)
-					} else if len(rf.OrLabelSelectors) > 0 {
-						var orStrs []string
-						for _, ols := range rf.OrLabelSelectors {
-							orStrs = append(orStrs, formatLabelMap(ols))
-						}
-						d.Printf("        OR label selectors: [%s]\n", strings.Join(orStrs, ", "))
-					} else {
-						d.Printf("        Label selector:     <none>\n")
-					}
-
-					// Name patterns
-					if len(rf.Names) > 0 {
-						d.Printf("        Included names:     [%s]\n", strings.Join(rf.Names, ", "))
-					} else {
-						d.Printf("        Included names:     <none>\n")
-					}
-
-					if len(rf.ExcludedNames) > 0 {
-						d.Printf("        Excluded names:     [%s]\n", strings.Join(rf.ExcludedNames, ", "))
-					} else {
-						d.Printf("        Excluded names:     <none>\n")
-					}
-				}
-			}
-		}
-	}
 }
