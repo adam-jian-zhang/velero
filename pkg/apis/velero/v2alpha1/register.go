@@ -46,8 +46,9 @@ func newTypeInfo(pluralName string, itemType, itemListType runtime.Object) typeI
 // API group, keyed on Kind.
 func CustomResources() map[string]typeInfo {
 	return map[string]typeInfo{
-		"DataUpload":   newTypeInfo("datauploads", &DataUpload{}, &DataUploadList{}),
-		"DataDownload": newTypeInfo("datadownloads", &DataDownload{}, &DataDownloadList{}),
+		"DataUpload":    newTypeInfo("datauploads", &DataUpload{}, &DataUploadList{}),
+		"DataDownload":  newTypeInfo("datadownloads", &DataDownload{}, &DataDownloadList{}),
+		"SearchRequest": newTypeInfo("searchrequests", &SearchRequest{}, &SearchRequestList{}),
 	}
 }
 

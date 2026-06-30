@@ -48,6 +48,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	vsv1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/volumesnapshotter/v1"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/repository"
@@ -76,6 +77,7 @@ type backupDeletionReconciler struct {
 	backupStoreGetter persistence.ObjectBackupStoreGetter
 	credentialStore   credentials.FileStore
 	repoEnsurer       *repository.Ensurer
+	searchProvider    velero.SearchProvider
 }
 
 // NewBackupDeletionReconciler creates a new backup deletion reconciler.
@@ -90,6 +92,7 @@ func NewBackupDeletionReconciler(
 	backupStoreGetter persistence.ObjectBackupStoreGetter,
 	credentialStore credentials.FileStore,
 	repoEnsurer *repository.Ensurer,
+	searchProvider velero.SearchProvider,
 ) *backupDeletionReconciler {
 	return &backupDeletionReconciler{
 		Client:            client,
@@ -103,6 +106,7 @@ func NewBackupDeletionReconciler(
 		backupStoreGetter: backupStoreGetter,
 		credentialStore:   credentialStore,
 		repoEnsurer:       repoEnsurer,
+		searchProvider:    searchProvider,
 	}
 }
 
@@ -365,6 +369,11 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		log.Info("Removing backup from backup storage")
 		if err := backupStore.DeleteBackup(backup.Name); err != nil {
 			errs = append(errs, err.Error())
+		} else if r.searchProvider != nil {
+			log.Info("Removing backup from search index")
+			if err := r.searchProvider.DeleteBackup(ctx, backup.Name); err != nil {
+				errs = append(errs, fmt.Sprintf("error removing backup %s from search index: %v", backup.Name, err))
+			}
 		}
 	} else if len(errs) > 0 {
 		log.Info("Skipping removal of backup from backup storage due to previous errors")

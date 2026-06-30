@@ -100,6 +100,7 @@ func setupBackupDeletionControllerTest(t *testing.T, req *velerov1api.DeleteBack
 			NewFakeSingleObjectBackupStoreGetter(backupStore),
 			velerotest.NewFakeCredentialsFileStore("", nil),
 			nil,
+			nil, // searchProvider
 		),
 		req: ctrl.Request{NamespacedName: types.NamespacedName{Namespace: req.Namespace, Name: req.Name}},
 	}
@@ -1124,6 +1125,7 @@ func TestDeleteMovedSnapshots(t *testing.T) {
 				NewFakeSingleObjectBackupStoreGetter(backupStore),
 				velerotest.NewFakeCredentialsFileStore("", nil),
 				nil,
+				nil, // searchProvider
 			)
 
 			veleroBackup.Name = test.backupName

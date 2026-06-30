@@ -85,6 +85,9 @@ type Manager interface {
 	// GetItemBlockAction returns the ItemBlock action plugin for name.
 	GetItemBlockAction(name string) (ibav1.ItemBlockAction, error)
 
+	// GetSearchProvider returns the search provider plugin for name.
+	GetSearchProvider(name string) (velero.SearchProvider, error)
+
 	// CleanupClients terminates all of the Manager's running plugin processes.
 	CleanupClients()
 }
@@ -418,6 +421,18 @@ func (m *manager) GetItemBlockAction(name string) (ibav1.ItemBlockAction, error)
 		return adaptedItemBlockAction.GetRestartable(name, restartableProcess), nil
 	}
 	return nil, fmt.Errorf("unable to get valid ItemBlockAction for %q", name)
+}
+
+// GetSearchProvider returns a restartableSearchProvider for name.
+func (m *manager) GetSearchProvider(name string) (velero.SearchProvider, error) {
+	name = sanitizeName(name)
+
+	restartableProcess, err := m.getRestartableProcess(common.PluginKindSearchProvider, name)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewRestartableSearchProvider(name, restartableProcess), nil
 }
 
 // sanitizeName adds "velero.io" to legacy plugins that weren't namespaced.

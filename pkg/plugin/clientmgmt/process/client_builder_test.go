@@ -63,6 +63,7 @@ func TestClientConfig(t *testing.T) {
 			string(common.PluginKindRestoreItemActionV2): riav2.NewRestoreItemActionPlugin(common.ClientLogger(logger)),
 			string(common.PluginKindDeleteItemAction):    framework.NewDeleteItemActionPlugin(common.ClientLogger(logger)),
 			string(common.PluginKindItemBlockAction):     ibav1.NewItemBlockActionPlugin(common.ClientLogger(logger)),
+			string(common.PluginKindSearchProvider):      framework.NewSearchProviderPlugin(common.ClientLogger(logger)),
 		},
 		Logger: cb.pluginLogger,
 		Cmd:    exec.CommandContext(t.Context(), cb.commandName, cb.commandArgs...),

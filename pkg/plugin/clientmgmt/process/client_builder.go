@@ -77,6 +77,7 @@ func (b *clientBuilder) clientConfig() *hcplugin.ClientConfig {
 			string(common.PluginKindRestoreItemActionV2): riav2.NewRestoreItemActionPlugin(common.ClientLogger(b.clientLogger)),
 			string(common.PluginKindDeleteItemAction):    framework.NewDeleteItemActionPlugin(common.ClientLogger(b.clientLogger)),
 			string(common.PluginKindItemBlockAction):     ibav1.NewItemBlockActionPlugin(common.ClientLogger(b.clientLogger)),
+			string(common.PluginKindSearchProvider):      framework.NewSearchProviderPlugin(common.ClientLogger(b.clientLogger)),
 		},
 		Logger: b.pluginLogger,
 		Cmd:    exec.CommandContext(context.Background(), b.commandName, b.commandArgs...), //nolint:gosec // Internal call. No need to check the command line.

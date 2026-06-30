@@ -320,6 +320,7 @@ func Test_veleroResourcesExist(t *testing.T) {
 			APIResources: []metav1.APIResource{
 				{Kind: "DataUpload"},
 				{Kind: "DataDownload"},
+				{Kind: "SearchRequest"},
 			},
 		},
 	})

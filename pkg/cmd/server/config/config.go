@@ -67,6 +67,8 @@ var (
 		constant.ControllerSchedule,
 		constant.ControllerServerStatusRequest,
 		constant.ControllerRestoreFinalizer,
+		constant.ControllerSearchIndex,
+		constant.ControllerSearchRequest,
 	}
 
 	/*
@@ -182,6 +184,19 @@ type Config struct {
 	ItemBlockWorkerCount                int
 	ConcurrentBackups                   int
 	GlobalBackupVolumePoliciesConfigMap string
+
+	// Search configs
+	SearchProviderName      string
+	SearchDBDriver          string
+	SearchDBDSN             string
+	SearchMaxWorkers        int
+	SearchResyncInterval    time.Duration
+	SearchRequestDefaultTTL time.Duration
+	SearchMaxPendingTTL     time.Duration
+	SearchGCInterval        time.Duration
+	SearchRestPort          int
+	SearchGRPCPort          int
+	SearchResultSizeBudget  int
 }
 
 func GetDefaultConfig() *Config {
@@ -215,6 +230,17 @@ func GetDefaultConfig() *Config {
 		CredentialsDirectory:           credentials.DefaultStoreDirectory(),
 		ItemBlockWorkerCount:           DefaultItemBlockWorkerCount,
 		ConcurrentBackups:              DefaultConcurrentBackups,
+		SearchProviderName:             "velero.io/search-provider",
+		SearchDBDriver:                 "sqlite",
+		SearchDBDSN:                    "/var/lib/velero/search.db",
+		SearchMaxWorkers:               10,
+		SearchResyncInterval:           time.Hour,
+		SearchRequestDefaultTTL:        10 * time.Minute,
+		SearchMaxPendingTTL:            5 * time.Minute,
+		SearchGCInterval:               30 * time.Minute,
+		SearchRestPort:                 8086,
+		SearchGRPCPort:                 8087,
+		SearchResultSizeBudget:         1024 * 1024, // 1MiB
 	}
 
 	return config
@@ -282,4 +308,15 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 		c.GlobalBackupVolumePoliciesConfigMap,
 		"The name of a ConfigMap in the Velero install namespace holding global backup volume policies that are merged into every backup. Optional.",
 	)
+	flags.StringVar(&c.SearchProviderName, "search-provider-name", c.SearchProviderName, "Active SearchProvider plugin name.")
+	flags.StringVar(&c.SearchDBDriver, "search-db-driver", c.SearchDBDriver, "Built-in backend driver: sqlite or postgres.")
+	flags.StringVar(&c.SearchDBDSN, "search-db-dsn", c.SearchDBDSN, "SQLite path or PostgreSQL DSN.")
+	flags.IntVar(&c.SearchMaxWorkers, "search-max-workers", c.SearchMaxWorkers, "Max concurrent IndexBackup calls.")
+	flags.DurationVar(&c.SearchResyncInterval, "search-resync-interval", c.SearchResyncInterval, "Full index reconcile interval.")
+	flags.DurationVar(&c.SearchRequestDefaultTTL, "search-request-default-ttl", c.SearchRequestDefaultTTL, "Default TTL for SearchRequest CRs.")
+	flags.DurationVar(&c.SearchMaxPendingTTL, "search-max-pending-ttl", c.SearchMaxPendingTTL, "Max time a SearchRequest may stay New/Processing.")
+	flags.DurationVar(&c.SearchGCInterval, "search-gc-interval", c.SearchGCInterval, "Interval for the SearchRequest GC sweep.")
+	flags.IntVar(&c.SearchRestPort, "search-rest-port", c.SearchRestPort, "REST API server port.")
+	flags.IntVar(&c.SearchGRPCPort, "search-grpc-port", c.SearchGRPCPort, "gRPC API server port.")
+	flags.IntVar(&c.SearchResultSizeBudget, "search-result-size-budget", c.SearchResultSizeBudget, "Max serialized status size before truncation in bytes.")
 }
