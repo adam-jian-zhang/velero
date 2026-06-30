@@ -181,6 +181,10 @@ func NewCommand(f client.Factory) *cobra.Command {
 				RegisterItemBlockAction(
 					"velero.io/service-account",
 					newServiceAccountItemBlockAction(f),
+				).
+				RegisterSearchProvider(
+					"velero.io/search-provider",
+					newBuiltinSearchProvider,
 				)
 
 			if !features.IsEnabled(velerov1api.APIGroupVersionsFeatureFlag) {

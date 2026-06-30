@@ -419,6 +419,36 @@ func (_m *Manager) GetRestoreItemActionsV2() ([]restoreitemactionv2.RestoreItemA
 	return r0, r1
 }
 
+// GetSearchProvider provides a mock function with given fields: name
+func (_m *Manager) GetSearchProvider(name string) (velero.SearchProvider, error) {
+	ret := _m.Called(name)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetSearchProvider")
+	}
+
+	var r0 velero.SearchProvider
+	var r1 error
+	if rf, ok := ret.Get(0).(func(string) (velero.SearchProvider, error)); ok {
+		return rf(name)
+	}
+	if rf, ok := ret.Get(0).(func(string) velero.SearchProvider); ok {
+		r0 = rf(name)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(velero.SearchProvider)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(string) error); ok {
+		r1 = rf(name)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // GetVolumeSnapshotter provides a mock function with given fields: name
 func (_m *Manager) GetVolumeSnapshotter(name string) (volumesnapshotterv1.VolumeSnapshotter, error) {
 	ret := _m.Called(name)

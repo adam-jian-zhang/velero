@@ -100,6 +100,10 @@ type Server interface {
 	// RegisterItemBlockActions registers multiple ItemBlock actions.
 	RegisterItemBlockActions(map[string]common.HandlerInitializer) Server
 
+	// RegisterSearchProvider registers a search provider. Accepted format
+	// for the plugin name is <DNS subdomain>/<non-empty name>.
+	RegisterSearchProvider(pluginName string, initializer common.HandlerInitializer) Server
+
 	// Server runs the plugin server.
 	Serve()
 }
@@ -117,6 +121,7 @@ type server struct {
 	restoreItemActionV2 *riav2.RestoreItemActionPlugin
 	deleteItemAction    *DeleteItemActionPlugin
 	itemBlockAction     *ibav1.ItemBlockActionPlugin
+	searchProvider      *SearchProviderPlugin
 }
 
 // NewServer returns a new Server
@@ -134,6 +139,7 @@ func NewServer() Server {
 		restoreItemActionV2: riav2.NewRestoreItemActionPlugin(common.ServerLogger(log)),
 		deleteItemAction:    NewDeleteItemActionPlugin(common.ServerLogger(log)),
 		itemBlockAction:     ibav1.NewItemBlockActionPlugin(common.ServerLogger(log)),
+		searchProvider:      NewSearchProviderPlugin(common.ServerLogger(log)),
 	}
 }
 
@@ -244,6 +250,11 @@ func (s *server) RegisterItemBlockActions(m map[string]common.HandlerInitializer
 	return s
 }
 
+func (s *server) RegisterSearchProvider(name string, initializer common.HandlerInitializer) Server {
+	s.searchProvider.Register(name, initializer)
+	return s
+}
+
 // getNames returns a list of PluginIdentifiers registered with plugin.
 func getNames(command string, kind common.PluginKind, plugin Interface) []PluginIdentifier {
 	var pluginIdentifiers []PluginIdentifier
@@ -279,6 +290,7 @@ func (s *server) Serve() {
 	pluginIdentifiers = append(pluginIdentifiers, getNames(command, common.PluginKindRestoreItemActionV2, s.restoreItemActionV2)...)
 	pluginIdentifiers = append(pluginIdentifiers, getNames(command, common.PluginKindDeleteItemAction, s.deleteItemAction)...)
 	pluginIdentifiers = append(pluginIdentifiers, getNames(command, common.PluginKindItemBlockAction, s.itemBlockAction)...)
+	pluginIdentifiers = append(pluginIdentifiers, getNames(command, common.PluginKindSearchProvider, s.searchProvider)...)
 
 	pluginLister := NewPluginLister(pluginIdentifiers...)
 
@@ -294,6 +306,7 @@ func (s *server) Serve() {
 			string(common.PluginKindRestoreItemActionV2): s.restoreItemActionV2,
 			string(common.PluginKindDeleteItemAction):    s.deleteItemAction,
 			string(common.PluginKindItemBlockAction):     s.itemBlockAction,
+			string(common.PluginKindSearchProvider):      s.searchProvider,
 		},
 		GRPCServer: plugin.DefaultGRPCServer,
 	})

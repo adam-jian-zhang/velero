@@ -52,6 +52,9 @@ const (
 
 	// PluginKindPluginLister represents a plugin lister plugin.
 	PluginKindPluginLister PluginKind = "PluginLister"
+
+	// PluginKindSearchProvider represents a search provider plugin.
+	PluginKindSearchProvider PluginKind = "SearchProvider"
 )
 
 // PluginKindsAdaptableTo if there are plugin kinds that are adaptable to newer API versions, list them here.
@@ -74,5 +77,6 @@ func AllPluginKinds() map[string]PluginKind {
 	allPluginKinds[PluginKindRestoreItemActionV2.String()] = PluginKindRestoreItemActionV2
 	allPluginKinds[PluginKindDeleteItemAction.String()] = PluginKindDeleteItemAction
 	allPluginKinds[PluginKindItemBlockAction.String()] = PluginKindItemBlockAction
+	allPluginKinds[PluginKindSearchProvider.String()] = PluginKindSearchProvider
 	return allPluginKinds
 }

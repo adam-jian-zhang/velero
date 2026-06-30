@@ -44,6 +44,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli/repo"
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli/restore"
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli/schedule"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/search"
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli/snapshotlocation"
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli/uninstall"
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli/version"
@@ -128,6 +129,7 @@ operations can also be performed as 'velero backup get' and 'velero schedule cre
 		repomantenance.NewCommand(f),
 		datamover.NewCommand(f),
 		podvolume.NewCommand(f),
+		search.NewCommand(f),
 	)
 
 	// init and add the klog flags

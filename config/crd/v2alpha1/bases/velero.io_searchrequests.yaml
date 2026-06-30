@@ -1,0 +1,155 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: searchrequests.velero.io
+spec:
+  group: velero.io
+  names:
+    kind: SearchRequest
+    listKind: SearchRequestList
+    plural: searchrequests
+    singular: searchrequest
+  scope: Namespaced
+  versions:
+  - name: v2alpha1
+    schema:
+      openAPIV3Schema:
+        description: SearchRequest is a Velero resource that queries the search index.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SearchRequestSpec defines the search filters.
+            properties:
+              limit:
+                default: 100
+                description: Limit is the maximum number of results returned. Hard
+                  capped at 500.
+                maximum: 500
+                minimum: 1
+                type: integer
+              query:
+                description: Query defines the search filters.
+                properties:
+                  apiVersion:
+                    description: APIVersion filters by exact API version (e.g. "apps/v1").
+                    type: string
+                  backupName:
+                    description: |-
+                      BackupName restricts the search to a single named backup.
+                      Omit to search across all indexed backups.
+                    type: string
+                  kind:
+                    description: Kind filters by exact resource kind (e.g. "Deployment",
+                      "Pod").
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Labels filters resources where ALL specified key/value pairs match.
+                      Multiple entries are AND-ed together.
+                    type: object
+                  name:
+                    description: |-
+                      Name is a glob pattern matched against resource names.
+                      Wildcards: * matches any sequence, ? matches one character.
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace filters by exact Kubernetes namespace.
+                      Omit to search all namespaces and cluster-scoped resources.
+                    type: string
+                type: object
+              ttl:
+                description: |-
+                  TTL specifies how long this SearchRequest is retained after completion.
+                  Defaults to the server's --search-request-default-ttl (10m).
+                  Set to 0 to disable automatic deletion.
+                type: string
+            required:
+            - query
+            type: object
+          status:
+            properties:
+              completionTimestamp:
+                description: CompletionTimestamp is when processing finished (Processed
+                  or Failed).
+                format: date-time
+                type: string
+              expiration:
+                description: Expiration is when this SearchRequest will be garbage-collected.
+                format: date-time
+                type: string
+              message:
+                description: Message provides human-readable details when Phase is
+                  Failed.
+                type: string
+              phase:
+                description: Phase is the current lifecycle state.
+                enum:
+                - New
+                - Processing
+                - Processed
+                - Failed
+                type: string
+              results:
+                description: Results holds the matching resource records (capped by
+                  spec.limit).
+                items:
+                  properties:
+                    apiVersion:
+                      type: string
+                    backupName:
+                      type: string
+                    kind:
+                      type: string
+                    labels:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    namespace:
+                      type: string
+                    resourceName:
+                      type: string
+                  required:
+                  - apiVersion
+                  - backupName
+                  - kind
+                  - resourceName
+                  type: object
+                type: array
+                x-kubernetes-preserve-unknown-fields: true
+              startTimestamp:
+                description: StartTimestamp is when the Velero server began processing
+                  this request.
+                format: date-time
+                type: string
+              totalCount:
+                description: TotalCount is the total number of matching resources
+                  before limit.
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

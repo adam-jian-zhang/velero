@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,12 +78,15 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt/process"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	"github.com/vmware-tanzu/velero/pkg/podexec"
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/repository"
 	repokey "github.com/vmware-tanzu/velero/pkg/repository/keys"
 	repomanager "github.com/vmware-tanzu/velero/pkg/repository/manager"
 	"github.com/vmware-tanzu/velero/pkg/restore"
+	"github.com/vmware-tanzu/velero/pkg/search/grpc"
+	searchrest "github.com/vmware-tanzu/velero/pkg/search/rest"
 	velerotypes "github.com/vmware-tanzu/velero/pkg/types"
 	"github.com/vmware-tanzu/velero/pkg/uploader"
 	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
@@ -152,6 +156,7 @@ type server struct {
 	cancelFunc            context.CancelFunc
 	logger                logrus.FieldLogger
 	logLevel              logrus.Level
+	searchProvider        velero.SearchProvider
 	pluginRegistry        process.Registry
 	repoManager           repomanager.Manager
 	repoLocker            *repository.RepoLocker
@@ -545,6 +550,22 @@ func (s *server) initRepoManager() error {
 func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string) error {
 	s.logger.Info("Starting controllers")
 
+	if features.IsEnabled(velerov1api.SearchFeatureFlag) {
+		pluginManager := clientmgmt.NewManager(s.logger, s.logLevel, s.pluginRegistry)
+		searchProvider, err := pluginManager.GetSearchProvider(s.config.SearchProviderName)
+		if err != nil {
+			s.logger.Fatal(err, "unable to get SearchProvider")
+		}
+		if err := searchProvider.Init(map[string]string{
+			"driver":     s.config.SearchDBDriver,
+			"dsn":        s.config.SearchDBDSN,
+			"maxWorkers": strconv.Itoa(s.config.SearchMaxWorkers),
+		}); err != nil {
+			s.logger.Fatal(err, "SearchProvider Init failed")
+		}
+		s.searchProvider = searchProvider
+	}
+
 	go func() {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", promhttp.Handler())
@@ -560,6 +581,9 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 	}()
 	s.metrics = metrics.NewServerMetrics()
 	s.metrics.RegisterAllMetrics()
+	if features.IsEnabled(velerov1api.SearchFeatureFlag) {
+		s.metrics.RegisterSearchMetrics()
+	}
 	// Initialize manual backup metrics
 	s.metrics.InitSchedule("")
 
@@ -698,6 +722,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			backupStoreGetter,
 			s.credentialFileStore,
 			s.repoEnsurer,
+			s.searchProvider,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerBackupDeletion)
 		}
@@ -932,6 +957,50 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerBackupQueue)
 		}
+	}
+
+	if features.IsEnabled(velerov1api.SearchFeatureFlag) {
+		if _, ok := enabledRuntimeControllers[constant.ControllerSearchRequest]; ok {
+			if err := controller.NewSearchRequestReconciler(
+				s.mgr.GetClient(),
+				s.logger,
+				s.searchProvider,
+				s.config.SearchRequestDefaultTTL,
+				s.config.SearchMaxPendingTTL,
+				s.config.SearchResultSizeBudget,
+				s.metrics,
+			).SetupWithManager(s.mgr, s.config.SearchGCInterval); err != nil {
+				s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerSearchRequest)
+			}
+		}
+
+		if _, ok := enabledRuntimeControllers[constant.ControllerSearchIndex]; ok {
+			if err := controller.NewSearchIndexReconciler(
+				s.mgr.GetClient(),
+				s.logger,
+				backupStoreGetter,
+				newPluginManager,
+				s.searchProvider,
+				s.namespace,
+				s.config.SearchMaxWorkers,
+				s.config.SearchResyncInterval,
+				s.metrics,
+			).SetupWithManager(s.mgr); err != nil {
+				s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerSearchIndex)
+			}
+		}
+	}
+
+	if features.IsEnabled(velerov1api.SearchRESTAPIFeatureFlag) {
+		go func() {
+			_ = searchrest.New(fmt.Sprintf(":%d", s.config.SearchRestPort), s.searchProvider, s.kubeClient, s.logger).Start(s.ctx)
+		}()
+	}
+
+	if features.IsEnabled(velerov1api.SearchGRPCAPIFeatureFlag) {
+		go func() {
+			_ = grpc.New(fmt.Sprintf(":%d", s.config.SearchGRPCPort), s.searchProvider, s.kubeClient, s.logger).Start(s.ctx)
+		}()
 	}
 
 	s.logger.Info("Server starting...")
