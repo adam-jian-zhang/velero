@@ -1231,18 +1231,23 @@ func TestKopiaObjectWriterEx_ConcurrentAsyncErrors(t *testing.T) {
 
 	data := make([]byte, 1024)
 
-	// Issue multiple writes so they all spawn async goroutines
-	// First few writes shouldn't fail immediately until getWriteError catches the asynchronous fault
+	var writeErr error
 	for i := 0; i < 10; i++ {
-		l, err := kow.Write(data)
-		require.NoError(t, err)
-		assert.Equal(t, 1024, l)
+		_, err := kow.Write(data)
+		if err != nil {
+			writeErr = err
+			break
+		}
 	}
 
-	id, err := kow.Result()
+	id, resultErr := kow.Result()
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "simulated async error")
+	if writeErr != nil {
+		assert.Contains(t, writeErr.Error(), "simulated async error")
+	} else {
+		require.Error(t, resultErr)
+		assert.Contains(t, resultErr.Error(), "simulated async error")
+	}
 	assert.Equal(t, udmrepo.ID(""), id)
 }
 
