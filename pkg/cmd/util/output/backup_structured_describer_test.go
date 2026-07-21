@@ -738,18 +738,24 @@ version: v1
 clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["StorageClass"]
-    labelSelector: {"app": "velero"}
+    labelSelector:
+      matchLabels:
+        app: velero
   - kinds: ["ClusterRole"]
     orLabelSelectors:
-    - {"app": "velero"}
-    - {"app": "test"}
+    - matchLabels:
+        app: velero
+    - matchLabels:
+        app: test
     names: ["role1"]
     excludedNames: ["role2"]
 namespacedFilterPolicies:
 - namespaces: ["ns1", "ns2"]
   resourceFilters:
   - kinds: ["Pod", "ConfigMap"]
-    labelSelector: {"app": "velero"}
+    labelSelector:
+      matchLabels:
+        app: velero
   - kinds: ["*"]
 `
 	cm := &corev1api.ConfigMap{
@@ -778,14 +784,16 @@ namespacedFilterPolicies:
 		"clusterScopedFilterPolicy": map[string]any{
 			"resourceFilters": []map[string]any{
 				{
-					"kinds":         []string{"StorageClass"},
-					"labelSelector": map[string]string{"app": "velero"},
+					"kinds": []string{"StorageClass"},
+					"labelSelector": map[string]any{
+						"matchLabels": map[string]string{"app": "velero"},
+					},
 				},
 				{
 					"kinds": []string{"ClusterRole"},
-					"orLabelSelectors": []map[string]string{
-						{"app": "velero"},
-						{"app": "test"},
+					"orLabelSelectors": []map[string]any{
+						{"matchLabels": map[string]string{"app": "velero"}},
+						{"matchLabels": map[string]string{"app": "test"}},
 					},
 					"names":         []string{"role1"},
 					"excludedNames": []string{"role2"},
@@ -797,8 +805,10 @@ namespacedFilterPolicies:
 				"namespace": "ns1",
 				"resourceFilters": []map[string]any{
 					{
-						"kinds":         []string{"Pod", "ConfigMap"},
-						"labelSelector": map[string]string{"app": "velero"},
+						"kinds": []string{"Pod", "ConfigMap"},
+						"labelSelector": map[string]any{
+							"matchLabels": map[string]string{"app": "velero"},
+						},
 					},
 					{
 						"kinds":      []string{},
@@ -810,8 +820,10 @@ namespacedFilterPolicies:
 				"namespace": "ns2",
 				"resourceFilters": []map[string]any{
 					{
-						"kinds":         []string{"Pod", "ConfigMap"},
-						"labelSelector": map[string]string{"app": "velero"},
+						"kinds": []string{"Pod", "ConfigMap"},
+						"labelSelector": map[string]any{
+							"matchLabels": map[string]string{"app": "velero"},
+						},
 					},
 					{
 						"kinds":      []string{},

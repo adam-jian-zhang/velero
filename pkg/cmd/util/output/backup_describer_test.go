@@ -904,18 +904,24 @@ version: v1
 clusterScopedFilterPolicy:
   resourceFilters:
   - kinds: ["StorageClass"]
-    labelSelector: {"app": "velero"}
+    labelSelector:
+      matchLabels:
+        app: velero
   - kinds: ["ClusterRole"]
     orLabelSelectors:
-    - {"app": "velero"}
-    - {"app": "test"}
+    - matchLabels:
+        app: velero
+    - matchLabels:
+        app: test
     names: ["role1"]
     excludedNames: ["role2"]
 namespacedFilterPolicies:
 - namespaces: ["ns1", "ns2"]
   resourceFilters:
   - kinds: ["Pod", "ConfigMap"]
-    labelSelector: {"app": "velero"}
+    labelSelector:
+      matchLabels:
+        app: velero
   - kinds: ["*"]
 `
 	cm := &corev1api.ConfigMap{

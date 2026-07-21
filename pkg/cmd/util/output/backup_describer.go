@@ -180,15 +180,22 @@ func DescribeFineGrainedFilterPolicies(ctx context.Context, kbClient kbclient.Cl
 			d.Printf("    %s:\n", kindsStr)
 
 			// Label selector
-			if len(rf.LabelSelector) > 0 {
-				selectorStr := formatLabelMap(rf.LabelSelector)
+			if resourcepolicies.IsPresentLabelSelector(rf.LabelSelector) {
+				selectorStr := formatPolicyLabelSelector(rf.LabelSelector)
 				d.Printf("      Label selector:     %s\n", selectorStr)
 			} else if len(rf.OrLabelSelectors) > 0 {
 				var orStrs []string
 				for _, ols := range rf.OrLabelSelectors {
-					orStrs = append(orStrs, formatLabelMap(ols))
+					if !resourcepolicies.IsPresentLabelSelector(ols) {
+						continue
+					}
+					orStrs = append(orStrs, formatPolicyLabelSelector(ols))
 				}
-				d.Printf("      OR label selectors: [%s]\n", strings.Join(orStrs, ", "))
+				if len(orStrs) > 0 {
+					d.Printf("      OR label selectors: [%s]\n", strings.Join(orStrs, ", "))
+				} else {
+					d.Printf("      Label selector:     <none>\n")
+				}
 			} else {
 				d.Printf("      Label selector:     <none>\n")
 			}
@@ -225,15 +232,22 @@ func DescribeFineGrainedFilterPolicies(ctx context.Context, kbClient kbclient.Cl
 					d.Printf("      %s:\n", kindsStr)
 
 					// Label selector
-					if len(rf.LabelSelector) > 0 {
-						selectorStr := formatLabelMap(rf.LabelSelector)
+					if resourcepolicies.IsPresentLabelSelector(rf.LabelSelector) {
+						selectorStr := formatPolicyLabelSelector(rf.LabelSelector)
 						d.Printf("        Label selector:     %s\n", selectorStr)
 					} else if len(rf.OrLabelSelectors) > 0 {
 						var orStrs []string
 						for _, ols := range rf.OrLabelSelectors {
-							orStrs = append(orStrs, formatLabelMap(ols))
+							if !resourcepolicies.IsPresentLabelSelector(ols) {
+								continue
+							}
+							orStrs = append(orStrs, formatPolicyLabelSelector(ols))
 						}
-						d.Printf("        OR label selectors: [%s]\n", strings.Join(orStrs, ", "))
+						if len(orStrs) > 0 {
+							d.Printf("        OR label selectors: [%s]\n", strings.Join(orStrs, ", "))
+						} else {
+							d.Printf("        Label selector:     <none>\n")
+						}
 					} else {
 						d.Printf("        Label selector:     <none>\n")
 					}
@@ -256,12 +270,38 @@ func DescribeFineGrainedFilterPolicies(ctx context.Context, kbClient kbclient.Cl
 	}
 }
 
-func formatLabelMap(labelMap map[string]string) string {
-	var pairs []string
-	for k, v := range labelMap {
-		pairs = append(pairs, fmt.Sprintf("%s=%s", k, v))
+func formatPolicyLabelSelector(s *resourcepolicies.PolicyLabelSelector) string {
+	if !resourcepolicies.IsPresentLabelSelector(s) {
+		return ""
 	}
-	return strings.Join(pairs, ",")
+	return metav1.FormatLabelSelector(resourcepolicies.ToMetaV1LabelSelector(s))
+}
+
+// policyLabelSelectorToMap converts a PolicyLabelSelector to a map suitable for
+// structured describer output (matchLabels / matchExpressions).
+func policyLabelSelectorToMap(s *resourcepolicies.PolicyLabelSelector) map[string]any {
+	if s == nil {
+		return nil
+	}
+	out := map[string]any{}
+	if len(s.MatchLabels) > 0 {
+		out["matchLabels"] = s.MatchLabels
+	}
+	if len(s.MatchExpressions) > 0 {
+		var exprs []map[string]any
+		for _, expr := range s.MatchExpressions {
+			e := map[string]any{
+				"key":      expr.Key,
+				"operator": expr.Operator,
+			}
+			if len(expr.Values) > 0 {
+				e["values"] = expr.Values
+			}
+			exprs = append(exprs, e)
+		}
+		out["matchExpressions"] = exprs
+	}
+	return out
 }
 
 // DescribeUploaderConfigForBackup describes uploader config in human-readable format

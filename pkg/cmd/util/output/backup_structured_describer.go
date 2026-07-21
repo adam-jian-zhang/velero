@@ -251,11 +251,20 @@ func DescribeFineGrainedFilterPoliciesInSF(ctx context.Context, kbClient kbclien
 			entry := map[string]any{
 				"kinds": rf.Kinds,
 			}
-			if len(rf.LabelSelector) > 0 {
-				entry["labelSelector"] = rf.LabelSelector
+			if resourcepolicies.IsPresentLabelSelector(rf.LabelSelector) {
+				entry["labelSelector"] = policyLabelSelectorToMap(rf.LabelSelector)
 			}
 			if len(rf.OrLabelSelectors) > 0 {
-				entry["orLabelSelectors"] = rf.OrLabelSelectors
+				var orMaps []map[string]any
+				for _, ols := range rf.OrLabelSelectors {
+					if !resourcepolicies.IsPresentLabelSelector(ols) {
+						continue
+					}
+					orMaps = append(orMaps, policyLabelSelectorToMap(ols))
+				}
+				if len(orMaps) > 0 {
+					entry["orLabelSelectors"] = orMaps
+				}
 			}
 			if len(rf.Names) > 0 {
 				entry["names"] = rf.Names
@@ -287,11 +296,20 @@ func DescribeFineGrainedFilterPoliciesInSF(ctx context.Context, kbClient kbclien
 				} else {
 					entry["kinds"] = rf.Kinds
 				}
-				if len(rf.LabelSelector) > 0 {
-					entry["labelSelector"] = rf.LabelSelector
+				if resourcepolicies.IsPresentLabelSelector(rf.LabelSelector) {
+					entry["labelSelector"] = policyLabelSelectorToMap(rf.LabelSelector)
 				}
 				if len(rf.OrLabelSelectors) > 0 {
-					entry["orLabelSelectors"] = rf.OrLabelSelectors
+					var orMaps []map[string]any
+					for _, ols := range rf.OrLabelSelectors {
+						if !resourcepolicies.IsPresentLabelSelector(ols) {
+							continue
+						}
+						orMaps = append(orMaps, policyLabelSelectorToMap(ols))
+					}
+					if len(orMaps) > 0 {
+						entry["orLabelSelectors"] = orMaps
+					}
 				}
 				if len(rf.Names) > 0 {
 					entry["names"] = rf.Names

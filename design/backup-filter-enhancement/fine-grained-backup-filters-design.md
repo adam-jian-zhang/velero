@@ -77,7 +77,8 @@ clusterScopedFilterPolicy:
       names: ["my-app-*"]
     - kinds: [CustomResourceDefinition]
       labelSelector:
-        app: my-app
+        matchLabels:
+          app: my-app
 namespacedFilterPolicies:
   # NEW: per-namespace filter overrides
   - namespaces:
@@ -85,7 +86,8 @@ namespacedFilterPolicies:
     resourceFilters:
       - kinds: [ConfigMap, Secret, Deployment]
         labelSelector:
-          app: my-app
+          matchLabels:
+            app: my-app
   - namespaces:
       - ns-b
     resourceFilters:
@@ -93,7 +95,8 @@ namespacedFilterPolicies:
         names: [app-1, app-2]
       - kinds: [ConfigMap]
         labelSelector:
-          app: my-service
+          matchLabels:
+            app: my-service
 ```
 
 All four sections coexist in the same ConfigMap. They are independent — `volumePolicies` handles volume backup strategy, `includeExcludePolicy` handles global resource type filtering, `clusterScopedFilterPolicy` handles cluster-scoped resource filtering by kind/name/label, and `namespacedFilterPolicies` handles per-namespace, per-kind overrides.
@@ -107,7 +110,9 @@ namespacedFilterPolicies:
   - namespaces: [ns-a]
     resourceFilters:
       - kinds: [ConfigMap, Secret]        # these kinds share a selector
-        labelSelector: {app: my-app}
+        labelSelector:
+          matchLabels:
+            app: my-app
         names: ["app-*"]
       - kinds: [Deployment]           # this kind has its own selector
         names: [workload-1, workload-2]
@@ -115,6 +120,24 @@ namespacedFilterPolicies:
 ```
 
 This model has one way to express filters — there is no ambiguity about how to structure the configuration. Only resource kinds listed in `resourceFilters` entries are included in the backup for the matched namespaces; unlisted kinds are implicitly excluded.
+
+#### Label selectors (`matchLabels` / `matchExpressions`)
+
+`labelSelector` and each entry of `orLabelSelectors` use the standard Kubernetes selector shape (same as `BackupSpec.labelSelector`):
+
+```yaml
+labelSelector:
+  matchLabels:
+    app: my-app
+  matchExpressions:
+    - key: environment
+      operator: In
+      values: [prod, staging]
+    - key: do-not-backup
+      operator: DoesNotExist
+```
+
+Supported `matchExpressions` operators: `In`, `NotIn`, `Exists`, `DoesNotExist`. Prefer `In` for value-OR on one key; use `orLabelSelectors` for OR across independent multi-key groups. `labelSelector` and `orLabelSelectors` cannot co-exist in the same `resourceFilters` entry.
 
 #### Catch-All Resource Filter (Empty `kinds` or `["*"]`)
 
@@ -319,9 +342,10 @@ resourceFilters:
 resourceFilters:
   - kinds: ["Pod"]
     labelSelector:
-      "invalid label key!": "value"  # invalid key syntax
+      matchLabels:
+        "invalid label key!": "value"  # invalid key syntax
 ```
-**Behavior:** Validation error during backup creation when `labels.SelectorFromSet()` fails:
+**Behavior:** Validation error during backup creation when `metav1.LabelSelectorAsSelector()` fails:
 ```
 namespacedFilterPolicies[0].resourceFilters[0]: invalid label selector: "invalid label key!" is not a valid label key
 ```
@@ -340,7 +364,33 @@ This is consistent with how other discovery-dependent features handle this error
 
 ## ResourceFilter Field Notes
 
-**`labelSelector`** supports equality-based selectors only (`key=value`). Set-based requirements (e.g., `environment in (prod, staging)`) are not supported. To match resources with any of several label combinations, use `orLabelSelectors` with multiple maps — each map is AND-evaluated internally, and the maps are OR-evaluated across the list. `labelSelector` and `orLabelSelectors` cannot co-exist in the same entry.
+**`labelSelector`** uses the standard Kubernetes shape: `matchLabels` (equality) and `matchExpressions` (set-based: `In`, `NotIn`, `Exists`, `DoesNotExist`). All requirements within one selector are AND-ed. Example:
+
+```yaml
+labelSelector:
+  matchLabels:
+    app: my-app
+  matchExpressions:
+    - key: environment
+      operator: In
+      values: [prod, staging]
+    - key: do-not-backup
+      operator: DoesNotExist
+```
+
+**`orLabelSelectors`** is a list of the same selector shape. Match if **any** entry matches (AND within each entry, OR across the list). Prefer `In` for value-OR on one key; use `orLabelSelectors` for OR of independent multi-key groups. `labelSelector` and `orLabelSelectors` cannot co-exist in the same entry.
+
+```yaml
+orLabelSelectors:
+  - matchLabels:
+      tier: frontend
+    matchExpressions:
+      - key: track
+        operator: In
+        values: [canary]
+  - matchLabels:
+      tier: backend
+```
 
 **`names` / `excludedNames`** accept exact resource names or glob patterns. If `names` is empty, all resource names are included (subject to label filters). `excludedNames` takes precedence over `names` when a name matches both.
 
@@ -420,7 +470,8 @@ data:
         resourceFilters:
           - kinds: [ConfigMap, Secret, Deployment]
             labelSelector:
-              app: my-app
+              matchLabels:
+                app: my-app
       # ns-b has no filter policy entry, so global filters apply (include everything)
 ```
 
@@ -462,10 +513,12 @@ data:
         resourceFilters:
           - kinds: [Deployment]
             labelSelector:
-              app: production-workload-1
+              matchLabels:
+                app: production-workload-1
           - kinds: [StatefulSet]
             labelSelector:
-              app: production-workload-2
+              matchLabels:
+                app: production-workload-2
 ```
 
 ### Per-Kind Exact Names
@@ -561,7 +614,8 @@ data:
         resourceFilters:
           - kinds: ["*"]          # catch-all: applies to every kind not listed below
             labelSelector:
-              backup: "true"     # back up any resource carrying this label
+              matchLabels:
+                backup: "true"     # back up any resource carrying this label
 ```
 
 **Result:** Every resource type in `production` that has the label `backup=true` is backed up. Resources without that label are excluded. No kind enumeration is required.
@@ -589,7 +643,8 @@ data:
             names: [db-credentials, tls-cert]  # these exact Secrets by name
           - kinds: ["*"]                        # catch-all for all other kinds
             labelSelector:
-              backup: "true"                   # back up by label
+              matchLabels:
+                backup: "true"                   # back up by label
 ```
 
 **Result:**
@@ -666,7 +721,8 @@ data:
             names: [workload-1, workload-2]
           - kinds: [StatefulSet]
             labelSelector:
-              app: my-app
+              matchLabels:
+                app: my-app
           - kinds: [ConfigMap, Secret]
             names: ["app-*"]
             excludedNames: ["*-tmp", "*-debug"]
