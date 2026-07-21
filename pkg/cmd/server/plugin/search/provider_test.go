@@ -18,6 +18,7 @@ package search
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -29,7 +30,7 @@ import (
 func TestNewBuiltInSearchProvider(t *testing.T) {
 	opts := Options{
 		Driver:       "sqlite",
-		DSN:          ":memory:",
+		DSN:          filepath.Join(t.TempDir(), "t.db"),
 		MaxWorkers:   1,
 		QueryTimeout: time.Second,
 		Logger:       logrus.New(),
@@ -37,13 +38,15 @@ func TestNewBuiltInSearchProvider(t *testing.T) {
 	p := NewBuiltInSearchProvider(opts)
 	assert.NotNil(t, p)
 
-	err := p.Init(map[string]string{
-		"driver": "sqlite",
-		"dsn":    ":memory:",
-	})
+	err := p.Init(map[string]string{})
 	require.NoError(t, err)
 
 	ready, err := p.Ready(context.Background())
 	require.NoError(t, err)
-	assert.True(t, ready) // Since we updated Init to immediately mark ready
+	assert.False(t, ready, "Ready must stay false until MarkReady after cold-start")
+
+	require.NoError(t, p.MarkReady(context.Background()))
+	ready, err = p.Ready(context.Background())
+	require.NoError(t, err)
+	assert.True(t, ready)
 }

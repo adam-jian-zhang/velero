@@ -22,8 +22,23 @@ func isGlob(s string) bool {
 	return strings.ContainsAny(s, "*?")
 }
 
+// globToLike converts a user glob (* / ?) to a SQL LIKE pattern, escaping
+// literal % and _ so they are not treated as SQL wildcards.
 func globToLike(s string) string {
-	s = strings.ReplaceAll(s, "*", "%")
-	s = strings.ReplaceAll(s, "?", "_")
-	return s
+	var b strings.Builder
+	b.Grow(len(s) * 2)
+	for _, r := range s {
+		switch r {
+		case '%', '_', '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case '*':
+			b.WriteByte('%')
+		case '?':
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

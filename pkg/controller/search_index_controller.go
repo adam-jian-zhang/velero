@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -56,8 +57,12 @@ type searchIndexReconciler struct {
 
 	indexSem chan struct{}
 
-	processedMu sync.RWMutex
-	processed   map[string]struct{}
+	processedMu   sync.RWMutex
+	processed     map[string]struct{}
+	seeded        atomic.Bool
+	backfillDone  atomic.Bool
+	pendingMu     sync.Mutex
+	pendingIndex  map[string]struct{}
 }
 
 func NewSearchIndexReconciler(
@@ -84,6 +89,7 @@ func NewSearchIndexReconciler(
 		metrics:           metrics,
 		indexSem:          make(chan struct{}, maxWorkers),
 		processed:         make(map[string]struct{}),
+		pendingIndex:      make(map[string]struct{}),
 	}
 }
 
@@ -98,7 +104,6 @@ func (r *searchIndexReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				old := ue.ObjectOld.(*velerov1api.Backup)
 				newObj := ue.ObjectNew.(*velerov1api.Backup)
 				return terminalIndexable(old.Status.Phase, newObj.Status.Phase) ||
-					newObj.Status.Phase == velerov1api.BackupPhaseDeleting ||
 					hasReindexAnnotation(newObj)
 			},
 			CreateFunc: func(ce event.CreateEvent) bool {
@@ -106,6 +111,7 @@ func (r *searchIndexReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return isIndexablePhase(b.Status.Phase)
 			},
 			DeleteFunc: func(de event.DeleteEvent) bool {
+				// Orphan cleanup only — primary de-index is BackupDeletionController (C8).
 				return true
 			},
 			GenericFunc: func(ge event.GenericEvent) bool {
@@ -134,34 +140,107 @@ func hasReindexAnnotation(b *velerov1api.Backup) bool {
 	return ok
 }
 
+func (r *searchIndexReconciler) ensureSeeded(ctx context.Context) error {
+	if r.seeded.Load() {
+		return nil
+	}
+	names, err := r.searchProvider.ListIndexedBackups(ctx)
+	if err != nil {
+		return err
+	}
+	r.processedMu.Lock()
+	for _, name := range names {
+		r.processed[name] = struct{}{}
+	}
+	r.processedMu.Unlock()
+	r.seeded.Store(true)
+	r.logger.WithField("count", len(names)).Info("Seeded search index processed set from store")
+	return nil
+}
+
+func (r *searchIndexReconciler) maybeMarkReady(ctx context.Context) {
+	if r.backfillDone.Load() {
+		return
+	}
+	r.pendingMu.Lock()
+	pending := len(r.pendingIndex)
+	r.pendingMu.Unlock()
+	if pending > 0 {
+		return
+	}
+
+	// Confirm cluster has no missing indexable backups relative to processed set.
+	list := &velerov1api.BackupList{}
+	if err := r.List(ctx, list, client.InNamespace(r.namespace)); err != nil {
+		r.logger.WithError(err).Warn("Unable to list backups while checking search readiness")
+		return
+	}
+	for i := range list.Items {
+		b := &list.Items[i]
+		if !isIndexablePhase(b.Status.Phase) {
+			continue
+		}
+		if !r.alreadyIndexed(b.Name) {
+			return
+		}
+	}
+
+	if err := r.searchProvider.MarkReady(ctx); err != nil {
+		r.logger.WithError(err).Warn("MarkReady failed")
+		return
+	}
+	r.backfillDone.Store(true)
+	if r.metrics != nil {
+		r.metrics.SetSearchReady(true)
+	}
+	r.logger.Info("Search index cold-start backfill complete; Ready=true")
+}
+
 func (r *searchIndexReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if r.searchProvider == nil {
 		return ctrl.Result{}, nil
 	}
 
+	if err := r.ensureSeeded(ctx); err != nil {
+		r.logger.WithError(err).Warn("Failed to seed processed backups; requeueing")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
 	b := &velerov1api.Backup{}
 	if err := r.Get(ctx, req.NamespacedName, b); err != nil {
 		if apierrors.IsNotFound(err) {
-			_ = r.searchProvider.DeleteBackup(ctx, req.Name)
+			// Orphan cleanup when Backup CR is gone (missed BDC hook / external delete).
+			if err := r.searchProvider.DeleteBackup(ctx, req.Name); err != nil {
+				r.logger.WithError(err).Warn("DeleteBackup on NotFound failed; requeueing")
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			if r.metrics != nil {
+				r.metrics.ObserveSearchDelete(true)
+			}
 			r.markUnindexed(req.Name)
+			r.maybeMarkReady(ctx)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	switch {
-	case b.Status.Phase == velerov1api.BackupPhaseDeleting || b.DeletionTimestamp != nil:
-		return r.handleDelete(ctx, b)
-
-	case isIndexablePhase(b.Status.Phase):
-		if r.alreadyIndexed(b.Name) && !hasReindexAnnotation(b) {
-			return ctrl.Result{}, nil
-		}
-		return r.handleIndex(ctx, b)
-
-	default:
+	// Do not de-index on Deleting — BackupDeletionController owns that after
+	// object-store delete succeeds (design C8).
+	if !isIndexablePhase(b.Status.Phase) {
+		r.maybeMarkReady(ctx)
 		return ctrl.Result{}, nil
 	}
+
+	if r.alreadyIndexed(b.Name) && !hasReindexAnnotation(b) {
+		r.maybeMarkReady(ctx)
+		return ctrl.Result{}, nil
+	}
+
+	result, err := r.handleIndex(ctx, b)
+	if err == nil && result.RequeueAfter == 0 && result.Requeue == false {
+		r.maybeMarkReady(ctx)
+	}
+	return result, err
 }
 
 func (r *searchIndexReconciler) handleIndex(ctx context.Context, b *velerov1api.Backup) (ctrl.Result, error) {
@@ -172,6 +251,9 @@ func (r *searchIndexReconciler) handleIndex(ctx context.Context, b *velerov1api.
 			return ctrl.Result{}, err
 		}
 	}
+
+	r.trackPending(b.Name, true)
+	defer r.trackPending(b.Name, false)
 
 	loc := &velerov1api.BackupStorageLocation{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: b.Namespace, Name: b.Spec.StorageLocation}, loc); err != nil {
@@ -197,33 +279,28 @@ func (r *searchIndexReconciler) handleIndex(ctx context.Context, b *velerov1api.
 	}
 	defer func() { <-r.indexSem }()
 
-	if b.DeletionTimestamp != nil {
-		return r.handleDelete(ctx, b)
-	}
-
 	start := r.clock.Now()
 	err = r.searchProvider.IndexBackup(ctx, b.Name, url)
 	if r.metrics != nil {
-		// r.metrics.ObserveSearchIndex(err == nil, r.clock.Since(start))
-	} else {
-		_ = start
+		r.metrics.ObserveSearchIndex(err == nil, r.clock.Since(start).Seconds())
 	}
 
 	if err != nil {
 		r.logger.WithError(err).Warn("IndexBackup failed; requeueing")
-		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil // simplistic backoff for now
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 	r.markIndexed(b.Name)
 	return ctrl.Result{}, nil
 }
 
-func (r *searchIndexReconciler) handleDelete(ctx context.Context, b *velerov1api.Backup) (ctrl.Result, error) {
-	if err := r.searchProvider.DeleteBackup(ctx, b.Name); err != nil {
-		r.logger.WithError(err).Warn("DeleteBackup failed; requeueing")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+func (r *searchIndexReconciler) trackPending(name string, add bool) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	if add {
+		r.pendingIndex[name] = struct{}{}
+	} else {
+		delete(r.pendingIndex, name)
 	}
-	r.markUnindexed(b.Name)
-	return ctrl.Result{}, nil
 }
 
 func (r *searchIndexReconciler) alreadyIndexed(name string) bool {

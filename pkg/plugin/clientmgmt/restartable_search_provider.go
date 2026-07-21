@@ -126,3 +126,21 @@ func (r *restartableSearchProvider) Ready(ctx context.Context) (bool, error) {
 
 	return delegate.Ready(ctx)
 }
+
+func (r *restartableSearchProvider) ListIndexedBackups(ctx context.Context) ([]string, error) {
+	delegate, err := r.getDelegate()
+	if err != nil {
+		return nil, err
+	}
+
+	return delegate.ListIndexedBackups(ctx)
+}
+
+func (r *restartableSearchProvider) MarkReady(ctx context.Context) error {
+	delegate, err := r.getDelegate()
+	if err != nil {
+		return err
+	}
+
+	return delegate.MarkReady(ctx)
+}

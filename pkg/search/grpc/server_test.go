@@ -19,25 +19,40 @@ package grpc
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	veleromocks "github.com/vmware-tanzu/velero/pkg/plugin/velero/mocks"
+	searchv1 "github.com/vmware-tanzu/velero/pkg/search/generated"
 )
 
-func TestGRPCServer(t *testing.T) {
-	srv := New(":0", nil, nil, logrus.New())
-	assert.NotNil(t, srv)
+func TestClampLimit(t *testing.T) {
+	assert.Equal(t, 100, clampLimit(0))
+	assert.Equal(t, 500, clampLimit(999))
+	assert.Equal(t, 25, clampLimit(25))
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestSearchAndReady(t *testing.T) {
+	sp := veleromocks.NewSearchProvider(t)
+	sp.On("Search", mock.Anything, velero.SearchParams{
+		Kind: "Pod", Limit: 100,
+	}).Return(velero.SearchResult{
+		Records:    []velero.ResourceRecord{{BackupName: "b", ResourceName: "p", Kind: "Pod"}},
+		TotalCount: 1,
+	}, nil)
+	sp.On("Ready", mock.Anything).Return(true, nil)
 
-	go func() {
-		// Mock start
-		err := srv.Start(ctx)
-		assert.NoError(t, err)
-	}()
+	srv := New(":0", sp, nil, logrus.New())
+	res, err := srv.Search(context.Background(), &searchv1.SearchRequest{Kind: "Pod"})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), res.TotalCount)
 
-	time.Sleep(100 * time.Millisecond)
-	cancel()
+	ready, err := srv.Ready(context.Background(), &emptypb.Empty{})
+	require.NoError(t, err)
+	assert.True(t, ready.Ready)
 }

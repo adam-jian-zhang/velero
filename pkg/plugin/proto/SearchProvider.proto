@@ -54,10 +54,24 @@ message ReadyResponse {
     bool ready = 1;
 }
 
+message ListIndexedBackupsRequest {
+    string plugin = 1;
+}
+
+message ListIndexedBackupsResponse {
+    repeated string backup_names = 1;
+}
+
+message MarkReadyRequest {
+    string plugin = 1;
+}
+
 service SearchProvider {
     rpc Init(SearchProviderInitRequest) returns (Empty);
     rpc IndexBackup(IndexBackupRequest) returns (Empty);
     rpc DeleteBackup(DeleteBackupRequest) returns (Empty);
     rpc Search(SearchRequest) returns (SearchResponse);
     rpc Ready(ReadyRequest) returns (ReadyResponse);
+    rpc ListIndexedBackups(ListIndexedBackupsRequest) returns (ListIndexedBackupsResponse);
+    rpc MarkReady(MarkReadyRequest) returns (Empty);
 }

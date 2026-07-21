@@ -991,15 +991,19 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 		}
 	}
 
-	if features.IsEnabled(velerov1api.SearchRESTAPIFeatureFlag) {
+	if features.IsEnabled(velerov1api.SearchFeatureFlag) && features.IsEnabled(velerov1api.SearchRESTAPIFeatureFlag) {
 		go func() {
-			_ = searchrest.New(fmt.Sprintf(":%d", s.config.SearchRestPort), s.searchProvider, s.kubeClient, s.logger).Start(s.ctx)
+			_ = searchrest.New(fmt.Sprintf(":%d", s.config.SearchRestPort), s.searchProvider, s.kubeClient, s.logger).
+				WithNamespace(s.namespace).
+				Start(s.ctx)
 		}()
 	}
 
-	if features.IsEnabled(velerov1api.SearchGRPCAPIFeatureFlag) {
+	if features.IsEnabled(velerov1api.SearchFeatureFlag) && features.IsEnabled(velerov1api.SearchGRPCAPIFeatureFlag) {
 		go func() {
-			_ = grpc.New(fmt.Sprintf(":%d", s.config.SearchGRPCPort), s.searchProvider, s.kubeClient, s.logger).Start(s.ctx)
+			_ = grpc.New(fmt.Sprintf(":%d", s.config.SearchGRPCPort), s.searchProvider, s.kubeClient, s.logger).
+				WithNamespace(s.namespace).
+				Start(s.ctx)
 		}()
 	}
 

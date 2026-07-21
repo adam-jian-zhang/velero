@@ -21,6 +21,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +50,14 @@ type writeOp struct {
 }
 
 func newSQLiteStore(dsn string, opts Options) (Store, error) {
+	if dsn != "" && dsn != ":memory:" {
+		if dir := filepath.Dir(dsn); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, fmt.Errorf("failed to create sqlite directory %q: %w", dir, err)
+			}
+		}
+	}
+
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
@@ -59,12 +69,13 @@ func newSQLiteStore(dsn string, opts Options) (Store, error) {
 		return nil, fmt.Errorf("failed to set pragmas: %w", err)
 	}
 
-	db.SetMaxOpenConns(opts.MaxWorkers)
+	// Single writer connection; writes are also serialized via writerLoop.
+	db.SetMaxOpenConns(1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &sqliteStore{
 		db:      db,
-		writeCh: make(chan writeOp, opts.MaxWorkers),
+		writeCh: make(chan writeOp, max(1, opts.MaxWorkers)),
 		opts:    opts,
 		ctx:     ctx,
 		cancel:  cancel,
@@ -237,7 +248,7 @@ func (s *sqliteStore) Search(ctx context.Context, params velero.SearchParams) (v
 
 	if params.Name != "" {
 		if isGlob(params.Name) {
-			query += " AND resource_name LIKE ?"
+			query += ` AND resource_name LIKE ? ESCAPE '\'`
 			args = append(args, globToLike(params.Name))
 		} else {
 			query += " AND resource_name = ?"

@@ -22,6 +22,7 @@ import (
 
 	corev1api "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -94,13 +95,28 @@ func podAnnotations(userAnnotations map[string]string) map[string]string {
 	return base
 }
 
-func containerPorts() []corev1api.ContainerPort {
-	return []corev1api.ContainerPort{
+func containerPorts(features []string) []corev1api.ContainerPort {
+	ports := []corev1api.ContainerPort{
 		{
 			Name:          "metrics",
 			ContainerPort: 8085,
 		},
 	}
+	has := func(name string) bool {
+		for _, f := range features {
+			if f == name {
+				return true
+			}
+		}
+		return false
+	}
+	if has(velerov1api.SearchFeatureFlag) && has(velerov1api.SearchRESTAPIFeatureFlag) {
+		ports = append(ports, corev1api.ContainerPort{Name: "search-rest", ContainerPort: 8086})
+	}
+	if has(velerov1api.SearchFeatureFlag) && has(velerov1api.SearchGRPCAPIFeatureFlag) {
+		ports = append(ports, corev1api.ContainerPort{Name: "search-grpc", ContainerPort: 8087})
+	}
+	return ports
 }
 
 func objectMeta(namespace, name string) metav1.ObjectMeta {
@@ -149,6 +165,56 @@ func ClusterRoleBinding(namespace string) *rbacv1.ClusterRoleBinding {
 	}
 
 	return crb
+}
+
+// SearchUserClusterRole is a least-privilege role for clients creating SearchRequest CRs
+// (and for TokenReview-backed REST/gRPC authorization checks).
+func SearchUserClusterRole() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "velero-search-user",
+			Labels: Labels(),
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterRole",
+			APIVersion: rbacv1.SchemeGroupVersion.String(),
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"velero.io"},
+				Resources: []string{"searchrequests"},
+				Verbs:     []string{"create", "get", "list", "watch", "delete"},
+			},
+			{
+				APIGroups: []string{"velero.io"},
+				Resources: []string{"searchrequests/status"},
+				Verbs:     []string{"get"},
+			},
+		},
+	}
+}
+
+// SearchIndexPVC returns an optional RWO PVC for the SQLite search index.
+func SearchIndexPVC(namespace, name string, size string) *corev1api.PersistentVolumeClaim {
+	if size == "" {
+		size = "10Gi"
+	}
+	qty := resource.MustParse(size)
+	return &corev1api.PersistentVolumeClaim{
+		ObjectMeta: objectMeta(namespace, name),
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "PersistentVolumeClaim",
+			APIVersion: corev1api.SchemeGroupVersion.String(),
+		},
+		Spec: corev1api.PersistentVolumeClaimSpec{
+			AccessModes: []corev1api.PersistentVolumeAccessMode{corev1api.ReadWriteOnce},
+			Resources: corev1api.VolumeResourceRequirements{
+				Requests: corev1api.ResourceList{
+					corev1api.ResourceStorage: qty,
+				},
+			},
+		},
+	}
 }
 
 func Namespace(namespace string) *corev1api.Namespace {
@@ -277,6 +343,9 @@ type VeleroOptions struct {
 	NodeAgentDisableHostPath        bool
 	ServerPriorityClassName         string
 	NodeAgentPriorityClassName      string
+	// SearchPVCName, when set with EnableSearch, creates/mounts a PVC for the SQLite index.
+	SearchPVCName string
+	SearchPVCSize string
 }
 
 func AllCRDs() *unstructured.UnstructuredList {
@@ -373,6 +442,27 @@ func AllResources(o *VeleroOptions) *unstructured.UnstructuredList {
 
 	if len(o.Features) > 0 {
 		deployOpts = append(deployOpts, WithFeatures(o.Features))
+	}
+
+	hasSearch := false
+	for _, f := range o.Features {
+		if f == velerov1api.SearchFeatureFlag {
+			hasSearch = true
+			break
+		}
+	}
+	if hasSearch {
+		role := SearchUserClusterRole()
+		if err := appendUnstructured(resources, role); err != nil {
+			fmt.Printf("error appending SearchUserClusterRole %s: %s\n", role.GetName(), err.Error())
+		}
+		if o.SearchPVCName != "" {
+			pvc := SearchIndexPVC(o.Namespace, o.SearchPVCName, o.SearchPVCSize)
+			if err := appendUnstructured(resources, pvc); err != nil {
+				fmt.Printf("error appending SearchIndexPVC %s: %s\n", pvc.GetName(), err.Error())
+			}
+			deployOpts = append(deployOpts, WithSearchPVC(o.SearchPVCName, "/var/lib/velero"))
+		}
 	}
 
 	if o.RestoreOnly {

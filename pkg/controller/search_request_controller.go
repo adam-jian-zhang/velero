@@ -149,9 +149,7 @@ func (r *searchRequestReconciler) process(ctx context.Context, sr *velerov2alpha
 	start := r.clock.Now()
 	res, err := r.searchProvider.Search(ctx, params)
 	if r.metrics != nil {
-		// r.metrics.ObserveSearchRequest(err == nil, r.clock.Since(start))
-	} else {
-		_ = start // avoid unused var if metrics are not ready
+		r.metrics.ObserveSearchRequest(err == nil, r.clock.Since(start).Seconds())
 	}
 
 	if err != nil {

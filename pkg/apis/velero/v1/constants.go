@@ -47,8 +47,7 @@ const (
 	// APIGroupVersionsFeatureFlag is the feature flag string that defines whether or not to handle multiple API Group Versions
 	APIGroupVersionsFeatureFlag = "EnableAPIGroupVersions"
 
-	SearchFeatureFlag                  = "EnableSearch"
-	SearchRESTAPIFeatureFlag           = "EnableSearchRESTAPI"
-	SearchRESTAPIAggregatedFeatureFlag = "EnableSearchRESTAPIAggregated"
-	SearchGRPCAPIFeatureFlag           = "EnableSearchGRPCAPI"
+	SearchFeatureFlag        = "EnableSearch"
+	SearchRESTAPIFeatureFlag = "EnableSearchRESTAPI"
+	SearchGRPCAPIFeatureFlag = "EnableSearchGRPCAPI"
 )

@@ -148,7 +148,7 @@ func DaemonSet(namespace string, opts ...podTemplateOption) *appsv1api.DaemonSet
 						{
 							Name:            dsName,
 							Image:           c.image,
-							Ports:           containerPorts(),
+							Ports:           containerPorts(nil),
 							ImagePullPolicy: pullPolicy,
 							Command: []string{
 								"/velero",

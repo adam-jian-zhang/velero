@@ -136,3 +136,36 @@ func (s *SearchProviderGRPCServer) Ready(ctx context.Context, req *generated.Rea
 	}
 	return &generated.ReadyResponse{Ready: ready}, nil
 }
+
+func (s *SearchProviderGRPCServer) ListIndexedBackups(ctx context.Context, req *generated.ListIndexedBackupsRequest) (resp *generated.ListIndexedBackupsResponse, err error) {
+	defer func() {
+		if panicked := recover(); panicked != nil {
+			err = common.NewGRPCError(common.HandlePanic(panicked))
+		}
+	}()
+	impl, err := s.getImpl(req.Plugin)
+	if err != nil {
+		return nil, common.NewGRPCError(err)
+	}
+	names, err := impl.ListIndexedBackups(ctx)
+	if err != nil {
+		return nil, common.NewGRPCError(err)
+	}
+	return &generated.ListIndexedBackupsResponse{BackupNames: names}, nil
+}
+
+func (s *SearchProviderGRPCServer) MarkReady(ctx context.Context, req *generated.MarkReadyRequest) (resp *generated.Empty, err error) {
+	defer func() {
+		if panicked := recover(); panicked != nil {
+			err = common.NewGRPCError(common.HandlePanic(panicked))
+		}
+	}()
+	impl, err := s.getImpl(req.Plugin)
+	if err != nil {
+		return nil, common.NewGRPCError(err)
+	}
+	if err := impl.MarkReady(ctx); err != nil {
+		return nil, common.NewGRPCError(err)
+	}
+	return &generated.Empty{}, nil
+}

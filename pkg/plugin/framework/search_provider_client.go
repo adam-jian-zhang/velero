@@ -90,6 +90,23 @@ func (c *SearchProviderGRPCClient) Ready(ctx context.Context) (bool, error) {
 	return resp.Ready, nil
 }
 
+func (c *SearchProviderGRPCClient) ListIndexedBackups(ctx context.Context) ([]string, error) {
+	resp, err := c.grpcClient.ListIndexedBackups(ctx, &generated.ListIndexedBackupsRequest{
+		Plugin: c.Plugin,
+	})
+	if err != nil {
+		return nil, common.FromGRPCError(err)
+	}
+	return resp.BackupNames, nil
+}
+
+func (c *SearchProviderGRPCClient) MarkReady(ctx context.Context) error {
+	_, err := c.grpcClient.MarkReady(ctx, &generated.MarkReadyRequest{
+		Plugin: c.Plugin,
+	})
+	return common.FromGRPCError(err)
+}
+
 func fromSearchProviderProtoRecords(protoRecords []*generated.ResourceRecord) []velero.ResourceRecord {
 	if protoRecords == nil {
 		return nil

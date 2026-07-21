@@ -20,15 +20,23 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSearchMetrics(t *testing.T) {
-	// The real ServerMetrics depends on other types in the package.
-	// For now we just test that the functions don't panic.
-	sm := &ServerMetrics{}
+	sm := NewServerMetrics()
+	require.NotNil(t, sm)
 	sm.RegisterSearchMetrics()
-	sm.ObserveSearchIndex(true, 1.0)
-	sm.ObserveSearchRequest(true, 1.0)
 
-	assert.NotNil(t, sm)
+	sm.ObserveSearchIndex(true, 1.0)
+	sm.ObserveSearchIndex(false, 2.0)
+	sm.ObserveSearchDelete(true)
+	sm.ObserveSearchRequest(true, 0.5)
+	sm.ObserveSearchQuery("sqlite", 0.1)
+	sm.SetSearchReady(true)
+	sm.SetSearchIndexedBackups(3)
+	sm.SetSearchIndexedResources(100)
+
+	assert.Contains(t, sm.Metrics(), searchReady)
+	assert.Contains(t, sm.Metrics(), searchIndexAttemptsTotal)
 }

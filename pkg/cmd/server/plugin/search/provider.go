@@ -68,16 +68,28 @@ func (p *BuiltInSearchProvider) Init(config map[string]string) error {
 		opts.MaxWorkers = w
 	}
 
+	if p.store != nil {
+		_ = p.store.Close()
+		p.store = nil
+	}
+
 	store, err := OpenStore(driver, dsn, opts)
 	if err != nil {
 		return err
 	}
 	if err := store.Migrate(context.Background()); err != nil {
+		_ = store.Close()
 		return err
 	}
 	p.store = store
 	p.inited = true
-	p.ready.Store(true) // Ready as soon as initialized for now, as gRPC doesn't expose MarkReady
+	// Ready stays false until MarkReady after cold-start backfill.
+	p.ready.Store(false)
+	return nil
+}
+
+func (p *BuiltInSearchProvider) MarkReady(ctx context.Context) error {
+	p.ready.Store(true)
 	return nil
 }
 
@@ -100,6 +112,7 @@ func (p *BuiltInSearchProvider) fetchTarball(ctx context.Context, url string) (*
 func (p *BuiltInSearchProvider) IndexBackup(ctx context.Context, name, url string) error {
 	p.mu.Lock()
 	inited := p.inited
+	store := p.store
 	p.mu.Unlock()
 	if !inited {
 		return errors.New("not initialized")
@@ -111,22 +124,24 @@ func (p *BuiltInSearchProvider) IndexBackup(ctx context.Context, name, url strin
 	}
 	defer resp.Body.Close()
 
-	return p.store.ReplaceBackup(ctx, name, parseTarballStream(resp.Body, name))
+	return store.ReplaceBackup(ctx, name, parseTarballStream(resp.Body, name))
 }
 
 func (p *BuiltInSearchProvider) DeleteBackup(ctx context.Context, name string) error {
 	p.mu.Lock()
 	inited := p.inited
+	store := p.store
 	p.mu.Unlock()
 	if !inited {
 		return errors.New("not initialized")
 	}
-	return p.store.DeleteBackup(ctx, name)
+	return store.DeleteBackup(ctx, name)
 }
 
 func (p *BuiltInSearchProvider) Search(ctx context.Context, params velero.SearchParams) (velero.SearchResult, error) {
 	p.mu.Lock()
 	inited := p.inited
+	store := p.store
 	p.mu.Unlock()
 	if !inited {
 		return velero.SearchResult{}, errors.New("not initialized")
@@ -135,9 +150,20 @@ func (p *BuiltInSearchProvider) Search(ctx context.Context, params velero.Search
 	ctx, cancel := context.WithTimeout(ctx, p.opts.QueryTimeout)
 	defer cancel()
 
-	return p.store.Search(ctx, params)
+	return store.Search(ctx, params)
 }
 
 func (p *BuiltInSearchProvider) Ready(ctx context.Context) (bool, error) {
 	return p.ready.Load(), nil
+}
+
+func (p *BuiltInSearchProvider) ListIndexedBackups(ctx context.Context) ([]string, error) {
+	p.mu.Lock()
+	inited := p.inited
+	store := p.store
+	p.mu.Unlock()
+	if !inited {
+		return nil, errors.New("not initialized")
+	}
+	return store.ListBackups(ctx)
 }

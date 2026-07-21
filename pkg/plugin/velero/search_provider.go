@@ -44,6 +44,16 @@ type SearchProvider interface {
 	// Ready reports whether the initial index load (cold-start backfill) has
 	// completed and the backend can serve queries.
 	Ready(ctx context.Context) (bool, error)
+
+	// ListIndexedBackups returns the names of backups currently present in the
+	// index (from processed_backups). Used by SearchIndexController for
+	// restart-safe idempotency.
+	ListIndexedBackups(ctx context.Context) ([]string, error)
+
+	// MarkReady signals that the server-side cold-start backfill has finished.
+	// Built-in providers flip Ready() to true; external plugins may no-op and
+	// manage Ready themselves.
+	MarkReady(ctx context.Context) error
 }
 
 // SearchParams defines the query filters.

@@ -46,11 +46,13 @@ var kindToResource = map[string]string{
 	"CustomResourceDefinition": "customresourcedefinitions",
 	"Namespace":                "namespaces",
 	"ClusterRoleBinding":       "clusterrolebindings",
+	"ClusterRole":              "clusterroles",
 	"ServiceAccount":           "serviceaccounts",
 	"Deployment":               "deployments",
 	"DaemonSet":                "daemonsets",
 	"Secret":                   "secrets",
 	"ConfigMap":                "configmaps",
+	"PersistentVolumeClaim":    "persistentvolumeclaims",
 	"BackupStorageLocation":    "backupstoragelocations",
 	"VolumeSnapshotLocation":   "volumesnapshotlocations",
 }

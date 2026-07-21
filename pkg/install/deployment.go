@@ -65,6 +65,8 @@ type podTemplateConfig struct {
 	kubeletRootDir                  string
 	nodeAgentDisableHostPath        bool
 	priorityClassName               string
+	searchPVCName                   string
+	searchPVCMountPath              string
 }
 
 func WithImage(image string) podTemplateOption {
@@ -262,6 +264,17 @@ func WithNodeAgentDisableHostPath(disable bool) podTemplateOption {
 	}
 }
 
+// WithSearchPVC mounts an existing PVC for the SQLite search index (default path /var/lib/velero).
+func WithSearchPVC(pvcName, mountPath string) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.searchPVCName = pvcName
+		if mountPath == "" {
+			mountPath = "/var/lib/velero"
+		}
+		c.searchPVCMountPath = mountPath
+	}
+}
+
 func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployment {
 	// TODO: Add support for server args
 	c := &podTemplateConfig{
@@ -395,7 +408,7 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployme
 						{
 							Name:            "velero",
 							Image:           c.image,
-							Ports:           containerPorts(),
+							Ports:           containerPorts(c.features),
 							ImagePullPolicy: pullPolicy,
 							Command: []string{
 								"/velero",
@@ -512,6 +525,28 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployme
 			container := *builder.ForPluginContainer(image, pullPolicy).Result()
 			deployment.Spec.Template.Spec.InitContainers = append(deployment.Spec.Template.Spec.InitContainers, container)
 		}
+	}
+
+	if c.searchPVCName != "" {
+		mountPath := c.searchPVCMountPath
+		if mountPath == "" {
+			mountPath = "/var/lib/velero"
+		}
+		deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, corev1api.Volume{
+			Name: "search-index",
+			VolumeSource: corev1api.VolumeSource{
+				PersistentVolumeClaim: &corev1api.PersistentVolumeClaimVolumeSource{
+					ClaimName: c.searchPVCName,
+				},
+			},
+		})
+		deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
+			deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+			corev1api.VolumeMount{
+				Name:      "search-index",
+				MountPath: mountPath,
+			},
+		)
 	}
 
 	return deployment
