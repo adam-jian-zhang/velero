@@ -61,6 +61,7 @@ import (
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/archive"
 	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/dag"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
 	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
@@ -330,6 +331,15 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 
 	req.RestoredItems = make(map[itemKey]restoredItemStatus)
 
+	if req.OwnerRefRemap == nil && features.IsEnabled(velerov1api.OwnerReferenceDAGFeatureFlag) {
+		req.OwnerRefRemap = NewOwnerRefRemapState()
+		req.OwnerRefRemap.Enabled = true
+		if req.OwnerRefScope == nil {
+			req.OwnerRefScope = dag.NewScope()
+		}
+		req.OwnerRefRemap.SetScope(req.OwnerRefScope)
+	}
+
 	restoreCtx := &restoreContext{
 		backup:                         req.Backup,
 		backupReader:                   req.BackupReader,
@@ -375,6 +385,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		namespacedFilterMap:            namespacedFilterMap,
 		namespacedFilterPatterns:       namespacedFilterPatterns,
 		namespaceFilterCache:           make(map[string]*resolvedNamespaceFilter),
+		ownerRefRemap:                  req.OwnerRefRemap,
 	}
 
 	return restoreCtx.execute()
@@ -440,6 +451,9 @@ type restoreContext struct {
 	// namespaceFilterCache memoizes the resolved filter for a given namespace
 	// to avoid re-evaluating glob patterns on every call.
 	namespaceFilterCache map[string]*resolvedNamespaceFilter
+
+	// ownerRefRemap is non-nil when OwnerReferenceDAG is enabled for this restore.
+	ownerRefRemap *OwnerRefRemapState
 }
 
 type resolvedResourceFilter struct {
@@ -748,6 +762,30 @@ func (ctx *restoreContext) execute() (results.Result, results.Result) {
 
 	// Need to set this for additionalItems to be restored.
 	ctx.restoreDir = dir
+
+	if features.IsEnabled(velerov1api.OwnerReferenceDAGFeatureFlag) && ctx.ownerRefRemap != nil {
+		ctx.ownerRefRemap.Enabled = true
+		dagPath := filepath.Join(ctx.restoreDir, velerov1api.OwnerRefDAGFileName)
+		data, err := ctx.fileSystem.ReadFile(dagPath)
+		if err != nil {
+			ctx.log.WithError(err).Warn("OwnerReferenceDAG enabled but velero-owner-dag.json missing; degrading to legacy ownerRef strip")
+			warnings.AddVeleroError(errors.New("OwnerReferenceDAG enabled but velero-owner-dag.json missing; using legacy ownerRef strip"))
+			ctx.ownerRefRemap.ResourceDAGPresent = false
+		} else {
+			var resourceDAG dag.ResourceDAG
+			if err := json.Unmarshal(data, &resourceDAG); err != nil {
+				ctx.log.WithError(err).Warn("Failed to parse velero-owner-dag.json; degrading to legacy ownerRef strip")
+				warnings.AddVeleroError(errors.Wrap(err, "failed to parse velero-owner-dag.json"))
+				ctx.ownerRefRemap.ResourceDAGPresent = false
+			} else {
+				ctx.ownerRefRemap.ResourceDAGPresent = true
+				ctx.ownerRefRemap.SetResourceDAG(&resourceDAG)
+				for _, w := range resourceDAG.Warnings {
+					ctx.log.Warnf("Owner-ref DAG warning from backup: %s", w)
+				}
+			}
+		}
+	}
 
 	backupResources, err := archive.NewParser(ctx.log, ctx.fileSystem).Parse(ctx.restoreDir)
 	// If ErrNotExist occurs, it implies that the backup to be restored includes zero items.
@@ -1481,6 +1519,11 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	// Make a copy of object retrieved from backup to make it available unchanged
 	//inside restore actions.
 	itemFromBackup := obj.DeepCopy()
+	originalOwnerRefs := copyOwnerReferences(itemFromBackup.GetOwnerReferences())
+	ownerRefSourceNS := ownerRefSourceNamespaces(originalOwnerRefs, nil)
+	if ctx.ownerRefRemap != nil && ctx.ownerRefRemap.ResourceDAG != nil {
+		ownerRefSourceNS = ownerRefSourceNamespaces(originalOwnerRefs, ctx.ownerRefRemap.ResourceDAG)
+	}
 
 	complete, err := isCompleted(obj, groupResource)
 	if err != nil {
@@ -1872,6 +1915,9 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				itemExists:  itemExists,
 				createdName: createdObj.GetName(),
 			}
+			if ctx.ownerRefRemap != nil {
+				ctx.ownerRefRemap.registerAndMaybeEnqueue(itemFromBackup, createdObj, groupResource, originalOwnerRefs, ownerRefSourceNS)
+			}
 		}
 	}
 
@@ -1902,6 +1948,8 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		itemStatus := ctx.restoredItems[itemKey]
 		itemStatus.itemExists = itemExists
 		ctx.restoredItems[itemKey] = itemStatus
+		// Capture live UID before metadata sanitization strips it.
+		liveObjForUID := fromCluster.DeepCopy()
 		// Remove insubstantial metadata.
 		fromCluster, err = resetMetadataAndStatus(fromCluster)
 		if err != nil {
@@ -1936,6 +1984,9 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				if patchBytes == nil {
 					// In-cluster and desired state are the same, so move on to
 					// the next item.
+					if ctx.ownerRefRemap != nil {
+						ctx.ownerRefRemap.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+					}
 					return warnings, errs, itemExists
 				}
 
@@ -1950,11 +2001,17 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 						warningsFromUpdate, errsFromUpdate := ctx.updateBackupRestoreLabels(fromCluster, fromClusterWithLabels, namespace, resourceClient)
 						warnings.Merge(&warningsFromUpdate)
 						errs.Merge(&errsFromUpdate)
+						if errsFromUpdate.IsEmpty() && ctx.ownerRefRemap != nil {
+							ctx.ownerRefRemap.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+						}
 					}
 				} else {
 					itemStatus.action = ItemRestoreResultUpdated
 					ctx.restoredItems[itemKey] = itemStatus
 					restoreLogger.Infof("ServiceAccount %s successfully updated", kube.NamespaceAndName(obj))
+					if ctx.ownerRefRemap != nil {
+						ctx.ownerRefRemap.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+					}
 				}
 			default:
 				// check for the presence of existingResourcePolicy
@@ -1976,6 +2033,9 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 						if warningsFromUpdateRP.IsEmpty() && errsFromUpdateRP.IsEmpty() {
 							itemStatus.action = ItemRestoreResultUpdated
 							ctx.restoredItems[itemKey] = itemStatus
+							if ctx.ownerRefRemap != nil {
+								ctx.ownerRefRemap.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+							}
 						}
 						warnings.Merge(&warningsFromUpdateRP)
 						errs.Merge(&errsFromUpdateRP)
@@ -2005,6 +2065,9 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		}
 
 		restoreLogger.Infof("Restore of %s skipped: it already exists in the cluster and is the same as the backed up version", obj.GetName())
+		if ctx.ownerRefRemap != nil {
+			ctx.ownerRefRemap.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+		}
 		return warnings, errs, itemExists
 	}
 

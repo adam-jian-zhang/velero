@@ -89,6 +89,7 @@ type Options struct {
 	BackupRepoConfigMap              string
 	RepoMaintenanceJobConfigMap      string
 	DefaultResourceModifierConfigMap string
+	OwnerRefConfigMap                string
 	NodeAgentConfigMap               string
 	ItemBlockWorkerCount             int
 	ConcurrentBackups                int
@@ -195,6 +196,12 @@ func (o *Options) BindFlags(flags *pflag.FlagSet) {
 		"default-resource-modifier-configmap",
 		o.DefaultResourceModifierConfigMap,
 		"The name of a ConfigMap in the Velero namespace containing default resource modifier rules applied to all restores.",
+	)
+	flags.StringVar(
+		&o.OwnerRefConfigMap,
+		"owner-ref-configmap",
+		o.OwnerRefConfigMap,
+		"The name of a ConfigMap in the Velero namespace holding owner-ref inScope allowlist and specRefPaths for --features=OwnerReferenceDAG. Optional.",
 	)
 	flags.StringVar(
 		&o.NodeAgentConfigMap,
@@ -342,6 +349,7 @@ func (o *Options) AsVeleroOptions() (*install.VeleroOptions, error) {
 		BackupRepoConfigMap:              o.BackupRepoConfigMap,
 		RepoMaintenanceJobConfigMap:      o.RepoMaintenanceJobConfigMap,
 		DefaultResourceModifierConfigMap: o.DefaultResourceModifierConfigMap,
+		OwnerRefConfigMap:                o.OwnerRefConfigMap,
 		NodeAgentConfigMap:               o.NodeAgentConfigMap,
 		ItemBlockWorkerCount:             o.ItemBlockWorkerCount,
 		ConcurrentBackups:                o.ConcurrentBackups,

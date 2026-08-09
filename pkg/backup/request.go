@@ -26,6 +26,7 @@ import (
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/dag"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/plugin/framework"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
@@ -88,6 +89,8 @@ type Request struct {
 	SkippedPVTracker          *skipPVTracker
 	VolumesInformation        volume.BackupVolumesInformation
 	WorkerPool                *ItemBlockWorkerPool
+	// OwnerDAGAccumulator collects owner-ref graph nodes/edges when OwnerReferenceDAG is enabled.
+	OwnerDAGAccumulator *dag.Accumulator
 
 	// ClusterScopedFilterMap holds resolved global filters for cluster-scoped resources.
 	// Key is the resolved group-resource string.

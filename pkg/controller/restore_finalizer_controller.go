@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -31,6 +33,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,6 +48,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	pkgrestore "github.com/vmware-tanzu/velero/pkg/restore"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/util/results"
@@ -167,6 +171,11 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, errors.Wrap(err, "error getting itemOperationList")
 	}
 
+	ownerRefRemap, err := loadOwnerRefRemapState(backupStore, restore.Name, log)
+	if err != nil {
+		log.WithError(err).Warn("error loading owner-ref remap state; skipping Phase 1B remapping")
+	}
+
 	finalizerCtx := &finalizerContext{
 		logger:           log,
 		restore:          restore,
@@ -175,6 +184,7 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		restoredPVCList:  restoredPVCList,
 		multiHookTracker: r.multiHookTracker,
 		resourceTimeout:  r.resourceTimeout,
+		ownerRefRemap:    ownerRefRemap,
 		restoreItemOperationList: restoreItemOperationList{
 			items: restoreItemOperations,
 		},
@@ -292,6 +302,7 @@ type finalizerContext struct {
 	restoreItemOperationList restoreItemOperationList
 	multiHookTracker         *hook.MultiHookTracker
 	resourceTimeout          time.Duration
+	ownerRefRemap            *pkgrestore.OwnerRefRemapState
 }
 
 func (ctx *finalizerContext) execute() (results.Result, results.Result) {
@@ -308,6 +319,12 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 
 	rehErrs := ctx.WaitRestoreExecHook()
 	errs.Merge(&rehErrs)
+
+	// Phase 1B: ownerRef + spec-ref remapping after async ops and hooks complete.
+	if ctx.ownerRefRemap != nil && ctx.ownerRefRemap.Enabled && ctx.ownerRefRemap.ResourceDAGPresent {
+		remapWarnings := pkgrestore.ApplyOwnerRefRemapping(context.Background(), ctx.logger, ctx.crClient, ctx.restore, ctx.ownerRefRemap)
+		warnings.Merge(&remapWarnings)
+	}
 
 	return warnings, errs
 }
@@ -612,4 +629,31 @@ func (ctx *finalizerContext) WaitRestoreExecHook() (errs results.Result) {
 	ctx.multiHookTracker.Delete(ctx.restore.Name)
 
 	return errs
+}
+
+func loadOwnerRefRemapState(backupStore persistence.BackupStore, restoreName string, log logrus.FieldLogger) (*pkgrestore.OwnerRefRemapState, error) {
+	rc, err := backupStore.GetOwnerRefRemapState(restoreName)
+	if err != nil {
+		return nil, err
+	}
+	if rc == nil {
+		return nil, nil
+	}
+	defer rc.Close()
+
+	gzr, err := gzip.NewReader(rc)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer gzr.Close()
+
+	state := pkgrestore.NewOwnerRefRemapState()
+	if err := json.NewDecoder(gzr).Decode(state); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if state.UIDMap == nil {
+		state.UIDMap = make(map[types.UID]types.UID)
+	}
+	log.Infof("Loaded owner-ref remap state with %d UID mappings and %d patch requests", len(state.UIDMap), len(state.OwnerPatchQueue))
+	return state, nil
 }
