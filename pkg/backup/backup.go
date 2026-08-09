@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,7 +53,9 @@ import (
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/dag"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemblock"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
@@ -69,6 +72,15 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
+
+// NewOwnerDAGAccumulatorIfEnabled returns a DAG accumulator when the
+// OwnerReferenceDAG feature flag is enabled, otherwise nil.
+func NewOwnerDAGAccumulatorIfEnabled() *dag.Accumulator {
+	if features.IsEnabled(velerov1api.OwnerReferenceDAGFeatureFlag) {
+		return dag.NewAccumulator()
+	}
+	return nil
+}
 
 // BackupVersion is the current backup major version for Velero.
 // Deprecated, use BackupFormatVersion
@@ -752,6 +764,13 @@ func (kb *kubernetesBackupper) BackupWithResolvers(
 	backupRequest.Status.Progress = &velerov1api.BackupProgress{TotalItems: backedUpItems, ItemsBackedUp: backedUpItems}
 	log.WithField("progress", "").Infof("Backed up a total of %d items", backedUpItems)
 
+	// Write owner-ref DAG at the end of the main pass (FinalizeBackup will merge/overwrite if it runs).
+	if features.IsEnabled(velerov1api.OwnerReferenceDAGFeatureFlag) {
+		if err := kb.writeResourceDAG(log, tw, backupRequest.OwnerDAGAccumulator); err != nil {
+			log.WithError(err).Warn("Failed to write velero-owner-dag.json to backup archive")
+		}
+	}
+
 	return nil
 }
 
@@ -1091,6 +1110,93 @@ func (kb *kubernetesBackupper) writeBackupVersion(tw tarWriter) error {
 	return nil
 }
 
+func (kb *kubernetesBackupper) writeResourceDAG(log logrus.FieldLogger, tw tarWriter, acc *dag.Accumulator) error {
+	if acc == nil {
+		acc = dag.NewAccumulator()
+	}
+	resourceDAG := acc.Snapshot()
+	for _, w := range resourceDAG.Warnings {
+		log.Warnf("Owner-ref DAG warning: %s", w)
+	}
+	data, err := json.Marshal(resourceDAG)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	hdr := &tar.Header{
+		Name:     velerov1api.OwnerRefDAGFileName,
+		Size:     int64(len(data)),
+		Typeflag: tar.TypeReg,
+		Mode:     0755,
+		ModTime:  time.Now(),
+	}
+	tw.Lock()
+	defer tw.Unlock()
+	if err := tw.WriteHeader(hdr); err != nil {
+		return errors.WithStack(err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// resourceDAGFileForArchive builds a FileForArchive for velero-owner-dag.json from a ResourceDAG.
+func resourceDAGFileForArchive(resourceDAG *dag.ResourceDAG) (FileForArchive, error) {
+	if resourceDAG == nil {
+		resourceDAG = &dag.ResourceDAG{
+			Version: dag.ResourceDAGVersion,
+			Nodes:   make(map[types.UID]dag.ResourceNode),
+		}
+	}
+	data, err := json.Marshal(resourceDAG)
+	if err != nil {
+		return FileForArchive{}, errors.WithStack(err)
+	}
+	hdr := &tar.Header{
+		Name:     velerov1api.OwnerRefDAGFileName,
+		Size:     int64(len(data)),
+		Typeflag: tar.TypeReg,
+		Mode:     0755,
+		ModTime:  time.Now(),
+	}
+	return FileForArchive{
+		FilePath:  velerov1api.OwnerRefDAGFileName,
+		Header:    hdr,
+		FileBytes: data,
+	}, nil
+}
+
+// loadResourceDAGFromTarReader scans a gzip+tar stream for velero-owner-dag.json.
+func loadResourceDAGFromTarReader(r io.Reader) (*dag.ResourceDAG, error) {
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer gzr.Close()
+	tr := tar.NewReader(gzr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if hdr.Name != velerov1api.OwnerRefDAGFileName {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		var resourceDAG dag.ResourceDAG
+		if err := json.Unmarshal(data, &resourceDAG); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return &resourceDAG, nil
+	}
+}
+
 func (kb *kubernetesBackupper) FinalizeBackup(
 	log logrus.FieldLogger,
 	backupRequest *Request,
@@ -1100,6 +1206,37 @@ func (kb *kubernetesBackupper) FinalizeBackup(
 	asyncBIAOperations []*itemoperation.BackupOperation,
 	backupStore persistence.BackupStore,
 ) error {
+	// When OwnerReferenceDAG is enabled, preload the DAG written by the main pass so
+	// postOperationItems can be merged before buildFinalTarball overwrites the file.
+	// Only replace the tarball DAG entry when preload succeeded; otherwise keep the
+	// original archive entry to avoid clobbering the pass-1 graph with a partial one.
+	writeOwnerDAG := false
+	if features.IsEnabled(velerov1api.OwnerReferenceDAGFeatureFlag) {
+		if backupRequest.OwnerDAGAccumulator == nil {
+			backupRequest.OwnerDAGAccumulator = dag.NewAccumulator()
+		}
+		if seeker, ok := inBackupFile.(io.ReadSeeker); ok {
+			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+				log.WithError(err).Warn("Cannot seek backup file to preload velero-owner-dag.json; leaving existing DAG entry unchanged")
+			} else {
+				existing, err := loadResourceDAGFromTarReader(seeker)
+				if err != nil {
+					log.WithError(err).Warn("Failed to load existing velero-owner-dag.json for finalize merge; leaving existing DAG entry unchanged")
+				} else {
+					if existing != nil {
+						backupRequest.OwnerDAGAccumulator.Merge(existing)
+					}
+					writeOwnerDAG = true
+				}
+				if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+					return errors.Wrap(err, "error rewinding backup file after DAG preload")
+				}
+			}
+		} else {
+			log.Warn("Backup finalize input is not seekable; cannot merge velero-owner-dag.json — leaving existing DAG entry unchanged")
+		}
+	}
+
 	gzw := gzip.NewWriter(outBackupFile)
 	defer gzw.Close()
 	tw := NewTarWriter(tar.NewWriter(gzw))
@@ -1229,6 +1366,19 @@ func (kb *kubernetesBackupper) FinalizeBackup(
 	if err := putVolumeInfos(backupRequest.Name, volumeInfos, backupStore); err != nil {
 		log.WithError(err).Errorf("fail to put the VolumeInfos for backup %s", backupRequest.Name)
 		return err
+	}
+
+	if features.IsEnabled(velerov1api.OwnerReferenceDAGFeatureFlag) && writeOwnerDAG {
+		resourceDAG := backupRequest.OwnerDAGAccumulator.Snapshot()
+		for _, w := range resourceDAG.Warnings {
+			log.Warnf("Owner-ref DAG warning: %s", w)
+		}
+		dagFile, err := resourceDAGFileForArchive(resourceDAG)
+		if err != nil {
+			log.WithError(err).Warn("Failed to marshal velero-owner-dag.json during finalize; leaving existing DAG entry unchanged")
+		} else {
+			updateFiles[dagFile.FilePath] = dagFile
+		}
 	}
 
 	// write new tar archive replacing files in original with content updateFiles for matches

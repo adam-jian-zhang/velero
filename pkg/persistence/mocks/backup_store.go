@@ -701,6 +701,50 @@ func (_m *BackupStore) PutRestoreVolumeInfo(restore string, volumeInfo io.Reader
 	return r0
 }
 
+// PutOwnerRefRemapState provides a mock function with given fields: restore, state
+func (_m *BackupStore) PutOwnerRefRemapState(restore string, state io.Reader) error {
+	ret := _m.Called(restore, state)
+
+	if len(ret) == 0 {
+		panic("no return value specified for PutOwnerRefRemapState")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(string, io.Reader) error); ok {
+		r0 = rf(restore, state)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// GetOwnerRefRemapState provides a mock function with given fields: name
+func (_m *BackupStore) GetOwnerRefRemapState(name string) (io.ReadCloser, error) {
+	ret := _m.Called(name)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetOwnerRefRemapState")
+	}
+
+	var r0 io.ReadCloser
+	var r1 error
+	if rf, ok := ret.Get(0).(func(string) (io.ReadCloser, error)); ok {
+		return rf(name)
+	}
+	if rf, ok := ret.Get(0).(func(string) io.ReadCloser); ok {
+		r0 = rf(name)
+	} else if ret.Get(0) != nil {
+		r0 = ret.Get(0).(io.ReadCloser)
+	}
+	if rf, ok := ret.Get(1).(func(string) error); ok {
+		r1 = rf(name)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
 // PutRestoredResourceList provides a mock function with given fields: restore, _a1
 func (_m *BackupStore) PutRestoredResourceList(restore string, _a1 io.Reader) error {
 	ret := _m.Called(restore, _a1)

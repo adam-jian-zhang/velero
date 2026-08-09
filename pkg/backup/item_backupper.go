@@ -364,6 +364,17 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 		return false, itemFiles, err
 	}
 	itemFiles = append(itemFiles, fileForArchive)
+
+	// Record owner-ref graph node/edges for the final backed-up item set.
+	if ib.backupRequest.OwnerDAGAccumulator != nil {
+		if u, ok := obj.(*unstructured.Unstructured); ok {
+			ib.backupRequest.OwnerDAGAccumulator.RecordItem(u)
+		} else {
+			converted := &unstructured.Unstructured{Object: obj.UnstructuredContent()}
+			ib.backupRequest.OwnerDAGAccumulator.RecordItem(converted)
+		}
+	}
+
 	return true, itemFiles, nil
 }
 
