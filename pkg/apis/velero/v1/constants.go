@@ -46,4 +46,13 @@ const (
 
 	// APIGroupVersionsFeatureFlag is the feature flag string that defines whether or not to handle multiple API Group Versions
 	APIGroupVersionsFeatureFlag = "EnableAPIGroupVersions"
+
+	// OwnerReferenceDAGFeatureFlag enables owner-reference dependency graph capture and
+	// create-then-patch remapping for in-scope GVKs, plus specRefPaths remapping.
+	// Historical name retained; the on-disk structure is a directed dependency graph.
+	OwnerReferenceDAGFeatureFlag = "OwnerReferenceDAG"
+
+	// OwnerRefDAGFileName is the root path of the owner-reference dependency graph
+	// written into the backup tarball when OwnerReferenceDAG is enabled.
+	OwnerRefDAGFileName = "velero-owner-dag.json"
 )

@@ -400,6 +400,7 @@ func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *vel
 		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
 		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
 		WorkerPool:                    pkgbackup.StartItemBlockWorkerPool(ctx, b.itemBlockWorkerCount, logger),
+		OwnerDAGAccumulator:           pkgbackup.NewOwnerDAGAccumulatorIfEnabled(),
 	}
 	request.VolumesInformation.Init()
 

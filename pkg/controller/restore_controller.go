@@ -48,6 +48,8 @@ import (
 	"github.com/vmware-tanzu/velero/internal/volume"
 	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/constant"
+	"github.com/vmware-tanzu/velero/pkg/dag"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
@@ -115,6 +117,7 @@ type restoreReconciler struct {
 	globalCrClient                   client.Client
 	resourceTimeout                  time.Duration
 	defaultResourceModifierConfigMap string
+	ownerRefConfigMap                string
 }
 
 type backupInfo struct {
@@ -138,6 +141,7 @@ func NewRestoreReconciler(
 	globalCrClient client.Client,
 	resourceTimeout time.Duration,
 	defaultResourceModifierConfigMap string,
+	ownerRefConfigMap string,
 ) *restoreReconciler {
 	r := &restoreReconciler{
 		ctx:                         ctx,
@@ -160,6 +164,7 @@ func NewRestoreReconciler(
 		globalCrClient:                   globalCrClient,
 		resourceTimeout:                  resourceTimeout,
 		defaultResourceModifierConfigMap: defaultResourceModifierConfigMap,
+		ownerRefConfigMap:                ownerRefConfigMap,
 	}
 
 	// Move the periodical backup and restore metrics computing logic from controllers to here.
@@ -661,6 +666,12 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 		BackupVolumeInfoMap:           backupVolumeInfoMap,
 		RestoreVolumeInfoTracker:      volume.NewRestoreVolInfoTracker(restore, restoreLog, r.globalCrClient),
 		ResourceDeletionStatusTracker: kubeutil.NewResourceDeletionStatusTracker(),
+		OwnerRefScope:                 r.loadOwnerRefScope(r.ctx, restore),
+	}
+	if features.IsEnabled(api.OwnerReferenceDAGFeatureFlag) {
+		restoreReq.OwnerRefRemap = pkgrestore.NewOwnerRefRemapState()
+		restoreReq.OwnerRefRemap.Enabled = true
+		restoreReq.OwnerRefRemap.SetScope(restoreReq.OwnerRefScope)
 	}
 	restoreWarnings, restoreErrors := r.restorer.RestoreWithResolvers(restoreReq, actionsResolver, pluginManager)
 
@@ -745,6 +756,10 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 
 	if err := putRestoredResourceList(restore, restoreReq.RestoredResourceList(), backupStore); err != nil {
 		r.logger.WithError(err).Error("Error uploading restored resource list to backup storage")
+	}
+
+	if err := putOwnerRefRemapState(restore, restoreReq.OwnerRefRemap, backupStore); err != nil {
+		r.logger.WithError(err).Error("Error uploading owner-ref remap state to backup storage")
 	}
 
 	if err := putOperationsForRestore(restore, *restoreReq.GetItemOperationsList(), backupStore); err != nil {
@@ -874,6 +889,46 @@ func putRestoredResourceList(restore *api.Restore, list map[string][]string, bac
 	}
 
 	return nil
+}
+
+func putOwnerRefRemapState(restore *api.Restore, state *pkgrestore.OwnerRefRemapState, backupStore persistence.BackupStore) error {
+	if state == nil || !state.Enabled {
+		return nil
+	}
+
+	buf := new(bytes.Buffer)
+	gzw := gzip.NewWriter(buf)
+	defer gzw.Close()
+
+	if err := json.NewEncoder(gzw).Encode(state); err != nil {
+		return errors.Wrap(err, "error encoding owner-ref remap state to JSON")
+	}
+	if err := gzw.Close(); err != nil {
+		return errors.Wrap(err, "error closing gzip writer")
+	}
+	return backupStore.PutOwnerRefRemapState(restore.Name, buf)
+}
+
+func (r *restoreReconciler) loadOwnerRefScope(ctx context.Context, restore *api.Restore) *dag.Scope {
+	scope := dag.NewScope()
+	if !features.IsEnabled(api.OwnerReferenceDAGFeatureFlag) {
+		return scope
+	}
+	if r.ownerRefConfigMap == "" {
+		return scope
+	}
+	cm := &corev1api.ConfigMap{}
+	err := r.kbClient.Get(ctx, types.NamespacedName{Namespace: restore.Namespace, Name: r.ownerRefConfigMap}, cm)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			r.logger.WithError(err).Warnf("Failed to load owner-ref ConfigMap %s/%s; using built-in seeds only", restore.Namespace, r.ownerRefConfigMap)
+		} else {
+			r.logger.Infof("Owner-ref ConfigMap %s/%s not found; using built-in seeds only", restore.Namespace, r.ownerRefConfigMap)
+		}
+		return scope
+	}
+	scope.LoadFromConfigMap(cm, r.logger)
+	return scope
 }
 
 func putOperationsForRestore(restore *api.Restore, operations []*itemoperation.RestoreOperation, backupStore persistence.BackupStore) error {

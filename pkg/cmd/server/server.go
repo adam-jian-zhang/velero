@@ -883,6 +883,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.crClient,
 			s.config.ResourceTimeout,
 			s.config.DefaultResourceModifierConfigMap,
+			s.config.OwnerRefConfigMap,
 		)
 
 		if err = r.SetupWithManager(s.mgr); err != nil {

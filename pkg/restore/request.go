@@ -29,6 +29,7 @@ import (
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/dag"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
@@ -68,6 +69,10 @@ type Request struct {
 	BackupVolumeInfoMap           map[string]volume.BackupVolumeInfo
 	RestoreVolumeInfoTracker      *volume.RestoreVolumeInfoTracker
 	ResourceDeletionStatusTracker kube.ResourceDeletionStatusTracker
+	// OwnerRefRemap holds Phase 1A UID mappings / patch queue when OwnerReferenceDAG is enabled.
+	OwnerRefRemap *OwnerRefRemapState
+	// OwnerRefScope resolves in-scope GVKs and specRefPaths (built-in + ConfigMap).
+	OwnerRefScope *dag.Scope
 }
 
 type restoredItemStatus struct {

@@ -59,6 +59,7 @@ type podTemplateConfig struct {
 	backupRepoConfigMap              string
 	repoMaintenanceJobConfigMap      string
 	defaultResourceModifierConfigMap string
+	ownerRefConfigMap                string
 	nodeAgentConfigMap               string
 	itemBlockWorkerCount             int
 	concurrentBackups                int
@@ -236,6 +237,12 @@ func WithDefaultResourceModifierConfigMap(name string) podTemplateOption {
 	}
 }
 
+func WithOwnerRefConfigMap(name string) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.ownerRefConfigMap = name
+	}
+}
+
 func WithItemBlockWorkerCount(itemBlockWorkerCount int) podTemplateOption {
 	return func(c *podTemplateConfig) {
 		c.itemBlockWorkerCount = itemBlockWorkerCount
@@ -359,6 +366,10 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1api.Deployme
 
 	if len(c.defaultResourceModifierConfigMap) > 0 {
 		args = append(args, fmt.Sprintf("--default-resource-modifier-configmap=%s", c.defaultResourceModifierConfigMap))
+	}
+
+	if len(c.ownerRefConfigMap) > 0 {
+		args = append(args, fmt.Sprintf("--owner-ref-configmap=%s", c.ownerRefConfigMap))
 	}
 
 	if c.itemBlockWorkerCount > 0 {

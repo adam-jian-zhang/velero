@@ -271,6 +271,7 @@ type VeleroOptions struct {
 	BackupRepoConfigMap              string
 	RepoMaintenanceJobConfigMap      string
 	DefaultResourceModifierConfigMap string
+	OwnerRefConfigMap                string
 	NodeAgentConfigMap               string
 	ItemBlockWorkerCount             int
 	ConcurrentBackups                int
@@ -410,6 +411,10 @@ func AllResources(o *VeleroOptions) *unstructured.UnstructuredList {
 
 	if len(o.DefaultResourceModifierConfigMap) > 0 {
 		deployOpts = append(deployOpts, WithDefaultResourceModifierConfigMap(o.DefaultResourceModifierConfigMap))
+	}
+
+	if len(o.OwnerRefConfigMap) > 0 {
+		deployOpts = append(deployOpts, WithOwnerRefConfigMap(o.OwnerRefConfigMap))
 	}
 
 	deploy := Deployment(o.Namespace, deployOpts...)

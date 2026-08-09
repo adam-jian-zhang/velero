@@ -163,6 +163,7 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		SkippedPVTracker:              pkgbackup.NewSkipPVTracker(),
 		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
 		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
+		OwnerDAGAccumulator:           pkgbackup.NewOwnerDAGAccumulatorIfEnabled(),
 	}
 	var outBackupFile *os.File
 	if len(operations) > 0 {

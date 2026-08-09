@@ -136,3 +136,7 @@ func (l *ObjectStoreLayout) getBackupVolumeInfoKey(backup string) string {
 func (l *ObjectStoreLayout) getRestoreVolumeInfoKey(restore string) string {
 	return path.Join(l.subdirs["restores"], restore, fmt.Sprintf("%s-volumeinfo.json.gz", restore))
 }
+
+func (l *ObjectStoreLayout) getRestoreOwnerRefRemapKey(restore string) string {
+	return path.Join(l.subdirs["restores"], restore, fmt.Sprintf("restore-%s-owner-ref-remap.json.gz", restore))
+}

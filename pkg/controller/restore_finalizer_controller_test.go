@@ -151,6 +151,7 @@ func TestRestoreFinalizerReconcile(t *testing.T) {
 				require.NoError(t, r.Client.Create(t.Context(), test.restore))
 				backupStore.On("GetRestoredResourceList", test.restore.Name).Return(map[string][]string{}, nil)
 				backupStore.On("GetRestoreItemOperations", test.restore.Name).Return([]*itemoperation.RestoreOperation{}, nil)
+				backupStore.On("GetOwnerRefRemapState", test.restore.Name).Return(nil, nil)
 			}
 			if test.backup != nil {
 				require.NoError(t, r.Client.Create(t.Context(), test.backup))
