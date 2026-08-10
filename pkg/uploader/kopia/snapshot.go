@@ -58,6 +58,12 @@ var flushVolumeFunc = flushVolume
 const UploaderConfigMultipartKey = "uploader-multipart"
 const MaxErrorReported = 10
 
+// DisabledDotIgnoreFilesSentinel is a Velero-internal filename pinned into
+// DotIgnoreFiles when in-volume .kopiaignore discovery is disabled. It will not
+// exist in real volumes, so ignorefs loads no rules; leaving DotIgnoreFiles
+// empty would let Kopia's defaultFilesPolicy merge ".kopiaignore" back in.
+const DisabledDotIgnoreFilesSentinel = ".velero.dotignore.sentinel"
+
 // SnapshotUploader which mainly used for UT test that could overwrite Upload interface
 type SnapshotUploader interface {
 	Upload(
@@ -110,9 +116,23 @@ func getDefaultPolicy() *policy.Policy {
 	}
 }
 
-func setupPolicy(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snapshot.SourceInfo, uploaderCfg map[string]string) (*policy.Tree, error) {
+func setupPolicy(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snapshot.SourceInfo, uploaderCfg map[string]string, log logrus.FieldLogger) (*policy.Tree, error) {
 	// some internal operations from Kopia code retrieves policies from repo directly, so we need to persist the policy to repo
 	curPolicy := getDefaultPolicy()
+
+	// Pin DotIgnoreFiles to an explicit, non-empty value in EVERY branch so
+	// Kopia's defaultFilesPolicy cannot leak .kopiaignore via mergeStringsReplace.
+	if uploaderutil.IsKopiaIgnoreDisabled(uploaderCfg) {
+		curPolicy.FilesPolicy.DotIgnoreFiles = []string{DisabledDotIgnoreFilesSentinel}
+	} else {
+		curPolicy.FilesPolicy.DotIgnoreFiles = []string{".kopiaignore"}
+	}
+
+	// Windows baseline exclusions are set first so user rules append to them.
+	if runtime.GOOS == "windows" {
+		curPolicy.FilesPolicy.IgnoreRules = append(curPolicy.FilesPolicy.IgnoreRules,
+			"/System Volume Information/", "/$Recycle.Bin/")
+	}
 
 	if len(uploaderCfg) > 0 {
 		parallelUpload, err := uploaderutil.GetParallelFilesUpload(uploaderCfg)
@@ -122,15 +142,24 @@ func setupPolicy(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snap
 		if parallelUpload > 0 {
 			curPolicy.UploadPolicy.MaxParallelFileReads = newOptionalInt(parallelUpload)
 		}
+
+		if _, ok := uploaderCfg[UploaderConfigMultipartKey]; ok {
+			curPolicy.UploadPolicy.ParallelUploadAboveSize = newOptionalInt64(2 << 30)
+		}
+
+		excludeRules, err := uploaderutil.GetExcludeFiles(uploaderCfg)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to read excludeFiles uploader config")
+		}
+		if len(excludeRules) > 0 {
+			curPolicy.FilesPolicy.IgnoreRules = append(curPolicy.FilesPolicy.IgnoreRules, excludeRules...)
+		}
 	}
 
-	if _, ok := uploaderCfg[UploaderConfigMultipartKey]; ok {
-		curPolicy.UploadPolicy.ParallelUploadAboveSize = newOptionalInt64(2 << 30)
-	}
-
-	if runtime.GOOS == "windows" {
-		curPolicy.FilesPolicy.IgnoreRules = []string{"/System Volume Information/", "/$Recycle.Bin/"}
-	}
+	log.WithFields(logrus.Fields{
+		"dotIgnoreFiles": curPolicy.FilesPolicy.DotIgnoreFiles,
+		"ignoreRules":    curPolicy.FilesPolicy.IgnoreRules,
+	}).Info("resolved kopia file exclusion policy for volume backup")
 
 	err := setPolicyFunc(ctx, rep, sourceInfo, curPolicy)
 	if err != nil {
@@ -142,7 +171,6 @@ func setupPolicy(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snap
 		return nil, errors.Wrap(err, "error to flush repo")
 	}
 
-	// retrieve policy from repo
 	policyTree, err := treeForSourceFunc(ctx, rep, sourceInfo)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to retrieve policy")
@@ -153,7 +181,7 @@ func setupPolicy(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snap
 
 // Backup backup specific sourcePath and update progress
 func Backup(ctx context.Context, fsUploader SnapshotUploader, repoWriter repo.RepositoryWriter, sourcePath string, realSource string,
-	forceFull bool, parentSnapshot string, volMode uploader.PersistentVolumeMode, uploaderCfg map[string]string, tags map[string]string, log logrus.FieldLogger) (*uploader.SnapshotInfo, bool, error) {
+	forceFull bool, parentSnapshot string, volMode uploader.PersistentVolumeMode, uploaderCfg map[string]string, tags map[string]string, progress *Progress, log logrus.FieldLogger) (*uploader.SnapshotInfo, bool, error) {
 	if fsUploader == nil {
 		return nil, false, errors.New("get empty kopia uploader")
 	}
@@ -193,6 +221,10 @@ func Backup(ctx context.Context, fsUploader SnapshotUploader, repoWriter repo.Re
 	snapshotInfo := &uploader.SnapshotInfo{
 		ID:   snapID,
 		Size: snapshotSize,
+	}
+	if progress != nil {
+		snapshotInfo.ExcludedFileCount = progress.GetExcludedFileCount()
+		snapshotInfo.ExcludedDirCount = progress.GetExcludedDirCount()
 	}
 
 	return snapshotInfo, false, err
@@ -272,7 +304,7 @@ func SnapshotSource(
 		log.Infof("Using parent snapshot %s, start time %v, end time %v, description %s", previous[i].ID, previous[i].StartTime.ToTime(), previous[i].EndTime.ToTime(), previous[i].Description)
 	}
 
-	policyTree, err := setupPolicy(ctx, rep, sourceInfo, uploaderCfg)
+	policyTree, err := setupPolicy(ctx, rep, sourceInfo, uploaderCfg, log)
 	if err != nil {
 		return "", 0, errors.Wrapf(err, "unable to set policy for si %v", sourceInfo)
 	}

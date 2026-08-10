@@ -166,7 +166,7 @@ func (kp *kopiaProvider) RunBackup(
 		uploaderCfg[kopia.UploaderConfigMultipartKey] = "true"
 	}
 
-	snapshotInfo, _, err := kopiaBackupFunc(ctx, kpUploader, repoWriter, path, realSource, forceFull, parentSnapshot, volMode, uploaderCfg, tags, log)
+	snapshotInfo, _, err := kopiaBackupFunc(ctx, kpUploader, repoWriter, path, realSource, forceFull, parentSnapshot, volMode, uploaderCfg, tags, progress, log)
 	if err != nil {
 		snapshotID := ""
 		if snapshotInfo != nil {
@@ -190,7 +190,12 @@ func (kp *kopiaProvider) RunBackup(
 		},
 	)
 
-	log.Debugf("Kopia backup finished, snapshot ID %s, backup size %d", snapshotInfo.ID, snapshotInfo.Size)
+	log.WithFields(logrus.Fields{
+		"snapshotID":        snapshotInfo.ID,
+		"backupSize":        snapshotInfo.Size,
+		"excludedFileCount": snapshotInfo.ExcludedFileCount,
+		"excludedDirCount":  snapshotInfo.ExcludedDirCount,
+	}).Info("Kopia backup finished")
 	return snapshotInfo.ID, false, snapshotInfo.Size, progress.GetIncrementalSize(), nil
 }
 

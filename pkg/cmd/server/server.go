@@ -399,6 +399,9 @@ func (s *server) setupBeforeControllerRun() error {
 		}
 		s.logger.WithField("configmap", s.config.GlobalBackupVolumePoliciesConfigMap).Info("Loaded global backup volume policies")
 	}
+	if !s.config.EnableInVolumeKopiaIgnore {
+		s.logger.Info("In-volume .kopiaignore discovery is disabled cluster-wide by --enable-in-volume-kopiaignore=false")
+	}
 	return nil
 }
 
@@ -681,6 +684,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.config.ConcurrentBackups,
 			s.crClient,
 			s.config.GlobalBackupVolumePoliciesConfigMap,
+			s.config.EnableInVolumeKopiaIgnore,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerBackup)
 		}

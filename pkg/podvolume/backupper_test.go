@@ -41,6 +41,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/repository"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
+	uploaderutil "github.com/vmware-tanzu/velero/pkg/uploader/util"
 )
 
 type fakeInformerRegistration struct{}
@@ -248,7 +249,7 @@ func Test_backupper_BackupPodVolumes_log_test(t *testing.T) {
 			logOutput := bytes.Buffer{}
 			var log = logrus.New()
 			log.SetOutput(&logOutput)
-			b.BackupPodVolumes(tt.args.backup, tt.args.pod, tt.args.volumesToBackup, tt.args.resPolicies, log)
+			b.BackupPodVolumes(tt.args.backup, tt.args.pod, tt.args.volumesToBackup, tt.args.resPolicies, true, log)
 			fmt.Println(logOutput.String())
 			assert.Contains(t, logOutput.String(), tt.wantLog)
 		})
@@ -633,7 +634,7 @@ func TestBackupPodVolumes(t *testing.T) {
 				funcGetRepositoryType = getRepositoryType
 			}
 
-			pvbs, summary, errs := bp.BackupPodVolumes(backupObj, test.sourcePod, test.volumes, nil, velerotest.NewLogger())
+			pvbs, summary, errs := bp.BackupPodVolumes(backupObj, test.sourcePod, test.volumes, nil, true, velerotest.NewLogger())
 
 			if test.errs != nil {
 				for i := 0; i < len(errs); i++ {
@@ -1108,4 +1109,19 @@ func TestGetMatchAction_PVCWithoutPVLookupError(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, action)
 	assert.Equal(t, resourcepolicies.Skip, action.Type)
+}
+
+func TestNewPodVolumeBackup_ExcludeFilesAndOptOut(t *testing.T) {
+	backup := builder.ForBackup("velero", "bak").Result()
+	pod := builder.ForPod("ns", "pod").NodeName("node-1").Result()
+	volume := corev1api.Volume{Name: "vol1"}
+	pvc := builder.ForPersistentVolumeClaim("ns", "pvc1").Result()
+
+	pvb := newPodVolumeBackup(backup, pod, volume, "", "kopia", pvc, []string{"/cache/*", "*.tmp"}, true)
+	require.NotNil(t, pvb.Spec.UploaderSettings)
+	assert.Equal(t, `["/cache/*","*.tmp"]`, pvb.Spec.UploaderSettings[uploaderutil.ExcludeFiles])
+	assert.Equal(t, "true", pvb.Spec.UploaderSettings[uploaderutil.KopiaIgnoreDisabled])
+
+	pvb2 := newPodVolumeBackup(backup, pod, volume, "", "kopia", nil, nil, false)
+	assert.Nil(t, pvb2.Spec.UploaderSettings)
 }

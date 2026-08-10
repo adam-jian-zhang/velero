@@ -85,6 +85,7 @@ type Request struct {
 	BackedUpItems             *backedUpItemsMap
 	itemOperationsList        *[]*itemoperation.BackupOperation
 	ResPolicies               *resourcepolicies.Policies
+	EnableInVolumeKopiaIgnore bool
 	SkippedPVTracker          *skipPVTracker
 	VolumesInformation        volume.BackupVolumesInformation
 	WorkerPool                *ItemBlockWorkerPool

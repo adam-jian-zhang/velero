@@ -18,11 +18,13 @@ package resourcepolicies
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	"go.yaml.in/yaml/v3"
 
 	datamover "github.com/vmware-tanzu/velero/pkg/util/datamover"
+	"github.com/vmware-tanzu/velero/third_party/kopia/wcmatch"
 )
 
 const currentSupportDataVersion = "v1"
@@ -132,5 +134,92 @@ func (a *Action) validate() error {
 		}
 	}
 
+	if raw, ok := a.Parameters[ExcludeFilesParameter]; ok {
+		if err := a.validateExcludeFilesAllowedAction(); err != nil {
+			return err
+		}
+
+		switch v := raw.(type) {
+		case []any:
+			for _, item := range v {
+				if str, ok := item.(string); !ok || strings.TrimSpace(str) == "" {
+					return fmt.Errorf("parameter %q must contain non-empty strings", ExcludeFilesParameter)
+				}
+			}
+		case []string:
+			for _, str := range v {
+				if strings.TrimSpace(str) == "" {
+					return fmt.Errorf("parameter %q must contain non-empty strings", ExcludeFilesParameter)
+				}
+			}
+		default:
+			return fmt.Errorf("parameter %q must be a list of pattern strings, got %T", ExcludeFilesParameter, raw)
+		}
+
+		rules, err := a.GetExcludeFiles()
+		if err != nil {
+			return err
+		}
+		for _, r := range rules {
+			if _, err := wcmatch.NewWildcardMatcher(r, wcmatch.IgnoreCase(false)); err != nil {
+				return fmt.Errorf("parameter %q contains invalid pattern %q: %w", ExcludeFilesParameter, r, err)
+			}
+		}
+	}
+
+	if raw, ok := a.Parameters[KopiaIgnoreDisabledParameter]; ok {
+		if err := a.validateKopiaIgnoreDisabledAllowedAction(); err != nil {
+			return err
+		}
+		if _, ok := raw.(bool); !ok {
+			return fmt.Errorf("parameter %q must be a boolean, got %T", KopiaIgnoreDisabledParameter, raw)
+		}
+	}
+
 	return nil
+}
+
+// validateExcludeFilesAllowedAction enforces that excludeFiles is only carried by
+// fs-backup actions, or snapshot actions whose dataMover resolves to velero-fs.
+func (a *Action) validateExcludeFilesAllowedAction() error {
+	switch a.Type {
+	case FSBackup:
+		return nil
+	case Snapshot:
+		dataMover, err := a.GetDataMover()
+		if err != nil {
+			return fmt.Errorf("parameter %q requires a valid dataMover on snapshot actions: %w", ExcludeFilesParameter, err)
+		}
+		if dataMover != datamover.DataMoverTypeVeleroFs {
+			return fmt.Errorf("parameter %q is only supported for %q action or %q action with dataMover %q, but dataMover is %q",
+				ExcludeFilesParameter, FSBackup, Snapshot, datamover.DataMoverTypeVeleroFs, dataMover)
+		}
+		return nil
+	default:
+		return fmt.Errorf("parameter %q is only supported for %q action or %q action with dataMover %q, but the action type is %q",
+			ExcludeFilesParameter, FSBackup, Snapshot, datamover.DataMoverTypeVeleroFs, a.Type)
+	}
+}
+
+// validateKopiaIgnoreDisabledAllowedAction enforces the same action-type restriction as
+// excludeFiles: kopiaIgnoreDisabled only reaches setupPolicy on fs-backup and
+// snapshot+velero-fs actions.
+func (a *Action) validateKopiaIgnoreDisabledAllowedAction() error {
+	switch a.Type {
+	case FSBackup:
+		return nil
+	case Snapshot:
+		dataMover, err := a.GetDataMover()
+		if err != nil {
+			return fmt.Errorf("parameter %q requires a valid dataMover on snapshot actions: %w", KopiaIgnoreDisabledParameter, err)
+		}
+		if dataMover != datamover.DataMoverTypeVeleroFs {
+			return fmt.Errorf("parameter %q is only supported for %q action or %q action with dataMover %q, but dataMover is %q",
+				KopiaIgnoreDisabledParameter, FSBackup, Snapshot, datamover.DataMoverTypeVeleroFs, dataMover)
+		}
+		return nil
+	default:
+		return fmt.Errorf("parameter %q is only supported for %q action or %q action with dataMover %q, but the action type is %q",
+			KopiaIgnoreDisabledParameter, FSBackup, Snapshot, datamover.DataMoverTypeVeleroFs, a.Type)
+	}
 }

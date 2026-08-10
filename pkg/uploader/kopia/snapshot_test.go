@@ -648,9 +648,9 @@ func TestBackup(t *testing.T) {
 			var snapshotInfo *uploader.SnapshotInfo
 			var err error
 			if tc.isEmptyUploader {
-				snapshotInfo, isSnapshotEmpty, err = Backup(t.Context(), nil, s.repoWriterMock, tc.sourcePath, "", tc.forceFull, tc.parentSnapshot, tc.volMode, map[string]string{}, tc.tags, &logrus.Logger{})
+				snapshotInfo, isSnapshotEmpty, err = Backup(t.Context(), nil, s.repoWriterMock, tc.sourcePath, "", tc.forceFull, tc.parentSnapshot, tc.volMode, map[string]string{}, tc.tags, nil, &logrus.Logger{})
 			} else {
-				snapshotInfo, isSnapshotEmpty, err = Backup(t.Context(), s.uploderMock, s.repoWriterMock, tc.sourcePath, "", tc.forceFull, tc.parentSnapshot, tc.volMode, map[string]string{}, tc.tags, &logrus.Logger{})
+				snapshotInfo, isSnapshotEmpty, err = Backup(t.Context(), s.uploderMock, s.repoWriterMock, tc.sourcePath, "", tc.forceFull, tc.parentSnapshot, tc.volMode, map[string]string{}, tc.tags, nil, &logrus.Logger{})
 			}
 			// Check if the returned error matches the expected error
 			if tc.expectedError != nil {
@@ -834,4 +834,111 @@ func TestRestore(t *testing.T) {
 			assert.Equal(t, tc.expectedCount, fileCount)
 		})
 	}
+}
+
+func TestSetupPolicy_ExcludeFilesAndDotIgnorePin(t *testing.T) {
+	log := logrus.New()
+	var captured *policy.Policy
+
+	setPolicyFunc = func(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snapshot.SourceInfo, p *policy.Policy) error {
+		captured = p
+		return nil
+	}
+	treeForSourceFunc = func(ctx context.Context, rep repo.Repository, sourceInfo snapshot.SourceInfo) (*policy.Tree, error) {
+		return nil, nil
+	}
+	defer func() {
+		setPolicyFunc = policy.SetPolicy
+		treeForSourceFunc = policy.TreeForSource
+	}()
+
+	repoWriter := &repomocks.RepositoryWriter{}
+	repoWriter.On("Flush", mock.Anything).Return(nil)
+
+	uploaderCfg := map[string]string{
+		"ExcludeFiles": `["/cache/*","*.tmp"]`,
+	}
+	_, err := setupPolicy(t.Context(), repoWriter, snapshot.SourceInfo{Path: "/data"}, uploaderCfg, log)
+	require.NoError(t, err)
+	require.NotNil(t, captured)
+	assert.Equal(t, []string{".kopiaignore"}, captured.FilesPolicy.DotIgnoreFiles)
+	assert.Contains(t, captured.FilesPolicy.IgnoreRules, "/cache/*")
+	assert.Contains(t, captured.FilesPolicy.IgnoreRules, "*.tmp")
+}
+
+func TestSetupPolicy_KopiaIgnoreOptOut(t *testing.T) {
+	log := logrus.New()
+	var captured *policy.Policy
+
+	setPolicyFunc = func(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snapshot.SourceInfo, p *policy.Policy) error {
+		captured = p
+		return nil
+	}
+	treeForSourceFunc = func(ctx context.Context, rep repo.Repository, sourceInfo snapshot.SourceInfo) (*policy.Tree, error) {
+		return nil, nil
+	}
+	defer func() {
+		setPolicyFunc = policy.SetPolicy
+		treeForSourceFunc = policy.TreeForSource
+	}()
+
+	repoWriter := &repomocks.RepositoryWriter{}
+	repoWriter.On("Flush", mock.Anything).Return(nil)
+
+	uploaderCfg := map[string]string{"KopiaIgnoreDisabled": "true"}
+	_, err := setupPolicy(t.Context(), repoWriter, snapshot.SourceInfo{Path: "/data"}, uploaderCfg, log)
+	require.NoError(t, err)
+	require.NotNil(t, captured)
+	assert.Equal(t, []string{DisabledDotIgnoreFilesSentinel}, captured.FilesPolicy.DotIgnoreFiles)
+}
+
+func TestSetupPolicy_DotIgnoreFilesNeverEmpty(t *testing.T) {
+	log := logrus.New()
+	var captured *policy.Policy
+
+	setPolicyFunc = func(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snapshot.SourceInfo, p *policy.Policy) error {
+		captured = p
+		return nil
+	}
+	treeForSourceFunc = func(ctx context.Context, rep repo.Repository, sourceInfo snapshot.SourceInfo) (*policy.Tree, error) {
+		return nil, nil
+	}
+	defer func() {
+		setPolicyFunc = policy.SetPolicy
+		treeForSourceFunc = policy.TreeForSource
+	}()
+
+	repoWriter := &repomocks.RepositoryWriter{}
+	repoWriter.On("Flush", mock.Anything).Return(nil)
+
+	_, err := setupPolicy(t.Context(), repoWriter, snapshot.SourceInfo{Path: "/data"}, nil, log)
+	require.NoError(t, err)
+	require.NotEmpty(t, captured.FilesPolicy.DotIgnoreFiles)
+}
+
+func TestSetupPolicy_MalformedExcludeFiles(t *testing.T) {
+	log := logrus.New()
+	setPolicyFunc = func(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snapshot.SourceInfo, p *policy.Policy) error {
+		return nil
+	}
+	defer func() {
+		setPolicyFunc = policy.SetPolicy
+	}()
+
+	repoWriter := &repomocks.RepositoryWriter{}
+	_, err := setupPolicy(t.Context(), repoWriter, snapshot.SourceInfo{Path: "/data"}, map[string]string{"ExcludeFiles": "not-json"}, log)
+	require.Error(t, err)
+}
+
+type nopProgressUpdater struct{}
+
+func (nopProgressUpdater) UpdateProgress(p *uploader.Progress) {}
+
+func TestProgressExcludedCounts(t *testing.T) {
+	p := NewProgress(nopProgressUpdater{}, time.Second, logrus.New())
+	p.ExcludedFile("a.txt", 10)
+	p.ExcludedFile("b.txt", 20)
+	p.ExcludedDir("cache")
+	assert.Equal(t, int64(2), p.GetExcludedFileCount())
+	assert.Equal(t, int64(1), p.GetExcludedDirCount())
 }

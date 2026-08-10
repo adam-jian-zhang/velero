@@ -407,8 +407,6 @@ func (p *pvcBackupItemAction) Execute(
 			"Backup":         backup.Name,
 		})
 
-		dataMoverFromVolumePolicy := vh.GetDataMoverFromActionParameters(item, kuberesource.PersistentVolumeClaims)
-
 		dataUploadLog.Info("Starting data upload of backup")
 
 		dataUpload, err := createDataUpload(
@@ -420,7 +418,8 @@ func (p *pvcBackupItemAction) Execute(
 			operationID,
 			vsc,
 			fsType,
-			dataMoverFromVolumePolicy,
+			item,
+			vh,
 		)
 		if err != nil {
 			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
@@ -561,6 +560,8 @@ func newDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
+	excludeFiles []string,
+	kopiaIgnoreDisabled bool,
 ) *velerov2alpha1.DataUpload {
 	parentSnapshot := ""
 
@@ -624,6 +625,31 @@ func newDataUpload(
 		dataUpload.Spec.DataMoverConfig[uploaderUtil.ParallelFilesUpload] = strconv.Itoa(backup.Spec.UploaderConfig.ParallelFilesUpload)
 	}
 
+	// File-exclusion config only takes effect on the filesystem data mover path
+	// (setupPolicy). Skip writing it for block/other movers so it is not a silent no-op.
+	if datamover.IsVeleroFSDataMover(dataMover) {
+		if serialized := uploaderUtil.StoreExcludeFiles(excludeFiles); serialized != "" {
+			if dataUpload.Spec.DataMoverConfig == nil {
+				dataUpload.Spec.DataMoverConfig = make(map[string]string)
+			}
+			dataUpload.Spec.DataMoverConfig[uploaderUtil.ExcludeFiles] = serialized
+		}
+
+		// Global kill-switch from backup annotation overrides per-volume setting.
+		enableInVolumeKopiaIgnore := true
+		if val, ok := backup.Annotations[velerov1api.EnableInVolumeKopiaIgnoreAnnotation]; ok {
+			if parsed, err := strconv.ParseBool(val); err == nil {
+				enableInVolumeKopiaIgnore = parsed
+			}
+		}
+		if !enableInVolumeKopiaIgnore || kopiaIgnoreDisabled {
+			if dataUpload.Spec.DataMoverConfig == nil {
+				dataUpload.Spec.DataMoverConfig = make(map[string]string)
+			}
+			dataUpload.Spec.DataMoverConfig[uploaderUtil.KopiaIgnoreDisabled] = "true"
+		}
+	}
+
 	return dataUpload
 }
 
@@ -636,9 +662,44 @@ func createDataUpload(
 	operationID string,
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
-	dataMoverFromVolumePolicy string,
+	item runtime.Unstructured,
+	vh vhutil.VolumeHelper,
 ) (*velerov2alpha1.DataUpload, error) {
-	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy)
+	var dataMoverFromVolumePolicy string
+	var excludeFiles []string
+	var kopiaIgnoreDisabled bool
+	if vh != nil {
+		var err error
+		dataMoverFromVolumePolicy = vh.GetDataMoverFromActionParameters(item, kuberesource.PersistentVolumeClaims)
+		excludeFiles, err = vh.GetExcludeFiles(item, kuberesource.PersistentVolumeClaims)
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid excludeFiles from volume policy")
+		}
+		kopiaIgnoreDisabled, err = vh.GetKopiaIgnoreDisabled(item, kuberesource.PersistentVolumeClaims)
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid kopiaIgnoreDisabled from volume policy")
+		}
+	}
+
+	dataMover := backup.Spec.DataMover
+	if dataMoverFromVolumePolicy != "" {
+		dataMover = dataMoverFromVolumePolicy
+	}
+
+	if !datamover.IsVeleroFSDataMover(dataMover) {
+		if len(excludeFiles) > 0 {
+			return nil, errors.Errorf(
+				"excludeFiles from volume policy requires filesystem data mover %q, but backup DataMover is %q",
+				datamover.DataMoverTypeVeleroFs, dataMover)
+		}
+		if kopiaIgnoreDisabled {
+			return nil, errors.Errorf(
+				"kopiaIgnoreDisabled from volume policy requires filesystem data mover %q, but backup DataMover is %q",
+				datamover.DataMoverTypeVeleroFs, dataMover)
+		}
+	}
+
+	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, excludeFiles, kopiaIgnoreDisabled)
 
 	err := crClient.Create(ctx, dataUpload)
 	if err != nil {

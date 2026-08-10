@@ -112,6 +112,7 @@ type backupReconciler struct {
 	itemBlockWorkerCount               int
 	concurrentBackups                  int
 	globalVolumePoliciesConfigMap      string
+	enableInVolumeKopiaIgnore          bool
 	knownSchedulesWithSuccessfulBackup sets.Set[string]
 }
 
@@ -142,6 +143,7 @@ func NewBackupReconciler(
 	concurrentBackups int,
 	globalCRClient kbclient.Client,
 	globalVolumePoliciesConfigMap string,
+	enableInVolumeKopiaIgnore bool,
 ) *backupReconciler {
 	b := &backupReconciler{
 		ctx:                           ctx,
@@ -171,6 +173,7 @@ func NewBackupReconciler(
 		concurrentBackups:             max(concurrentBackups, 1),
 		globalCRClient:                globalCRClient,
 		globalVolumePoliciesConfigMap: globalVolumePoliciesConfigMap,
+		enableInVolumeKopiaIgnore:     enableInVolumeKopiaIgnore,
 	}
 	b.updateTotalBackupMetric()
 	return b
@@ -636,6 +639,10 @@ func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *vel
 			"They cannot be used with namespace-scoped or fine-grained global filter policies.")
 	}
 	request.ResPolicies = resourcePolicies
+	request.EnableInVolumeKopiaIgnore = b.enableInVolumeKopiaIgnore
+	if !b.enableInVolumeKopiaIgnore {
+		request.Annotations[velerov1api.EnableInVolumeKopiaIgnoreAnnotation] = "false"
+	}
 	return request
 }
 

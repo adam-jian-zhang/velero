@@ -395,7 +395,7 @@ func (ib *itemBackupper) backupPodVolumes(log logrus.FieldLogger, pod *corev1api
 		return nil, nil, nil
 	}
 
-	return ib.podVolumeBackupper.BackupPodVolumes(ib.backupRequest.Backup, pod, volumes, ib.backupRequest.ResPolicies, log)
+	return ib.podVolumeBackupper.BackupPodVolumes(ib.backupRequest.Backup, pod, volumes, ib.backupRequest.ResPolicies, ib.backupRequest.EnableInVolumeKopiaIgnore, log)
 }
 
 func (ib *itemBackupper) executeActions(

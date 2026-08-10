@@ -58,6 +58,18 @@ const (
 	// SnapshotClassParameter is the key of the action parameter that selects the
 	// VolumeSnapshotClass to use for CSI snapshots when the action type is snapshot.
 	SnapshotClassParameter = "snapshotClass"
+
+	// ExcludeFilesParameter is the key of the action parameter that selects file and
+	// directory pattern exclusions for file-system backups. This is the user-facing
+	// YAML key in volume policies (lowercase). It is distinct from the uploader-config
+	// key of the same name in pkg/uploader/util (capital "ExcludeFiles").
+	ExcludeFilesParameter = "excludeFiles"
+
+	// KopiaIgnoreDisabledParameter is the key of the action parameter that opts a
+	// specific volume out of in-volume .kopiaignore auto-discovery. It is the
+	// user-facing YAML key (lowercase), distinct from the uploader-config key
+	// "KopiaIgnoreDisabled" (capital) in pkg/uploader/util.
+	KopiaIgnoreDisabledParameter = "kopiaIgnoreDisabled"
 )
 
 // validDataMovers is the set of data mover values accepted in the snapshot
@@ -135,6 +147,62 @@ func (a *Action) GetSnapshotClass() (string, error) {
 		return "", fmt.Errorf("parameter %q must be a string, got %T", SnapshotClassParameter, raw)
 	}
 	return snapshotClass, nil
+}
+
+// GetExcludeFiles returns the list of file/directory ignore pattern rules configured in
+// the action's excludeFiles parameter. Patterns are trimmed; empty entries after trim are dropped.
+func (a *Action) GetExcludeFiles() ([]string, error) {
+	if a == nil {
+		return nil, nil
+	}
+	if len(a.Parameters) == 0 {
+		return nil, nil
+	}
+	raw, ok := a.Parameters[ExcludeFilesParameter]
+	if !ok {
+		return nil, nil
+	}
+
+	var rules []string
+	switch v := raw.(type) {
+	case []any:
+		for _, item := range v {
+			str, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("parameter %q must contain only strings, got element of type %T", ExcludeFilesParameter, item)
+			}
+			if strings.TrimSpace(str) != "" {
+				rules = append(rules, strings.TrimSpace(str))
+			}
+		}
+	case []string:
+		for _, str := range v {
+			if strings.TrimSpace(str) != "" {
+				rules = append(rules, strings.TrimSpace(str))
+			}
+		}
+	default:
+		return nil, fmt.Errorf("parameter %q must be a slice of strings, got %T", ExcludeFilesParameter, raw)
+	}
+
+	return rules, nil
+}
+
+// GetKopiaIgnoreDisabled reports whether the action opts out of in-volume .kopiaignore
+// discovery. Returns false when the parameter is absent.
+func (a *Action) GetKopiaIgnoreDisabled() (bool, error) {
+	if a == nil || len(a.Parameters) == 0 {
+		return false, nil
+	}
+	raw, ok := a.Parameters[KopiaIgnoreDisabledParameter]
+	if !ok {
+		return false, nil
+	}
+	disable, ok := raw.(bool)
+	if !ok {
+		return false, fmt.Errorf("parameter %q must be a boolean, got %T", KopiaIgnoreDisabledParameter, raw)
+	}
+	return disable, nil
 }
 
 // PolicyLabelSelector mirrors metav1.LabelSelector with yaml tags for ConfigMap decode.

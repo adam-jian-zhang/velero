@@ -4017,7 +4017,7 @@ type fakePodVolumeBackupper struct {
 
 // BackupPodVolumes returns one pod volume backup per entry in volumes, with namespace "velero"
 // and name "pvb-<pod-namespace>-<pod-name>-<volume-name>".
-func (b *fakePodVolumeBackupper) BackupPodVolumes(backup *velerov1.Backup, pod *corev1api.Pod, volumes []string, _ *resourcepolicies.Policies, _ logrus.FieldLogger) ([]*velerov1.PodVolumeBackup, *podvolume.PVCBackupSummary, []error) {
+func (b *fakePodVolumeBackupper) BackupPodVolumes(backup *velerov1.Backup, pod *corev1api.Pod, volumes []string, _ *resourcepolicies.Policies, _ bool, _ logrus.FieldLogger) ([]*velerov1.PodVolumeBackup, *podvolume.PVCBackupSummary, []error) {
 	var res []*velerov1.PodVolumeBackup
 	pvcSummary := podvolume.NewPVCBackupSummary()
 

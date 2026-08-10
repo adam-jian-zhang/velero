@@ -29,4 +29,6 @@ type VolumeHelper interface {
 	GetActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) (bool, string, map[string]any, error)
 	GetSnapshotClass(obj runtime.Unstructured, groupResource schema.GroupResource) (string, error)
 	GetDataMoverFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) string
+	GetExcludeFiles(obj runtime.Unstructured, groupResource schema.GroupResource) ([]string, error)
+	GetKopiaIgnoreDisabled(obj runtime.Unstructured, groupResource schema.GroupResource) (bool, error)
 }

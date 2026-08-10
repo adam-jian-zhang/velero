@@ -29,3 +29,13 @@ func TestGlobalBackupVolumePoliciesConfigMapFlag(t *testing.T) {
 	require.NoError(t, flags.Parse([]string{"--global-backup-volume-policies-configmap", "global-volume-policy"}))
 	assert.Equal(t, "global-volume-policy", config.GlobalBackupVolumePoliciesConfigMap)
 }
+
+func TestEnableInVolumeKopiaIgnoreFlag(t *testing.T) {
+	config := GetDefaultConfig()
+	assert.True(t, config.EnableInVolumeKopiaIgnore)
+
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	config.BindFlags(flags)
+	require.NoError(t, flags.Parse([]string{"--enable-in-volume-kopiaignore=false"}))
+	assert.False(t, config.EnableInVolumeKopiaIgnore)
+}

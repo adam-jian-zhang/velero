@@ -56,6 +56,7 @@ import (
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	uploaderUtil "github.com/vmware-tanzu/velero/pkg/uploader/util"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
+	"github.com/vmware-tanzu/velero/pkg/util/datamover"
 )
 
 const testDriver = "csi.example.com"
@@ -2320,7 +2321,7 @@ func TestNewDataUpload(t *testing.T) {
 			operationID := "test-op-id"
 			fsType := "ext4"
 
-			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy)
+			du := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, tc.dataMoverFromVolumePolicy, nil, false)
 
 			require.NotNil(t, du)
 			assert.Equal(t, velerov2alpha1.SchemeGroupVersion.String(), du.APIVersion)
@@ -2368,4 +2369,41 @@ func TestNewDataUpload(t *testing.T) {
 			assert.Equal(t, tc.expectedDataMoverCfg, du.Spec.DataMoverConfig)
 		})
 	}
+}
+
+func TestNewDataUpload_ExcludeFilesAndKillSwitch(t *testing.T) {
+	backup := &velerov1api.Backup{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "velero",
+			Name:      "bak",
+			UID:       types.UID("bak-uid"),
+			Annotations: map[string]string{
+				velerov1api.EnableInVolumeKopiaIgnoreAnnotation: "false",
+			},
+		},
+		Spec: velerov1api.BackupSpec{
+			DataMover: datamover.DataMoverTypeVeleroFs,
+		},
+	}
+	vs := &snapshotv1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "vs"},
+		Spec:       snapshotv1api.VolumeSnapshotSpec{},
+	}
+	pvc := &corev1api.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc", Namespace: "ns", UID: types.UID("pvc-uid")},
+		Spec:       corev1api.PersistentVolumeClaimSpec{StorageClassName: ptr.To("sc")},
+	}
+	vsc := &snapshotv1api.VolumeSnapshotContent{
+		Spec: snapshotv1api.VolumeSnapshotContentSpec{Driver: "driver"},
+	}
+
+	du := newDataUpload(backup, vs, pvc, "op", vsc, "ext4", "", []string{"*.tmp"}, false)
+	require.NotNil(t, du.Spec.DataMoverConfig)
+	assert.Equal(t, `["*.tmp"]`, du.Spec.DataMoverConfig[uploaderUtil.ExcludeFiles])
+	assert.Equal(t, "true", du.Spec.DataMoverConfig[uploaderUtil.KopiaIgnoreDisabled])
+
+	// Block data mover: file-exclusion settings must not be written (would be a silent no-op).
+	backup.Spec.DataMover = datamover.DataMoverTypeVeleroBlock
+	duBlock := newDataUpload(backup, vs, pvc, "op", vsc, "ext4", "", []string{"*.tmp"}, true)
+	assert.Nil(t, duBlock.Spec.DataMoverConfig)
 }

@@ -17,7 +17,10 @@ limitations under the License.
 package util
 
 import (
+	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -28,6 +31,15 @@ const (
 	ParallelFilesUpload = "ParallelFilesUpload"
 	WriteSparseFiles    = "WriteSparseFiles"
 	RestoreConcurrency  = "ParallelFilesDownload"
+
+	// ExcludeFiles is the reserved uploader-config key carrying a JSON-encoded
+	// []string of file/directory ignore patterns. It is written into PVB.Spec.UploaderSettings
+	// and DU.Spec.DataMoverConfig.
+	ExcludeFiles = "ExcludeFiles"
+
+	// KopiaIgnoreDisabled is the reserved uploader-config key that, when set to "true",
+	// disables in-volume .kopiaignore auto-discovery for the volume.
+	KopiaIgnoreDisabled = "KopiaIgnoreDisabled"
 )
 
 func StoreBackupConfig(config *velerov1api.UploaderConfigForBackup) map[string]string {
@@ -84,4 +96,38 @@ func GetRestoreConcurrency(uploaderCfg map[string]string) (int, error) {
 		return restoreConcurrencyInt, nil
 	}
 	return 0, nil
+}
+
+// StoreExcludeFiles JSON-encodes a slice of exclude pattern strings into a single config
+// string suitable for the map[string]string carrier. Returns "" for an empty/nil slice.
+func StoreExcludeFiles(rules []string) string {
+	if len(rules) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(rules)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// GetExcludeFiles JSON-decodes the exclude pattern rules from the uploader configuration map.
+// Returns (nil, nil) when the key is absent or empty. A malformed JSON value returns an error.
+func GetExcludeFiles(uploaderCfg map[string]string) ([]string, error) {
+	excludeStr, ok := uploaderCfg[ExcludeFiles]
+	if !ok || strings.TrimSpace(excludeStr) == "" {
+		return nil, nil
+	}
+	var rules []string
+	if err := json.Unmarshal([]byte(excludeStr), &rules); err != nil {
+		return nil, fmt.Errorf("invalid %q config (expected JSON-encoded string array): %w", ExcludeFiles, err)
+	}
+	return rules, nil
+}
+
+// IsKopiaIgnoreDisabled reports whether in-volume .kopiaignore discovery has been
+// opted out for this volume via the KopiaIgnoreDisabled config key.
+func IsKopiaIgnoreDisabled(uploaderCfg map[string]string) bool {
+	v, ok := uploaderCfg[KopiaIgnoreDisabled]
+	return ok && strings.EqualFold(strings.TrimSpace(v), "true")
 }

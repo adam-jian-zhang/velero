@@ -183,6 +183,9 @@ type Config struct {
 	ConcurrentBackups                   int
 	GlobalBackupVolumePoliciesConfigMap string
 	DefaultResourceModifierConfigMap    string
+	// EnableInVolumeKopiaIgnore controls in-volume .kopiaignore auto-discovery.
+	// Default true. Set to false to disable discovery cluster-wide.
+	EnableInVolumeKopiaIgnore bool
 }
 
 func GetDefaultConfig() *Config {
@@ -216,6 +219,7 @@ func GetDefaultConfig() *Config {
 		CredentialsDirectory:           credentials.DefaultStoreDirectory(),
 		ItemBlockWorkerCount:           DefaultItemBlockWorkerCount,
 		ConcurrentBackups:              DefaultConcurrentBackups,
+		EnableInVolumeKopiaIgnore:      true,
 	}
 
 	return config
@@ -282,6 +286,13 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 		"global-backup-volume-policies-configmap",
 		c.GlobalBackupVolumePoliciesConfigMap,
 		"The name of a ConfigMap in the Velero install namespace holding global backup volume policies that are merged into every backup. Optional.",
+	)
+	flags.BoolVar(
+		&c.EnableInVolumeKopiaIgnore,
+		"enable-in-volume-kopiaignore",
+		c.EnableInVolumeKopiaIgnore,
+		"Enable in-volume .kopiaignore auto-discovery for fs-backup volumes. "+
+			"Set to false to disable discovery cluster-wide (trust-boundary kill-switch).",
 	)
 	flags.StringVar(
 		&c.DefaultResourceModifierConfigMap,

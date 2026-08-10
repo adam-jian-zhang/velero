@@ -57,13 +57,17 @@ type Progress struct {
 	// +checkatomic
 	fatalErrorCount     int32 //the total errors has occurred
 	estimatedFileCount  int64 // +checklocksignore the total count of files to be processed
-	estimatedTotalBytes int64 // +checklocksignore	the total size of files to be processed
+	estimatedTotalBytes int64 // +checklocksignore the total size of files to be processed
 	// +checkatomic
-	processedBytes  int64                    // which statistic all bytes has been processed currently
-	outputThrottle  Throttle                 // which control the frequency of update progress
-	updater         uploader.ProgressUpdater //which kopia progress will call the UpdateProgress interface, the third party will implement the interface to do the progress update
-	log             logrus.FieldLogger       // output info into log when backup
-	estimationParam upload.EstimationParameters
+	processedBytes int64 // which statistic all bytes has been processed currently
+	// +checkatomic
+	excludedFileCount int64 // files excluded by IgnoreRules / DotIgnoreFiles
+	// +checkatomic
+	excludedDirCount int64                    // directories excluded by IgnoreRules / DotIgnoreFiles
+	outputThrottle   Throttle                 // which control the frequency of update progress
+	updater          uploader.ProgressUpdater //which kopia progress will call the UpdateProgress interface, the third party will implement the interface to do the progress update
+	log              logrus.FieldLogger       // output info into log when backup
+	estimationParam  upload.EstimationParameters
 }
 
 func NewProgress(updater uploader.ProgressUpdater, interval time.Duration, log logrus.FieldLogger) *Progress {
@@ -136,11 +140,24 @@ func (p *Progress) HashedBytes(numBytes int64) {
 func (p *Progress) HashingFile(fname string) {}
 
 // ExcludedFile statistic the file been excluded currently
-func (p *Progress) ExcludedFile(fname string, numBytes int64) {}
+func (p *Progress) ExcludedFile(fname string, numBytes int64) {
+	atomic.AddInt64(&p.excludedFileCount, 1)
+}
 
 // ExcludedDir statistic the dir been excluded currently
 func (p *Progress) ExcludedDir(dirname string) {
+	atomic.AddInt64(&p.excludedDirCount, 1)
 	p.log.Infof("Excluded dir %s", dirname)
+}
+
+// GetExcludedFileCount returns the number of files excluded during the upload.
+func (p *Progress) GetExcludedFileCount() int64 {
+	return atomic.LoadInt64(&p.excludedFileCount)
+}
+
+// GetExcludedDirCount returns the number of directories excluded during the upload.
+func (p *Progress) GetExcludedDirCount() int64 {
+	return atomic.LoadInt64(&p.excludedDirCount)
 }
 
 // FinishedHashingFile which will called when specific file finished hash

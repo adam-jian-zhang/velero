@@ -21,6 +21,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 )
@@ -239,4 +241,41 @@ func TestGetRestoreConcurrency(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStoreExcludeFiles(t *testing.T) {
+	assert.Empty(t, StoreExcludeFiles(nil))
+	assert.Empty(t, StoreExcludeFiles([]string{}))
+
+	got := StoreExcludeFiles([]string{"/cache/*", "*.tmp"})
+	assert.Equal(t, `["/cache/*","*.tmp"]`, got)
+
+	// comma in pattern must round-trip
+	encoded := StoreExcludeFiles([]string{"foo,bar.txt"})
+	assert.Equal(t, `["foo,bar.txt"]`, encoded)
+}
+
+func TestGetExcludeFiles(t *testing.T) {
+	rules, err := GetExcludeFiles(nil)
+	require.NoError(t, err)
+	assert.Nil(t, rules)
+
+	rules, err = GetExcludeFiles(map[string]string{})
+	require.NoError(t, err)
+	assert.Nil(t, rules)
+
+	rules, err = GetExcludeFiles(map[string]string{ExcludeFiles: `["/cache/*","foo,bar.txt"]`})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/cache/*", "foo,bar.txt"}, rules)
+
+	_, err = GetExcludeFiles(map[string]string{ExcludeFiles: "not-json"})
+	assert.Error(t, err)
+}
+
+func TestIsKopiaIgnoreDisabled(t *testing.T) {
+	assert.False(t, IsKopiaIgnoreDisabled(nil))
+	assert.False(t, IsKopiaIgnoreDisabled(map[string]string{}))
+	assert.False(t, IsKopiaIgnoreDisabled(map[string]string{KopiaIgnoreDisabled: "false"}))
+	assert.True(t, IsKopiaIgnoreDisabled(map[string]string{KopiaIgnoreDisabled: "true"}))
+	assert.True(t, IsKopiaIgnoreDisabled(map[string]string{KopiaIgnoreDisabled: " TRUE "}))
 }

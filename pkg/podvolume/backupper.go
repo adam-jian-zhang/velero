@@ -54,7 +54,7 @@ const (
 // Backupper can execute pod volume backups of volumes in a pod.
 type Backupper interface {
 	// BackupPodVolumes backs up all specified volumes in a pod.
-	BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.Pod, volumesToBackup []string, resPolicies *resourcepolicies.Policies, log logrus.FieldLogger) ([]*velerov1api.PodVolumeBackup, *PVCBackupSummary, []error)
+	BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.Pod, volumesToBackup []string, resPolicies *resourcepolicies.Policies, enableInVolumeKopiaIgnore bool, log logrus.FieldLogger) ([]*velerov1api.PodVolumeBackup, *PVCBackupSummary, []error)
 	WaitAllPodVolumesProcessed(log logrus.FieldLogger) []*velerov1api.PodVolumeBackup
 	GetPodVolumeBackupByPodAndVolume(podNamespace, podName, volume string) (*velerov1api.PodVolumeBackup, error)
 	ListPodVolumeBackupsByPod(podNamespace, podName string) ([]*velerov1api.PodVolumeBackup, error)
@@ -230,7 +230,7 @@ func (b *backupper) getMatchAction(resPolicies *resourcepolicies.Policies, pvc *
 
 var funcGetRepositoryType = getRepositoryType
 
-func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.Pod, volumesToBackup []string, resPolicies *resourcepolicies.Policies, log logrus.FieldLogger) ([]*velerov1api.PodVolumeBackup, *PVCBackupSummary, []error) {
+func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.Pod, volumesToBackup []string, resPolicies *resourcepolicies.Policies, enableInVolumeKopiaIgnore bool, log logrus.FieldLogger) ([]*velerov1api.PodVolumeBackup, *PVCBackupSummary, []error) {
 	if len(volumesToBackup) == 0 {
 		return nil, nil, nil
 	}
@@ -323,6 +323,8 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 			}
 		}
 
+		var excludeFiles []string
+		var kopiaIgnoreDisabled bool
 		if resPolicies != nil {
 			if action, err := b.getMatchAction(resPolicies, pvc, &volume); err != nil {
 				errs = append(errs, errors.Wrapf(err, "error getting pv for pvc %s", pvc.Spec.VolumeName))
@@ -331,6 +333,17 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 				log.Infof("skip backup of volume %s for the matched resource policies", volumeName)
 				pvcSummary.addSkipped(volumeName, "matched action is 'skip' in chosen resource policies")
 				continue
+			} else if action != nil {
+				excludeFiles, err = action.GetExcludeFiles()
+				if err != nil {
+					errs = append(errs, errors.Wrapf(err, "invalid excludeFiles for volume %s", volumeName))
+					continue
+				}
+				kopiaIgnoreDisabled, err = action.GetKopiaIgnoreDisabled()
+				if err != nil {
+					errs = append(errs, errors.Wrapf(err, "invalid kopiaIgnoreDisabled for volume %s", volumeName))
+					continue
+				}
 			}
 		}
 
@@ -364,7 +377,14 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 			continue
 		}
 
-		volumeBackup := newPodVolumeBackup(backup, pod, volume, "", b.uploaderType, pvc)
+		volumeBackup := newPodVolumeBackup(backup, pod, volume, "", b.uploaderType, pvc, excludeFiles, kopiaIgnoreDisabled)
+		// Global kill-switch: when the server flag is false, force in-volume discovery off.
+		if !enableInVolumeKopiaIgnore {
+			if volumeBackup.Spec.UploaderSettings == nil {
+				volumeBackup.Spec.UploaderSettings = make(map[string]string)
+			}
+			volumeBackup.Spec.UploaderSettings[uploaderutil.KopiaIgnoreDisabled] = "true"
+		}
 		// the PVB must be added into the indexer before creating it in API server otherwise unexpected behavior may happen:
 		// the PVB may be handled very quickly by the controller and the informer handler will insert the PVB before "b.pvbIndexer.Add(volumeBackup)" runs,
 		// this causes the PVB inserted by "b.pvbIndexer.Add(volumeBackup)" overrides the PVB in the indexer while the PVB inserted by "b.pvbIndexer.Add(volumeBackup)"
@@ -537,7 +557,7 @@ func isHostPathVolume(volume *corev1api.Volume, pvc *corev1api.PersistentVolumeC
 	return pv.Spec.HostPath != nil, nil
 }
 
-func newPodVolumeBackup(backup *velerov1api.Backup, pod *corev1api.Pod, volume corev1api.Volume, repoIdentifier, uploaderType string, pvc *corev1api.PersistentVolumeClaim) *velerov1api.PodVolumeBackup {
+func newPodVolumeBackup(backup *velerov1api.Backup, pod *corev1api.Pod, volume corev1api.Volume, repoIdentifier, uploaderType string, pvc *corev1api.PersistentVolumeClaim, excludeFiles []string, kopiaIgnoreDisabled bool) *velerov1api.PodVolumeBackup {
 	pvb := &velerov1api.PodVolumeBackup{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:    backup.Namespace,
@@ -596,6 +616,19 @@ func newPodVolumeBackup(backup *velerov1api.Backup, pod *corev1api.Pod, volume c
 
 	if backup.Spec.UploaderConfig != nil {
 		pvb.Spec.UploaderSettings = uploaderutil.StoreBackupConfig(backup.Spec.UploaderConfig)
+	}
+
+	if serialized := uploaderutil.StoreExcludeFiles(excludeFiles); serialized != "" {
+		if pvb.Spec.UploaderSettings == nil {
+			pvb.Spec.UploaderSettings = make(map[string]string)
+		}
+		pvb.Spec.UploaderSettings[uploaderutil.ExcludeFiles] = serialized
+	}
+	if kopiaIgnoreDisabled {
+		if pvb.Spec.UploaderSettings == nil {
+			pvb.Spec.UploaderSettings = make(map[string]string)
+		}
+		pvb.Spec.UploaderSettings[uploaderutil.KopiaIgnoreDisabled] = "true"
 	}
 
 	return pvb

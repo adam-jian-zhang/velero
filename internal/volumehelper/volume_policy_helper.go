@@ -442,6 +442,36 @@ func (v *volumeHelperImpl) GetSnapshotClass(obj runtime.Unstructured, groupResou
 	return action.GetSnapshotClass()
 }
 
+func (v *volumeHelperImpl) GetExcludeFiles(obj runtime.Unstructured, groupResource schema.GroupResource) ([]string, error) {
+	matched, actionType, params, err := v.GetActionParameters(obj, groupResource)
+	if err != nil {
+		return nil, err
+	}
+	if !matched {
+		return nil, nil
+	}
+	action := &resourcepolicies.Action{
+		Type:       resourcepolicies.VolumeActionType(actionType),
+		Parameters: params,
+	}
+	return action.GetExcludeFiles()
+}
+
+func (v *volumeHelperImpl) GetKopiaIgnoreDisabled(obj runtime.Unstructured, groupResource schema.GroupResource) (bool, error) {
+	matched, actionType, params, err := v.GetActionParameters(obj, groupResource)
+	if err != nil {
+		return false, err
+	}
+	if !matched {
+		return false, nil
+	}
+	action := &resourcepolicies.Action{
+		Type:       resourcepolicies.VolumeActionType(actionType),
+		Parameters: params,
+	}
+	return action.GetKopiaIgnoreDisabled()
+}
+
 func (v *volumeHelperImpl) shouldIncludeVolumeInBackup(vol corev1api.Volume) bool {
 	includeVolumeInBackup := true
 	// cannot backup hostpath volumes as they are not mounted into /var/lib/kubelet/pods

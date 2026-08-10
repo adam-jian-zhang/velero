@@ -85,6 +85,10 @@ const (
 	// backup, so that `velero backup describe` can surface it.
 	GlobalBackupVolumePolicyConfigMapAnnotation = "velero.io/global-backup-volume-policy-configmap"
 
+	// EnableInVolumeKopiaIgnoreAnnotation records whether in-volume .kopiaignore discovery
+	// is enabled for this backup ("true"/"false"). CSI plugins read it when creating DataUploads.
+	EnableInVolumeKopiaIgnoreAnnotation = "velero.io/enable-in-volume-kopiaignore"
+
 	// AsyncOperationIDLabel is the label key used to identify the async operation ID
 	AsyncOperationIDLabel = "velero.io/async-operation-id"
 

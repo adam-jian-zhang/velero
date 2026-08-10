@@ -3121,3 +3121,59 @@ func TestActionGetSnapshotClass(t *testing.T) {
 		})
 	}
 }
+
+func TestGetExcludeFiles(t *testing.T) {
+	testCases := []struct {
+		name     string
+		action   *Action
+		expected []string
+		wantErr  bool
+	}{
+		{name: "nil action", action: nil},
+		{name: "absent parameter", action: &Action{Type: FSBackup, Parameters: map[string]any{}}},
+		{
+			name:     "[]any form with trim",
+			action:   &Action{Type: FSBackup, Parameters: map[string]any{ExcludeFilesParameter: []any{" /cache/* ", "*.tmp", "", "  "}}},
+			expected: []string{"/cache/*", "*.tmp"},
+		},
+		{
+			name:     "[]string form",
+			action:   &Action{Type: FSBackup, Parameters: map[string]any{ExcludeFilesParameter: []string{"node_modules/", "*.log"}}},
+			expected: []string{"node_modules/", "*.log"},
+		},
+		{
+			name:    "wrong type",
+			action:  &Action{Type: FSBackup, Parameters: map[string]any{ExcludeFilesParameter: "not-a-list"}},
+			wantErr: true,
+		},
+		{
+			name:    "[]any with non-string element",
+			action:  &Action{Type: FSBackup, Parameters: map[string]any{ExcludeFilesParameter: []any{"*.tmp", 123}}},
+			wantErr: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.action.GetExcludeFiles()
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestGetKopiaIgnoreDisabled(t *testing.T) {
+	disabled, err := (&Action{Type: FSBackup, Parameters: map[string]any{KopiaIgnoreDisabledParameter: true}}).GetKopiaIgnoreDisabled()
+	require.NoError(t, err)
+	assert.True(t, disabled)
+
+	disabled, err = (&Action{Type: FSBackup}).GetKopiaIgnoreDisabled()
+	require.NoError(t, err)
+	assert.False(t, disabled)
+
+	_, err = (&Action{Type: FSBackup, Parameters: map[string]any{KopiaIgnoreDisabledParameter: "true"}}).GetKopiaIgnoreDisabled()
+	require.Error(t, err)
+}

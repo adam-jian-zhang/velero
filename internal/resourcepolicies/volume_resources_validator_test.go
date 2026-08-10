@@ -758,6 +758,161 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidateAction_ExcludeFiles(t *testing.T) {
+	testCases := []struct {
+		name    string
+		action  Action
+		wantErr bool
+	}{
+		{
+			name: "valid patterns on fs-backup",
+			action: Action{
+				Type: FSBackup,
+				Parameters: map[string]any{
+					ExcludeFilesParameter: []any{"/cache/*", "*.tmp", "node_modules/"},
+				},
+			},
+		},
+		{
+			name: "valid on snapshot with velero-fs",
+			action: Action{
+				Type: Snapshot,
+				Parameters: map[string]any{
+					DataMoverParameter:    "velero-fs",
+					ExcludeFilesParameter: []any{"*.log"},
+				},
+			},
+		},
+		{
+			name: "valid on snapshot with no dataMover (defaults to velero-fs)",
+			action: Action{
+				Type: Snapshot,
+				Parameters: map[string]any{
+					ExcludeFilesParameter: []any{"*.log"},
+				},
+			},
+		},
+		{
+			name: "gitignore patterns accepted (trailing slash, **, !)",
+			action: Action{
+				Type: FSBackup,
+				Parameters: map[string]any{
+					ExcludeFilesParameter: []any{"node_modules/", "logs/**/*.log", "!important.tmp"},
+				},
+			},
+		},
+		{
+			name: "rejected on snapshot with velero-block",
+			action: Action{
+				Type: Snapshot,
+				Parameters: map[string]any{
+					DataMoverParameter:    "velero-block",
+					ExcludeFilesParameter: []any{"*.log"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejected on skip",
+			action: Action{
+				Type:       Skip,
+				Parameters: map[string]any{ExcludeFilesParameter: []any{"*.log"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejected on custom",
+			action: Action{
+				Type:       Custom,
+				Parameters: map[string]any{ExcludeFilesParameter: []any{"*.log"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejected non-list type",
+			action: Action{
+				Type:       FSBackup,
+				Parameters: map[string]any{ExcludeFilesParameter: 123},
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejected empty string entry",
+			action: Action{
+				Type:       FSBackup,
+				Parameters: map[string]any{ExcludeFilesParameter: []any{"", "  "}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejected malformed pattern trailing backslash",
+			action: Action{
+				Type:       FSBackup,
+				Parameters: map[string]any{ExcludeFilesParameter: []any{`bad\`}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.action.validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateAction_KopiaIgnoreDisabled(t *testing.T) {
+	testCases := []struct {
+		name    string
+		action  Action
+		wantErr bool
+	}{
+		{
+			name:   "true on fs-backup",
+			action: Action{Type: FSBackup, Parameters: map[string]any{KopiaIgnoreDisabledParameter: true}},
+		},
+		{
+			name:   "false on snapshot without dataMover",
+			action: Action{Type: Snapshot, Parameters: map[string]any{KopiaIgnoreDisabledParameter: false}},
+		},
+		{
+			name:    "string rejected",
+			action:  Action{Type: FSBackup, Parameters: map[string]any{KopiaIgnoreDisabledParameter: "true"}},
+			wantErr: true,
+		},
+		{
+			name:    "rejected on skip",
+			action:  Action{Type: Skip, Parameters: map[string]any{KopiaIgnoreDisabledParameter: true}},
+			wantErr: true,
+		},
+		{
+			name: "rejected on snapshot velero-block",
+			action: Action{Type: Snapshot, Parameters: map[string]any{
+				DataMoverParameter:           "velero-block",
+				KopiaIgnoreDisabledParameter: true,
+			}},
+			wantErr: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.action.validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateForRestore(t *testing.T) {
 	testCases := []struct {
 		name    string

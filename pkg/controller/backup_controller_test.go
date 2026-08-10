@@ -1709,6 +1709,7 @@ func TestProcessBackupCompletions(t *testing.T) {
 				backupper:                backupper,
 				formatFlag:               formatFlag,
 				globalCRClient:           fakeGlobalClient,
+				enableInVolumeKopiaIgnore: true,
 			}
 
 			pluginManager.On("GetBackupItemActionsV2").Return(nil, nil)
