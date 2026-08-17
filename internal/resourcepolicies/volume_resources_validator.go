@@ -18,6 +18,7 @@ package resourcepolicies
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	"go.yaml.in/yaml/v3"
@@ -132,5 +133,44 @@ func (a *Action) validate() error {
 		}
 	}
 
+	if raw, ok := a.Parameters[ExcludeParameter]; ok {
+		patterns, err := parseExcludePatterns(raw)
+		if err != nil {
+			return err
+		}
+		if len(patterns) == 0 {
+			return fmt.Errorf("parameter %q must not be an empty list", ExcludeParameter)
+		}
+		for _, p := range patterns {
+			if strings.TrimSpace(p) == "" {
+				return fmt.Errorf("parameter %q must not contain empty entries", ExcludeParameter)
+			}
+		}
+		if err := a.validateExcludeForAction(); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+func (a *Action) validateExcludeForAction() error {
+	switch a.Type {
+	case Skip, Custom:
+		return fmt.Errorf("parameter %q is not supported for action type %q", ExcludeParameter, a.Type)
+	case FSBackup:
+		return nil
+	case Snapshot:
+		dataMover, err := a.GetDataMover()
+		if err != nil {
+			return err
+		}
+		// GetDataMover already maps empty/"velero" to the default built-in (FS today).
+		if dataMover == datamover.DataMoverTypeVeleroBlock {
+			return fmt.Errorf("parameter %q is not supported for data mover %q", ExcludeParameter, dataMover)
+		}
+		return nil
+	default:
+		return fmt.Errorf("parameter %q is not supported for action type %q", ExcludeParameter, a.Type)
+	}
 }
