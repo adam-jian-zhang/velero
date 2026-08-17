@@ -523,6 +523,26 @@ var _ = Describe(
 	Label("ResourceFiltering", "ResourcePolicies", "FSBackup"),
 	ResourcePoliciesTest,
 )
+var _ = Describe(
+	"Velero test on exclude files from fs-backup via Volume Policy",
+	Label("ResourceFiltering", "ResourcePolicies", "FSBackup", "ExcludeFiles"),
+	ExcludeFilesFSBackupTest,
+)
+var _ = Describe(
+	"Velero test on exclude files from CSI data mover via Volume Policy",
+	Label("ResourceFiltering", "ResourcePolicies", "CSIDataMover", "ExcludeFiles"),
+	ExcludeFilesCSIDataMoverTest,
+)
+var _ = Describe(
+	"Velero test that Volume Policy exclude is rejected for velero-block",
+	Label("ResourceFiltering", "ResourcePolicies", "ExcludeFiles"),
+	ExcludeFilesBlockRejectTest,
+)
+var _ = Describe(
+	"Velero test on additive exclude across matching Volume Policy rules",
+	Label("ResourceFiltering", "ResourcePolicies", "FSBackup", "ExcludeFiles"),
+	ExcludeFilesAdditiveTest,
+)
 
 // backup VolumeInfo test
 var _ = Describe(

@@ -110,7 +110,12 @@ func NewVolumeHelperImplWithCache(
 	logger logrus.FieldLogger,
 	pvcPodCache *podvolumeutil.PVCPodCache,
 ) (vhutil.VolumeHelper, error) {
-	resourcePolicies, err := resourcepolicies.GetResourcePoliciesFromBackup(backup, client, logger)
+	globalConfigMapName := ""
+	if backup.Annotations != nil {
+		globalConfigMapName = backup.Annotations[velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation]
+	}
+	resourcePolicies, err := resourcepolicies.GetResourcePoliciesFromBackupWithGlobal(
+		backup, client, globalConfigMapName, backup.Namespace, logger)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get volume policies from backup")
 	}
@@ -509,4 +514,39 @@ func (v *volumeHelperImpl) GetDataMoverFromActionParameters(obj runtime.Unstruct
 	v.logger.Debugf("no matching volume policy found for %s: %s, no data mover parameter to return",
 		groupResource.String(), metadata.GetNamespace()+"/"+metadata.GetName())
 	return ""
+}
+
+func (v *volumeHelperImpl) GetEffectiveExclude(obj runtime.Unstructured, groupResource schema.GroupResource) ([]string, error) {
+	if v.volumePolicy == nil {
+		return nil, nil
+	}
+
+	var pvcPtr *corev1api.PersistentVolumeClaim
+	var pv *corev1api.PersistentVolume
+
+	if groupResource == kuberesource.PersistentVolumeClaims {
+		pvc := new(corev1api.PersistentVolumeClaim)
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pvc); err != nil {
+			v.logger.WithError(err).Warn("fail to convert unstructured into PVC")
+			return nil, err
+		}
+		pvcPtr = pvc
+		foundPV, err := kubeutil.GetPVForPVC(pvc, v.client)
+		if err != nil {
+			// Leave pv nil so matching falls through to PVC-only conditions,
+			// matching ShouldPerformSnapshot. A zero PV would fail storageClass
+			// rules and silently drop exclude patterns.
+			v.logger.WithError(err).Warnf("failed to get PV for PVC %s", pvc.Namespace+"/"+pvc.Name)
+		} else {
+			pv = foundPV
+		}
+	} else if groupResource == kuberesource.PersistentVolumes {
+		pv = new(corev1api.PersistentVolume)
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pv); err != nil {
+			v.logger.WithError(err).Warn("fail to convert unstructured into PV")
+			return nil, err
+		}
+	}
+
+	return v.volumePolicy.GetEffectiveExclude(resourcepolicies.NewVolumeFilterData(pv, nil, pvcPtr))
 }
