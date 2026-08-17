@@ -1680,6 +1680,162 @@ func TestGetDataMoverFromActionParameters(t *testing.T) {
 	}
 }
 
+func TestGetEffectiveExclude(t *testing.T) {
+	pv := builder.ForPersistentVolume("example-pv").StorageClass("gp2-csi").ClaimRef("ns", "pvc-1").Result()
+	policies := &resourcepolicies.ResourcePolicies{
+		Version: "v1",
+		VolumePolicies: []resourcepolicies.VolumePolicy{
+			{
+				Conditions: map[string]any{
+					"storageClass": []string{"gp2-csi"},
+				},
+				Action: resourcepolicies.Action{
+					Type: resourcepolicies.FSBackup,
+					Parameters: map[string]any{
+						resourcepolicies.ExcludeParameter: []any{"*.tmp", "node_modules/"},
+					},
+				},
+			},
+		},
+	}
+	p := &resourcepolicies.Policies{}
+	require.NoError(t, p.BuildPolicy(policies))
+
+	vh := NewVolumeHelperImpl(p, ptr.To(true), logrus.StandardLogger(), velerotest.NewFakeControllerRuntimeClient(t), false, false)
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pv)
+	require.NoError(t, err)
+
+	got, err := vh.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"*.tmp", "node_modules/"}, got)
+
+	nilVH := NewVolumeHelperImpl(nil, ptr.To(true), logrus.StandardLogger(), velerotest.NewFakeControllerRuntimeClient(t), false, false)
+	got, err = nilVH.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestGetEffectiveExcludePVCWithoutPV(t *testing.T) {
+	pvc := builder.ForPersistentVolumeClaim("ns", "pvc-1").
+		ObjectMeta(builder.WithLabels("env", "prod")).
+		StorageClass("gp2-csi").
+		Result()
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
+	require.NoError(t, err)
+	unstructuredPVC := &unstructured.Unstructured{Object: obj}
+
+	t.Run("pvcLabels match applies exclude when PV lookup fails", func(t *testing.T) {
+		policies := &resourcepolicies.ResourcePolicies{
+			Version: "v1",
+			VolumePolicies: []resourcepolicies.VolumePolicy{
+				{
+					Conditions: map[string]any{
+						"pvcLabels": map[string]string{"env": "prod"},
+					},
+					Action: resourcepolicies.Action{
+						Type: resourcepolicies.FSBackup,
+						Parameters: map[string]any{
+							resourcepolicies.ExcludeParameter: []any{"*.tmp"},
+						},
+					},
+				},
+			},
+		}
+		p := &resourcepolicies.Policies{}
+		require.NoError(t, p.BuildPolicy(policies))
+
+		vh := NewVolumeHelperImpl(p, ptr.To(true), logrus.StandardLogger(), velerotest.NewFakeControllerRuntimeClient(t), false, false)
+		got, err := vh.GetEffectiveExclude(unstructuredPVC, kuberesource.PersistentVolumeClaims)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"*.tmp"}, got)
+	})
+
+	t.Run("storageClass rule does not match a zero PV", func(t *testing.T) {
+		policies := &resourcepolicies.ResourcePolicies{
+			Version: "v1",
+			VolumePolicies: []resourcepolicies.VolumePolicy{
+				{
+					Conditions: map[string]any{
+						"storageClass": []string{"gp2-csi"},
+					},
+					Action: resourcepolicies.Action{
+						Type: resourcepolicies.FSBackup,
+						Parameters: map[string]any{
+							resourcepolicies.ExcludeParameter: []any{"*.tmp"},
+						},
+					},
+				},
+			},
+		}
+		p := &resourcepolicies.Policies{}
+		require.NoError(t, p.BuildPolicy(policies))
+
+		vh := NewVolumeHelperImpl(p, ptr.To(true), logrus.StandardLogger(), velerotest.NewFakeControllerRuntimeClient(t), false, false)
+		got, err := vh.GetEffectiveExclude(unstructuredPVC, kuberesource.PersistentVolumeClaims)
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+}
+
+func TestNewVolumeHelperImplWithCacheLoadsGlobalPolicies(t *testing.T) {
+	globalCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "global-volume-policy", Namespace: "velero"},
+		Data: map[string]string{
+			"policies.yaml": `version: v1
+volumePolicies:
+- conditions:
+    storageClass:
+    - gp2-csi
+  action:
+    type: fs-backup
+    parameters:
+      exclude:
+      - "*.tmp"
+`,
+		},
+	}
+	backupCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "backup-policy", Namespace: "velero"},
+		Data: map[string]string{
+			"policies.yaml": `version: v1
+volumePolicies:
+- conditions:
+    storageClass:
+    - gp2-csi
+  action:
+    type: fs-backup
+    parameters:
+      exclude:
+      - "node_modules/"
+`,
+		},
+	}
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, globalCM, backupCM)
+	backup := velerov1api.Backup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-backup",
+			Namespace: "velero",
+			Annotations: map[string]string{
+				velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation: "global-volume-policy",
+			},
+		},
+		Spec: velerov1api.BackupSpec{
+			ResourcePolicy: &corev1api.TypedLocalObjectReference{Kind: "configmap", Name: "backup-policy"},
+		},
+	}
+
+	vh, err := NewVolumeHelperImplWithCache(backup, fakeClient, logrus.StandardLogger(), nil)
+	require.NoError(t, err)
+
+	pv := builder.ForPersistentVolume("example-pv").StorageClass("gp2-csi").ClaimRef("ns", "pvc-1").Result()
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pv)
+	require.NoError(t, err)
+
+	got, err := vh.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"*.tmp", "node_modules/"}, got)
+}
+
 func TestGetActionParameters(t *testing.T) {
 	testCases := []struct {
 		name             string

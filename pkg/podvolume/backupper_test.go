@@ -1109,3 +1109,23 @@ func TestGetMatchAction_PVCWithoutPVLookupError(t *testing.T) {
 	require.NotNil(t, action)
 	assert.Equal(t, resourcepolicies.Skip, action.Type)
 }
+
+func TestNewPodVolumeBackupExclude(t *testing.T) {
+	backup := builder.ForBackup("velero", "backup-1").Result()
+	pod := builder.ForPod("ns", "pod-1").Result()
+	volume := corev1api.Volume{Name: "data"}
+
+	t.Run("sets Exclude JSON when patterns are present", func(t *testing.T) {
+		pvb, err := newPodVolumeBackup(backup, pod, volume, "", "kopia", nil, []string{"*.tmp", "node_modules/"})
+		require.NoError(t, err)
+		require.Contains(t, pvb.Spec.UploaderSettings, "Exclude")
+		assert.Equal(t, `["*.tmp","node_modules/"]`, pvb.Spec.UploaderSettings["Exclude"])
+	})
+
+	t.Run("omits Exclude key when patterns are empty", func(t *testing.T) {
+		pvb, err := newPodVolumeBackup(backup, pod, volume, "", "kopia", nil, nil)
+		require.NoError(t, err)
+		_, ok := pvb.Spec.UploaderSettings["Exclude"]
+		assert.False(t, ok)
+	})
+}

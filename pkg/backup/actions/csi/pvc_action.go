@@ -42,6 +42,7 @@ import (
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	veleroshared "github.com/vmware-tanzu/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
@@ -83,6 +84,10 @@ type pvcBackupItemAction struct {
 	// This avoids the O(N*M) performance issue when there are many PVCs and pods.
 	// See issue #9179 and PR #9226 for details.
 	pvcPodCache *podvolumeutil.PVCPodCache
+
+	// volumeHelper, when set, is returned by getOrCreateVolumeHelper instead of
+	// constructing one from the backup. Nil in production.
+	volumeHelper vhutil.VolumeHelper
 }
 
 // AppliesTo returns information indicating that the PVCBackupItemAction
@@ -151,6 +156,10 @@ func (p *pvcBackupItemAction) getVolumeHelperWithCache(backup *velerov1api.Backu
 // cleaned up via CleanupClients at backup completion), we can safely cache this.
 // See issue #9179 and PR #9226 for details.
 func (p *pvcBackupItemAction) getOrCreateVolumeHelper(backup *velerov1api.Backup) (vhutil.VolumeHelper, error) {
+	if p.volumeHelper != nil {
+		return p.volumeHelper, nil
+	}
+
 	// Initialize the PVC-to-Pod cache if needed
 	if p.pvcPodCache == nil {
 		p.pvcPodCache = podvolumeutil.NewPVCPodCache()
@@ -413,6 +422,31 @@ func (p *pvcBackupItemAction) Execute(
 
 		dataMoverFromVolumePolicy := vh.GetDataMoverFromActionParameters(item, kuberesource.PersistentVolumeClaims)
 
+		exclude, excludeErr := vh.GetEffectiveExclude(item, kuberesource.PersistentVolumeClaims)
+		if excludeErr != nil {
+			dataUploadLog.WithError(excludeErr).Error("failed to get exclude patterns from volume policies")
+			if deleteErr := p.crClient.Delete(ctx, vs); deleteErr != nil {
+				if !apierrors.IsNotFound(deleteErr) {
+					dataUploadLog.WithError(deleteErr).Error("fail to delete VolumeSnapshot")
+				}
+			}
+			return item, nil, "", nil, nil
+		}
+
+		effectiveMover := backup.Spec.DataMover
+		if dataMoverFromVolumePolicy != "" {
+			effectiveMover = dataMoverFromVolumePolicy
+		}
+		if err := resourcepolicies.ValidateExcludeForDataMover(exclude, effectiveMover); err != nil {
+			dataUploadLog.WithError(err).Error("exclude is not supported by the effective data mover")
+			if deleteErr := p.crClient.Delete(ctx, vs); deleteErr != nil {
+				if !apierrors.IsNotFound(deleteErr) {
+					dataUploadLog.WithError(deleteErr).Error("fail to delete VolumeSnapshot")
+				}
+			}
+			return item, nil, "", nil, nil
+		}
+
 		dataUploadLog.Info("Starting data upload of backup")
 
 		dataUpload, err := createDataUpload(
@@ -425,6 +459,7 @@ func (p *pvcBackupItemAction) Execute(
 			vsc,
 			fsType,
 			dataMoverFromVolumePolicy,
+			exclude,
 		)
 		if err != nil {
 			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
@@ -565,7 +600,8 @@ func newDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
-) *velerov2alpha1.DataUpload {
+	exclude []string,
+) (*velerov2alpha1.DataUpload, error) {
 	parentSnapshot := ""
 
 	if backup.Spec.BackupType == velerov1api.BackupTypeFull {
@@ -628,7 +664,13 @@ func newDataUpload(
 		dataUpload.Spec.DataMoverConfig[uploaderUtil.ParallelFilesUpload] = strconv.Itoa(backup.Spec.UploaderConfig.ParallelFilesUpload)
 	}
 
-	return dataUpload
+	var err error
+	dataUpload.Spec.DataMoverConfig, err = uploaderUtil.MergeExclude(dataUpload.Spec.DataMoverConfig, exclude)
+	if err != nil {
+		return nil, err
+	}
+
+	return dataUpload, nil
 }
 
 func createDataUpload(
@@ -641,10 +683,14 @@ func createDataUpload(
 	vsc *snapshotv1api.VolumeSnapshotContent,
 	fsType string,
 	dataMoverFromVolumePolicy string,
+	exclude []string,
 ) (*velerov2alpha1.DataUpload, error) {
-	dataUpload := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy)
+	dataUpload, err := newDataUpload(backup, vs, pvc, operationID, vsc, fsType, dataMoverFromVolumePolicy, exclude)
+	if err != nil {
+		return nil, errors.Wrap(err, "fail to encode exclude patterns for DataUpload")
+	}
 
-	err := crClient.Create(ctx, dataUpload)
+	err = crClient.Create(ctx, dataUpload)
 	if err != nil {
 		return nil, errors.Wrap(err, "fail to create DataUpload CR")
 	}

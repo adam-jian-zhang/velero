@@ -3121,3 +3121,226 @@ func TestActionGetSnapshotClass(t *testing.T) {
 		})
 	}
 }
+
+func TestActionGetExclude(t *testing.T) {
+	testCases := []struct {
+		name             string
+		action           *Action
+		expectedPatterns []string
+		expectErr        bool
+	}{
+		{
+			name:   "nil action",
+			action: nil,
+		},
+		{
+			name:   "action without parameters",
+			action: &Action{Type: FSBackup},
+		},
+		{
+			name:   "action without exclude parameter",
+			action: &Action{Type: FSBackup, Parameters: map[string]any{"other": "value"}},
+		},
+		{
+			name:             "[]any patterns are trimmed and empty-after-trim dropped",
+			action:           &Action{Type: FSBackup, Parameters: map[string]any{"exclude": []any{" /cache/* ", "*.tmp", "  "}}},
+			expectedPatterns: []string{"/cache/*", "*.tmp"},
+		},
+		{
+			name:             "[]string patterns round-trip",
+			action:           &Action{Type: Snapshot, Parameters: map[string]any{"exclude": []string{"node_modules/", "*.log"}}},
+			expectedPatterns: []string{"node_modules/", "*.log"},
+		},
+		{
+			name:      "string exclude is an error",
+			action:    &Action{Type: FSBackup, Parameters: map[string]any{"exclude": "*.tmp"}},
+			expectErr: true,
+		},
+		{
+			name:      "number exclude is an error",
+			action:    &Action{Type: FSBackup, Parameters: map[string]any{"exclude": 1}},
+			expectErr: true,
+		},
+		{
+			name:      "mixed list is an error",
+			action:    &Action{Type: FSBackup, Parameters: map[string]any{"exclude": []any{"*.tmp", 1}}},
+			expectErr: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			patterns, err := tc.action.GetExclude()
+			if tc.expectErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedPatterns, patterns)
+		})
+	}
+}
+
+func TestGetEffectiveExclude(t *testing.T) {
+	pv := &corev1api.PersistentVolume{Spec: corev1api.PersistentVolumeSpec{StorageClassName: "gp2"}}
+	vfd := VolumeFilterData{PersistentVolume: pv}
+
+	build := func(t *testing.T, backupYAML, globalYAML string) *Policies {
+		t.Helper()
+		client := velerotest.NewFakeControllerRuntimeClient(t)
+		var backupRef string
+		if backupYAML != "" {
+			backupRef = "backup01"
+			require.NoError(t, client.Create(t.Context(), globalPolicyConfigMap("backup01", backupYAML)))
+		}
+		globalName := ""
+		if globalYAML != "" {
+			globalName = "global"
+			require.NoError(t, client.Create(t.Context(), globalPolicyConfigMap("global", globalYAML)))
+		}
+		p, err := GetResourcePoliciesFromBackupWithGlobal(backupWithPolicy(backupRef), client, globalName, "velero", logrus.New())
+		require.NoError(t, err)
+		require.NotNil(t, p)
+		return p
+	}
+
+	t.Run("first-match-wins still applies to action type", func(t *testing.T) {
+		p := build(t, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["node_modules/"]
+`, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: skip
+`)
+		action, err := p.GetMatchAction(vfd)
+		require.NoError(t, err)
+		require.NotNil(t, action)
+		assert.Equal(t, FSBackup, action.Type)
+	})
+
+	t.Run("concatenates global then backup-level exclude", func(t *testing.T) {
+		p := build(t, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["node_modules/"]
+`, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["*.tmp"]
+`)
+		got, err := p.GetEffectiveExclude(vfd)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"*.tmp", "node_modules/"}, got)
+	})
+
+	t.Run("backup-level negation overlays global exclude", func(t *testing.T) {
+		p := build(t, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["*.log", "!keep.tmp"]
+`, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["*.tmp"]
+`)
+		got, err := p.GetEffectiveExclude(vfd)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"*.tmp", "*.log", "!keep.tmp"}, got)
+	})
+
+	t.Run("skip winning action drops inherited exclude", func(t *testing.T) {
+		p := build(t, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: skip
+`, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["*.tmp"]
+`)
+		got, err := p.GetEffectiveExclude(vfd)
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+
+	t.Run("velero-block winning action drops inherited exclude", func(t *testing.T) {
+		p := build(t, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: snapshot
+    parameters:
+      dataMover: velero-block
+`, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["*.tmp"]
+`)
+		got, err := p.GetEffectiveExclude(vfd)
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+
+	t.Run("no matching rule returns nil", func(t *testing.T) {
+		p := build(t, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["other"]
+  action:
+    type: fs-backup
+    parameters:
+      exclude: ["*.tmp"]
+`, "")
+		got, err := p.GetEffectiveExclude(vfd)
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+
+	t.Run("nil policies returns nil", func(t *testing.T) {
+		var p *Policies
+		got, err := p.GetEffectiveExclude(vfd)
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+}
+
+func TestValidateExcludeForDataMover(t *testing.T) {
+	require.NoError(t, ValidateExcludeForDataMover(nil, datamover.DataMoverTypeVeleroBlock))
+	require.NoError(t, ValidateExcludeForDataMover([]string{"*.tmp"}, datamover.DataMoverTypeVeleroFs))
+	require.Error(t, ValidateExcludeForDataMover([]string{"*.tmp"}, datamover.DataMoverTypeVeleroBlock))
+}

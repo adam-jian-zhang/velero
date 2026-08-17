@@ -18,6 +18,8 @@ package kopia
 
 import (
 	"context"
+	"io"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -834,4 +836,73 @@ func TestRestore(t *testing.T) {
 			assert.Equal(t, tc.expectedCount, fileCount)
 		})
 	}
+}
+
+func TestSetupPolicy(t *testing.T) {
+	origSet := setPolicyFunc
+	origTree := treeForSourceFunc
+	t.Cleanup(func() {
+		setPolicyFunc = origSet
+		treeForSourceFunc = origTree
+	})
+
+	var captured *policy.Policy
+	setPolicyFunc = func(ctx context.Context, rep repo.RepositoryWriter, si snapshot.SourceInfo, p *policy.Policy) error {
+		captured = p
+		return nil
+	}
+	treeForSourceFunc = func(ctx context.Context, rep repo.Repository, si snapshot.SourceInfo) (*policy.Tree, error) {
+		return nil, nil
+	}
+
+	repoWriter := &repomocks.RepositoryWriter{}
+	repoWriter.On("Flush", mock.Anything).Return(nil)
+	sourceInfo := snapshot.SourceInfo{UserName: "u", Host: "h", Path: "/var"}
+
+	windowsBaseline := []string{"/System Volume Information/", "/$Recycle.Bin/"}
+
+	t.Run("exclude JSON appears in ignore rules", func(t *testing.T) {
+		captured = nil
+		var buf strings.Builder
+		log := logrus.New()
+		log.SetOutput(&buf)
+		_, err := setupPolicy(t.Context(), repoWriter, sourceInfo, map[string]string{
+			"Exclude": `["*.tmp","/cache/*"]`,
+		}, log)
+		require.NoError(t, err)
+		require.NotNil(t, captured)
+		assert.Contains(t, captured.FilesPolicy.IgnoreRules, "*.tmp")
+		assert.Contains(t, captured.FilesPolicy.IgnoreRules, "/cache/*")
+		if runtime.GOOS == "windows" {
+			for _, p := range windowsBaseline {
+				assert.Contains(t, captured.FilesPolicy.IgnoreRules, p)
+			}
+		}
+		assert.Contains(t, buf.String(), "resolved filesystem exclude patterns")
+		assert.Contains(t, buf.String(), "*.tmp")
+	})
+
+	t.Run("malformed JSON returns error", func(t *testing.T) {
+		log := logrus.New()
+		log.SetOutput(io.Discard)
+		_, err := setupPolicy(t.Context(), repoWriter, sourceInfo, map[string]string{
+			"Exclude": "not-json",
+		}, log)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to read Exclude uploader config")
+	})
+
+	t.Run("no Exclude key leaves ignore rules as baseline only", func(t *testing.T) {
+		captured = nil
+		log := logrus.New()
+		log.SetOutput(io.Discard)
+		_, err := setupPolicy(t.Context(), repoWriter, sourceInfo, map[string]string{}, log)
+		require.NoError(t, err)
+		require.NotNil(t, captured)
+		if runtime.GOOS == "windows" {
+			assert.Equal(t, windowsBaseline, captured.FilesPolicy.IgnoreRules)
+		} else {
+			assert.Empty(t, captured.FilesPolicy.IgnoreRules)
+		}
+	})
 }
