@@ -18,6 +18,7 @@ package resourcepolicies
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -42,13 +43,14 @@ const (
 
 type ExcludeFilesCase struct {
 	TestCase
-	cmName           string
-	yamlConfig       string
-	snapshotMoveData bool
-	expectBackupFail bool
-	presentFiles     []string
-	absentFiles      []string
-	filesToWrite     []string
+	cmName             string
+	yamlConfig         string
+	snapshotMoveData   bool
+	snapshotNoMoveData bool
+	expectBackupFail   bool
+	presentFiles       []string
+	absentFiles        []string
+	filesToWrite       []string
 }
 
 var ExcludeFilesFSBackupTest = TestFunc(&ExcludeFilesCase{
@@ -131,6 +133,29 @@ volumePolicies:
 	absentFiles:  []string{excludeOtherTmp, excludeLogFile},
 })
 
+// ExcludeFilesSnapshotNoDataMoveTest covers design.md §6.2 Phase 2: a snapshot
+// action carrying exclude on a backup without --snapshot-move-data cannot apply
+// the exclusion (no uploader runs). The backup must succeed as a plain CSI
+// snapshot, warn that the patterns were not applied, and restore everything.
+var ExcludeFilesSnapshotNoDataMoveTest = TestFunc(&ExcludeFilesCase{
+	snapshotNoMoveData: true,
+	yamlConfig: `version: v1
+volumePolicies:
+- conditions:
+    storageClass:
+    - e2e-storage-class
+  action:
+    type: snapshot
+    parameters:
+      dataMover: velero-fs
+      exclude:
+      - "/cache/*"
+      - "*.log"
+`,
+	filesToWrite: []string{excludeImportantDB, excludeCacheFile, excludeLogFile},
+	presentFiles: []string{excludeImportantDB, excludeCacheFile, excludeLogFile},
+})
+
 func (e *ExcludeFilesCase) Init() error {
 	e.TestCase.Init()
 
@@ -144,6 +169,9 @@ func (e *ExcludeFilesCase) Init() error {
 	if len(e.presentFiles) > 1 {
 		kind = "additive"
 	}
+	if e.snapshotNoMoveData {
+		kind = "snapshot-no-move"
+	}
 
 	e.CaseBaseName = "exclude-files-" + kind + "-" + e.UUIDgen
 	e.BackupName = "backup-" + e.CaseBaseName
@@ -153,7 +181,7 @@ func (e *ExcludeFilesCase) Init() error {
 	e.NSIncluded = &[]string{e.CaseBaseName}
 
 	e.VeleroCfg.UseNodeAgent = true
-	e.VeleroCfg.UseVolumeSnapshots = e.snapshotMoveData
+	e.VeleroCfg.UseVolumeSnapshots = e.snapshotMoveData || e.snapshotNoMoveData
 
 	e.BackupArgs = []string{
 		"create", "--namespace", e.VeleroCfg.VeleroNamespace, "backup", e.BackupName,
@@ -161,13 +189,21 @@ func (e *ExcludeFilesCase) Init() error {
 		"--include-namespaces", e.CaseBaseName,
 		"--wait",
 	}
-	if e.snapshotMoveData {
+	switch {
+	case e.snapshotMoveData:
 		e.BackupArgs = append(e.BackupArgs,
 			"--snapshot-volumes=true",
 			"--default-volumes-to-fs-backup=false",
 			"--snapshot-move-data=true",
 		)
-	} else {
+	case e.snapshotNoMoveData:
+		// CSI snapshot without data movement: exclude cannot apply, the backup
+		// must warn instead of silently capturing the full volume.
+		e.BackupArgs = append(e.BackupArgs,
+			"--snapshot-volumes=true",
+			"--default-volumes-to-fs-backup=false",
+		)
+	default:
 		e.BackupArgs = append(e.BackupArgs,
 			"--default-volumes-to-fs-backup",
 			"--snapshot-volumes=false",
@@ -283,6 +319,19 @@ func (e *ExcludeFilesCase) Verify() error {
 			}
 		}
 	})
+
+	if e.snapshotNoMoveData {
+		By("Verify the backup warns that exclude patterns were not applied", func() {
+			warnings, err := backupWarnings(e.Ctx, e.VeleroCfg.VeleroCLI, e.VeleroCfg.VeleroNamespace, e.BackupName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(warnings).To(BeNumerically(">", 0), "expected backup warnings for unapplied exclude patterns")
+
+			logs, err := backupLogsOutput(e.Ctx, e.VeleroCfg.VeleroCLI, e.VeleroCfg.VeleroNamespace, e.BackupName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(logs).To(ContainSubstring("does not have SnapshotMoveData enabled"),
+				"expected the backup log to explain why exclude patterns were not applied")
+		})
+	}
 	return nil
 }
 
@@ -338,4 +387,29 @@ func mkdirInPod(namespace, podName, containerName, volume, dir, workerOS string)
 	}
 	arg := []string{"exec", "-n", namespace, "-c", containerName, podName, "--", shell, param, cmd}
 	return exec.CommandContext(context.Background(), "kubectl", arg...).Run()
+}
+
+// backupWarnings returns the warning count recorded on the Backup CR status.
+func backupWarnings(ctx context.Context, veleroCLI, veleroNamespace, backupName string) (int, error) {
+	args := []string{"--namespace", veleroNamespace, "backup", "get", backupName, "-o", "json"}
+	out, err := exec.CommandContext(ctx, veleroCLI, args...).Output()
+	if err != nil {
+		return 0, err
+	}
+	var b struct {
+		Status struct {
+			Warnings int `json:"warnings"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(out, &b); err != nil {
+		return 0, err
+	}
+	return b.Status.Warnings, nil
+}
+
+// backupLogsOutput returns the server-side backup log (velero backup logs).
+func backupLogsOutput(ctx context.Context, veleroCLI, veleroNamespace, backupName string) (string, error) {
+	args := []string{"--namespace", veleroNamespace, "backup", "logs", backupName}
+	out, err := exec.CommandContext(ctx, veleroCLI, args...).Output()
+	return string(out), err
 }

@@ -330,7 +330,10 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 			}
 		}
 
-		var exclude []string
+		var (
+			exclude        []string
+			excludeDropped bool
+		)
 		if resPolicies != nil {
 			vfd, err := b.volumeFilterData(pvc, &volume)
 			if err != nil {
@@ -345,10 +348,19 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 				pvcSummary.addSkipped(volumeName, "matched action is 'skip' in chosen resource policies")
 				continue
 			}
-			exclude, err = resPolicies.GetEffectiveExclude(vfd)
+			exclude, excludeDropped, err = resPolicies.GetEffectiveExclude(vfd)
 			if err != nil {
 				errs = append(errs, errors.Wrapf(err, "error getting exclude patterns for volume %s", volumeName))
 				continue
+			}
+			if excludeDropped {
+				// design.md §5.2: the winning action (skip/custom/velero-block)
+				// cannot honor exclusions; inherited patterns are dropped.
+				log.Warnf("Volume policy exclude patterns are ignored for volume %s of pod %s/%s: the winning action cannot honor exclusions", volumeName, pod.Namespace, pod.Name)
+			} else if len(exclude) > 0 {
+				// design.md §9.1: log at the wiring point (server process) so the
+				// resolved list lands in the backup logs.
+				log.WithField("exclude", exclude).Infof("Resolved volume policy exclude patterns for volume %s of pod %s/%s (uploader: %s)", volumeName, pod.Namespace, pod.Name, b.uploaderType)
 			}
 		}
 

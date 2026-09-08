@@ -1705,13 +1705,15 @@ func TestGetEffectiveExclude(t *testing.T) {
 	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pv)
 	require.NoError(t, err)
 
-	got, err := vh.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
+	got, dropped, err := vh.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
 	require.NoError(t, err)
+	assert.False(t, dropped)
 	assert.Equal(t, []string{"*.tmp", "node_modules/"}, got)
 
 	nilVH := NewVolumeHelperImpl(nil, ptr.To(true), logrus.StandardLogger(), velerotest.NewFakeControllerRuntimeClient(t), false, false)
-	got, err = nilVH.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
+	got, dropped, err = nilVH.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
 	require.NoError(t, err)
+	assert.False(t, dropped)
 	assert.Nil(t, got)
 }
 
@@ -1745,8 +1747,9 @@ func TestGetEffectiveExcludePVCWithoutPV(t *testing.T) {
 		require.NoError(t, p.BuildPolicy(policies))
 
 		vh := NewVolumeHelperImpl(p, ptr.To(true), logrus.StandardLogger(), velerotest.NewFakeControllerRuntimeClient(t), false, false)
-		got, err := vh.GetEffectiveExclude(unstructuredPVC, kuberesource.PersistentVolumeClaims)
+		got, dropped, err := vh.GetEffectiveExclude(unstructuredPVC, kuberesource.PersistentVolumeClaims)
 		require.NoError(t, err)
+		assert.False(t, dropped)
 		assert.Equal(t, []string{"*.tmp"}, got)
 	})
 
@@ -1771,8 +1774,9 @@ func TestGetEffectiveExcludePVCWithoutPV(t *testing.T) {
 		require.NoError(t, p.BuildPolicy(policies))
 
 		vh := NewVolumeHelperImpl(p, ptr.To(true), logrus.StandardLogger(), velerotest.NewFakeControllerRuntimeClient(t), false, false)
-		got, err := vh.GetEffectiveExclude(unstructuredPVC, kuberesource.PersistentVolumeClaims)
+		got, dropped, err := vh.GetEffectiveExclude(unstructuredPVC, kuberesource.PersistentVolumeClaims)
 		require.NoError(t, err)
+		assert.False(t, dropped)
 		assert.Nil(t, got)
 	})
 }
@@ -1831,8 +1835,9 @@ volumePolicies:
 	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pv)
 	require.NoError(t, err)
 
-	got, err := vh.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
+	got, dropped, err := vh.GetEffectiveExclude(&unstructured.Unstructured{Object: obj}, kuberesource.PersistentVolumes)
 	require.NoError(t, err)
+	assert.False(t, dropped)
 	assert.Equal(t, []string{"*.tmp", "node_modules/"}, got)
 }
 

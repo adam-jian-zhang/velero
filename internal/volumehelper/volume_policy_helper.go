@@ -516,9 +516,9 @@ func (v *volumeHelperImpl) GetDataMoverFromActionParameters(obj runtime.Unstruct
 	return ""
 }
 
-func (v *volumeHelperImpl) GetEffectiveExclude(obj runtime.Unstructured, groupResource schema.GroupResource) ([]string, error) {
+func (v *volumeHelperImpl) GetEffectiveExclude(obj runtime.Unstructured, groupResource schema.GroupResource) ([]string, bool, error) {
 	if v.volumePolicy == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	var pvcPtr *corev1api.PersistentVolumeClaim
@@ -528,7 +528,7 @@ func (v *volumeHelperImpl) GetEffectiveExclude(obj runtime.Unstructured, groupRe
 		pvc := new(corev1api.PersistentVolumeClaim)
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pvc); err != nil {
 			v.logger.WithError(err).Warn("fail to convert unstructured into PVC")
-			return nil, err
+			return nil, false, err
 		}
 		pvcPtr = pvc
 		foundPV, err := kubeutil.GetPVForPVC(pvc, v.client)
@@ -544,7 +544,7 @@ func (v *volumeHelperImpl) GetEffectiveExclude(obj runtime.Unstructured, groupRe
 		pv = new(corev1api.PersistentVolume)
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pv); err != nil {
 			v.logger.WithError(err).Warn("fail to convert unstructured into PV")
-			return nil, err
+			return nil, false, err
 		}
 	}
 

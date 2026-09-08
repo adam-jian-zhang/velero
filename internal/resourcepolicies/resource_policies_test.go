@@ -3244,8 +3244,9 @@ volumePolicies:
     parameters:
       exclude: ["*.tmp"]
 `)
-		got, err := p.GetEffectiveExclude(vfd)
+		got, dropped, err := p.GetEffectiveExclude(vfd)
 		require.NoError(t, err)
+		assert.False(t, dropped)
 		assert.Equal(t, []string{"*.tmp", "node_modules/"}, got)
 	})
 
@@ -3267,8 +3268,9 @@ volumePolicies:
     parameters:
       exclude: ["*.tmp"]
 `)
-		got, err := p.GetEffectiveExclude(vfd)
+		got, dropped, err := p.GetEffectiveExclude(vfd)
 		require.NoError(t, err)
+		assert.False(t, dropped)
 		assert.Equal(t, []string{"*.tmp", "*.log", "!keep.tmp"}, got)
 	})
 
@@ -3288,8 +3290,9 @@ volumePolicies:
     parameters:
       exclude: ["*.tmp"]
 `)
-		got, err := p.GetEffectiveExclude(vfd)
+		got, dropped, err := p.GetEffectiveExclude(vfd)
 		require.NoError(t, err)
+		assert.True(t, dropped)
 		assert.Nil(t, got)
 	})
 
@@ -3311,8 +3314,9 @@ volumePolicies:
     parameters:
       exclude: ["*.tmp"]
 `)
-		got, err := p.GetEffectiveExclude(vfd)
+		got, dropped, err := p.GetEffectiveExclude(vfd)
 		require.NoError(t, err)
+		assert.True(t, dropped)
 		assert.Nil(t, got)
 	})
 
@@ -3326,15 +3330,31 @@ volumePolicies:
     parameters:
       exclude: ["*.tmp"]
 `, "")
-		got, err := p.GetEffectiveExclude(vfd)
+		got, dropped, err := p.GetEffectiveExclude(vfd)
 		require.NoError(t, err)
+		assert.False(t, dropped)
 		assert.Nil(t, got)
 	})
 
 	t.Run("nil policies returns nil", func(t *testing.T) {
 		var p *Policies
-		got, err := p.GetEffectiveExclude(vfd)
+		got, dropped, err := p.GetEffectiveExclude(vfd)
 		require.NoError(t, err)
+		assert.False(t, dropped)
+		assert.Nil(t, got)
+	})
+
+	t.Run("skip winning action without any exclude does not report dropped", func(t *testing.T) {
+		p := build(t, `version: v1
+volumePolicies:
+- conditions:
+    storageClass: ["gp2"]
+  action:
+    type: skip
+`, "")
+		got, dropped, err := p.GetEffectiveExclude(vfd)
+		require.NoError(t, err)
+		assert.False(t, dropped)
 		assert.Nil(t, got)
 	})
 }

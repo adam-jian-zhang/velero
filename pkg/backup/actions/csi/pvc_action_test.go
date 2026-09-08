@@ -29,6 +29,7 @@ import (
 	volumegroupsnapshotv1beta2 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumegroupsnapshot/v1beta2"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1api "k8s.io/api/apps/v1"
@@ -82,9 +83,10 @@ func (c *errorInjectingClient) Create(ctx context.Context, obj crclient.Object, 
 // stubVolumeHelper is a test double for vhutil.VolumeHelper used to reach
 // Execute branches that validated volume policies cannot (Phase-2 exclude guard).
 type stubVolumeHelper struct {
-	snapshot  bool
-	dataMover string
-	exclude   []string
+	snapshot       bool
+	dataMover      string
+	exclude        []string
+	excludeDropped bool
 }
 
 func (s *stubVolumeHelper) ShouldPerformSnapshot(runtime.Unstructured, schema.GroupResource) (bool, error) {
@@ -105,8 +107,8 @@ func (s *stubVolumeHelper) GetSnapshotClass(runtime.Unstructured, schema.GroupRe
 func (s *stubVolumeHelper) GetDataMoverFromActionParameters(runtime.Unstructured, schema.GroupResource) string {
 	return s.dataMover
 }
-func (s *stubVolumeHelper) GetEffectiveExclude(runtime.Unstructured, schema.GroupResource) ([]string, error) {
-	return s.exclude, nil
+func (s *stubVolumeHelper) GetEffectiveExclude(runtime.Unstructured, schema.GroupResource) ([]string, bool, error) {
+	return s.exclude, s.excludeDropped, nil
 }
 
 func TestExecute(t *testing.T) {
@@ -133,6 +135,7 @@ func TestExecute(t *testing.T) {
 		volumeHelper        vhutil.VolumeHelper
 		expectNoDataUpload  bool
 		expectNoVS          bool
+		expectLogContains   string
 	}{
 		{
 			name:   "Skip PVC BIA when backup is in finalizing phase",
@@ -360,12 +363,49 @@ func TestExecute(t *testing.T) {
 			expectNoDataUpload: true,
 			expectNoVS:         true,
 		},
+		{
+			name:    "warns when inherited exclude is dropped for a velero-block winning action",
+			backup:  builder.ForBackup("velero", "test").SnapshotMoveData(true).DataMover("velero-block").CSISnapshotTimeout(1 * time.Minute).Result(),
+			pvc:     builder.ForPersistentVolumeClaim("velero", "testPVC").VolumeName("testPV").StorageClass("testSC").Phase(corev1api.ClaimBound).Result(),
+			pv:      builder.ForPersistentVolume("testPV").CSI("hostpath", "testVolume").Result(),
+			sc:      builder.ForStorageClass("testSC").Provisioner("hostpath").Result(),
+			vsClass: builder.ForVolumeSnapshotClass("testVSClass").Driver("hostpath").ObjectMeta(builder.WithLabels(velerov1api.VolumeSnapshotClassSelectorLabel, "")).Result(),
+			volumeHelper: &stubVolumeHelper{
+				snapshot:       true,
+				dataMover:      "velero-block",
+				excludeDropped: true,
+			},
+			extraObjects: []runtime.Object{
+				&corev1api.Node{
+					ObjectMeta: metav1.ObjectMeta{Name: "linux-node", Labels: map[string]string{corev1api.LabelOSStable: "linux"}},
+				},
+				&appsv1api.DaemonSet{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "node-agent"},
+					Status:     appsv1api.DaemonSetStatus{NumberReady: 3},
+				},
+			},
+			expectLogContains: "cannot honor exclusions",
+		},
+		{
+			name:           "warns when exclude is set but SnapshotMoveData is false",
+			backup:         builder.ForBackup("velero", "test").ResourcePolicies("resourcePolicy").CSISnapshotTimeout(1 * time.Minute).Result(),
+			resourcePolicy: builder.ForConfigMap("velero", "resourcePolicy").Data("policy", `{"version":"v1","volumePolicies":[{"conditions":{"csi":{}},"action":{"type":"snapshot","parameters":{"dataMover":"velero-fs","exclude":["*.tmp"]}}}]}`).Result(),
+			pvc:            builder.ForPersistentVolumeClaim("velero", "testPVC").VolumeName("testPV").StorageClass("testSC").Phase(corev1api.ClaimBound).Result(),
+			pv:             builder.ForPersistentVolume("testPV").CSI("hostpath", "testVolume").Result(),
+			sc:             builder.ForStorageClass("testSC").Provisioner("hostpath").Result(),
+			vsClass:        builder.ForVolumeSnapshotClass("testVSClass").Driver("hostpath").ObjectMeta(builder.WithLabels(velerov1api.VolumeSnapshotClassSelectorLabel, "")).Result(),
+			// No SnapshotMoveData: no DataUpload is created, and the backup logs
+			// that the exclude patterns were not applied (design.md §6.2 Phase 2).
+			expectNoDataUpload: true,
+			expectLogContains:  "does not have SnapshotMoveData enabled",
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			logger := logrus.New()
 			logger.Level = logrus.DebugLevel
+			logHook := logrustest.NewLocal(logger)
 			objects := make([]runtime.Object, 0)
 			if tc.pvc != nil {
 				objects = append(objects, tc.pvc)
@@ -497,6 +537,16 @@ func TestExecute(t *testing.T) {
 				vsList := new(snapshotv1api.VolumeSnapshotList)
 				require.NoError(t, crClient.List(t.Context(), vsList, &crclient.ListOptions{Namespace: tc.pvc.Namespace}))
 				assert.Empty(t, vsList.Items, "VolumeSnapshot should be deleted when exclude is rejected")
+			}
+			if tc.expectLogContains != "" {
+				found := false
+				for _, entry := range logHook.AllEntries() {
+					if strings.Contains(entry.Message, tc.expectLogContains) {
+						found = true
+						break
+					}
+				}
+				assert.True(t, found, "expected a log entry containing %q", tc.expectLogContains)
 			}
 		})
 	}

@@ -422,7 +422,7 @@ func (p *pvcBackupItemAction) Execute(
 
 		dataMoverFromVolumePolicy := vh.GetDataMoverFromActionParameters(item, kuberesource.PersistentVolumeClaims)
 
-		exclude, excludeErr := vh.GetEffectiveExclude(item, kuberesource.PersistentVolumeClaims)
+		exclude, excludeDropped, excludeErr := vh.GetEffectiveExclude(item, kuberesource.PersistentVolumeClaims)
 		if excludeErr != nil {
 			dataUploadLog.WithError(excludeErr).Error("failed to get exclude patterns from volume policies")
 			if deleteErr := p.crClient.Delete(ctx, vs); deleteErr != nil {
@@ -445,6 +445,16 @@ func (p *pvcBackupItemAction) Execute(
 				}
 			}
 			return item, nil, "", nil, nil
+		}
+
+		if excludeDropped {
+			// design.md §5.2: inherited exclude patterns are dropped when the
+			// winning action cannot honor exclusions (skip/custom/velero-block).
+			dataUploadLog.Warn("Volume policy exclude patterns are ignored: the winning action for this volume cannot honor exclusions")
+		} else if len(exclude) > 0 {
+			// design.md §9.1: log at the wiring point (server process) so the
+			// resolved list lands in the backup logs.
+			dataUploadLog.WithField("exclude", exclude).Infof("Resolved volume policy exclude patterns (effective data mover: %s)", effectiveMover)
 		}
 
 		dataUploadLog.Info("Starting data upload of backup")
@@ -494,6 +504,18 @@ func (p *pvcBackupItemAction) Execute(
 			dataUploadLog.Info("DataUpload is submitted successfully.")
 		}
 	} else {
+		// No data movement: no uploader runs for this volume, so volume policy
+		// exclude patterns cannot be applied (design.md §6.2 Phase 2). Warn
+		// instead of silently capturing an unfiltered snapshot; the backup
+		// stays Completed.
+		if exclude, _, excludeErr := vh.GetEffectiveExclude(item, kuberesource.PersistentVolumeClaims); excludeErr != nil {
+			p.log.WithError(excludeErr).Warn("failed to get exclude patterns from volume policies")
+		} else if len(exclude) > 0 {
+			p.log.WithField("exclude", exclude).Warnf(
+				"Volume policy exclude patterns are not applied to PVC %s/%s: the backup does not have SnapshotMoveData enabled, so the volume is captured as a full CSI snapshot",
+				pvc.Namespace, pvc.Name)
+		}
+
 		setPVCRequestSizeToVSRestoreSize(&pvc, vsc, p.log)
 
 		additionalItems = []velero.ResourceIdentifier{

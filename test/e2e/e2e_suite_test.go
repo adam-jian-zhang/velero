@@ -543,6 +543,11 @@ var _ = Describe(
 	Label("ResourceFiltering", "ResourcePolicies", "FSBackup", "ExcludeFiles"),
 	ExcludeFilesAdditiveTest,
 )
+var _ = Describe(
+	"Velero test that exclude without data movement warns and snapshots fully",
+	Label("ResourceFiltering", "ResourcePolicies", "ExcludeFiles"),
+	ExcludeFilesSnapshotNoDataMoveTest,
+)
 
 // backup VolumeInfo test
 var _ = Describe(

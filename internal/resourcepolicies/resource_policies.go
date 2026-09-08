@@ -514,18 +514,17 @@ func (p *Policies) GetMatchAction(res any) (*Action, error) {
 // backup-level "!foo" can re-include a path excluded by a matching global rule.
 //
 // If the first-match (winning) action cannot honor exclude (skip, custom,
-// velero-block), inherited patterns are dropped and nil is returned. exclude
-// on that winning action is still rejected in Action.validate().
-func (p *Policies) GetEffectiveExclude(res any) ([]string, error) {
+// velero-block), the collected patterns are dropped: the return is
+// (nil, true, nil) when any matching rule did carry exclude, so callers can
+// log that inherited patterns were ignored (design §5.2). exclude on that
+// winning action is still rejected in Action.validate().
+func (p *Policies) GetEffectiveExclude(res any) (patterns []string, dropped bool, err error) {
 	if p == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	volume, err := parseVolumeFilterData(res)
 	if err != nil {
-		return nil, err
-	}
-	if !actionHonorsExclude(p.match(volume)) {
-		return nil, nil
+		return nil, false, err
 	}
 
 	n := len(p.volumePolicies)
@@ -543,7 +542,7 @@ func (p *Policies) GetEffectiveExclude(res any) ([]string, error) {
 		}
 		excl, err := r.action.GetExclude()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		effective = append(effective, excl...)
 	}
@@ -553,11 +552,17 @@ func (p *Policies) GetEffectiveExclude(res any) ([]string, error) {
 		}
 		excl, err := r.action.GetExclude()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		effective = append(effective, excl...)
 	}
-	return effective, nil
+
+	if !actionHonorsExclude(p.match(volume)) {
+		// The override is a whole-volume skip or a block copy: nothing reads
+		// the collected list. Report the drop so callers can log it.
+		return nil, len(effective) > 0, nil
+	}
+	return effective, false, nil
 }
 
 func (p *Policies) Validate() error {
