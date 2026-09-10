@@ -31,6 +31,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -42,13 +43,16 @@ import (
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	veleroclient "github.com/vmware-tanzu/velero/pkg/client"
 	serverconfig "github.com/vmware-tanzu/velero/pkg/cmd/server/config"
 	"github.com/vmware-tanzu/velero/pkg/constant"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	pkgrestore "github.com/vmware-tanzu/velero/pkg/restore"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	csiutil "github.com/vmware-tanzu/velero/pkg/util/csi"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
@@ -66,6 +70,8 @@ type restoreFinalizerReconciler struct {
 	crClient          client.Client
 	multiHookTracker  *hook.MultiHookTracker
 	resourceTimeout   time.Duration
+	restMapper        meta.RESTMapper
+	ownerRefConfigMap string
 }
 
 func NewRestoreFinalizerReconciler(
@@ -78,6 +84,8 @@ func NewRestoreFinalizerReconciler(
 	crClient client.Client,
 	multiHookTracker *hook.MultiHookTracker,
 	resourceTimeout time.Duration,
+	restMapper meta.RESTMapper,
+	ownerRefConfigMap string,
 ) *restoreFinalizerReconciler {
 	return &restoreFinalizerReconciler{
 		Client:            client,
@@ -90,6 +98,8 @@ func NewRestoreFinalizerReconciler(
 		crClient:          crClient,
 		multiHookTracker:  multiHookTracker,
 		resourceTimeout:   resourceTimeout,
+		restMapper:        restMapper,
+		ownerRefConfigMap: ownerRefConfigMap,
 	}
 }
 
@@ -107,7 +117,11 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	log.Debug("restoreFinalizerReconciler getting restore")
 
 	original := &velerov1api.Restore{}
-	if err := r.Get(ctx, req.NamespacedName, original); err != nil {
+	restoreReader := r.crClient
+	if restoreReader == nil {
+		restoreReader = r.Client
+	}
+	if err := restoreReader.Get(ctx, req.NamespacedName, original); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.WithError(err).Error("restore not found")
 			return ctrl.Result{}, nil
@@ -124,6 +138,8 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	)
 
 	switch restore.Status.Phase {
+	case velerov1api.RestorePhaseCompleted, velerov1api.RestorePhasePartiallyFailed:
+		return r.cleanupPendingSnapshots(ctx, restore), nil
 	case velerov1api.RestorePhaseFinalizing, velerov1api.RestorePhaseFinalizingPartiallyFailed:
 	default:
 		log.Debug("Restore is not awaiting finalization, skipping")
@@ -179,6 +195,7 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	finalizerCtx := &finalizerContext{
+		ctx:                ctx,
 		logger:             log,
 		backupStore:        backupStore,
 		restore:            restore,
@@ -188,11 +205,16 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		restoredPVCList:    restoredPVCList,
 		multiHookTracker:   r.multiHookTracker,
 		resourceTimeout:    r.resourceTimeout,
+		restMapper:         r.restMapper,
+		ownerRefConfigMap:  r.ownerRefConfigMap,
 		restoreItemOperationList: restoreItemOperationList{
 			items: restoreItemOperations,
 		},
 	}
-	warnings, errs := finalizerCtx.execute()
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	if persistenceErr != nil {
+		return ctrl.Result{}, persistenceErr
+	}
 
 	warningCnt := len(warnings.Velero) + len(warnings.Cluster)
 	for _, w := range warnings.Namespaces {
@@ -228,7 +250,15 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, errors.Wrap(err, "error updating restore's final status")
 	}
 
-	return ctrl.Result{}, nil
+	return r.cleanupPendingSnapshots(ctx, restore), nil
+}
+
+func (r *restoreFinalizerReconciler) cleanupPendingSnapshots(ctx context.Context, restore *velerov1api.Restore) ctrl.Result {
+	if err := pkgrestore.CleanupPendingPatchSnapshots(ctx, r.crClient, restore); err != nil {
+		r.logger.WithError(err).Warn("Failed to clean obsolete pending-patch snapshots; retrying cleanup")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}
+	}
+	return ctrl.Result{}
 }
 
 func (r *restoreFinalizerReconciler) updateResults(backupStore persistence.BackupStore, restore *velerov1api.Restore, newWarnings *results.Result, newErrs *results.Result) error {
@@ -255,16 +285,30 @@ func (r *restoreFinalizerReconciler) updateResults(backupStore persistence.Backu
 func (r *restoreFinalizerReconciler) finishProcessing(restorePhase velerov1api.RestorePhase, restore *velerov1api.Restore, original *velerov1api.Restore) error {
 	if restorePhase == velerov1api.RestorePhasePartiallyFailed {
 		restore.Status.Phase = velerov1api.RestorePhasePartiallyFailed
-		r.metrics.RegisterRestorePartialFailure(restore.Spec.ScheduleName)
 	} else {
 		restore.Status.Phase = velerov1api.RestorePhaseCompleted
-		r.metrics.RegisterRestoreSuccess(restore.Spec.ScheduleName)
 	}
 	restore.Status.CompletionTimestamp = &metav1.Time{Time: r.clock.Now()}
 	// retry `Finalizing`/`FinalizingPartiallyFailed` to
 	// - `Completed`
 	// - `PartiallyFailed`
-	return kubeutil.PatchResourceWithRetriesOnErrors(r.resourceTimeout, original, restore, r.Client)
+	// Use the resourceVersion from the latest self-authored hook update, if any.
+	// A conflict or ambiguous failure is returned to reconciliation; never overwrite
+	// a newer partition by blindly replaying this status transition.
+	base := original.DeepCopy()
+	base.SetResourceVersion(restore.GetResourceVersion())
+	err := veleroclient.RetryOnRetriableMaxBackOff(r.resourceTimeout, func() error {
+		return r.Client.Patch(context.Background(), restore, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	}, func(err error) bool { return err != nil && !apierrors.IsConflict(err) })
+	if err != nil {
+		return err
+	}
+	if restore.Status.Phase == velerov1api.RestorePhasePartiallyFailed {
+		r.metrics.RegisterRestorePartialFailure(restore.Spec.ScheduleName)
+	} else {
+		r.metrics.RegisterRestoreSuccess(restore.Spec.ScheduleName)
+	}
+	return nil
 }
 
 type restoreItemOperationList struct {
@@ -297,6 +341,7 @@ func (r *restoreItemOperationList) SelectByPVC(ns, name string) []*itemoperation
 // finalizerContext includes all the dependencies required by finalization tasks and
 // a function execute() to orderly implement task logic.
 type finalizerContext struct {
+	ctx                      context.Context
 	logger                   logrus.FieldLogger
 	restore                  *velerov1api.Restore
 	crClient                 client.Client
@@ -307,9 +352,11 @@ type finalizerContext struct {
 	restoreItemOperationList restoreItemOperationList
 	multiHookTracker         *hook.MultiHookTracker
 	resourceTimeout          time.Duration
+	restMapper               meta.RESTMapper
+	ownerRefConfigMap        string
 }
 
-func (ctx *finalizerContext) execute() (results.Result, results.Result) {
+func (ctx *finalizerContext) execute() (results.Result, results.Result, error) {
 	warnings, errs := results.Result{}, results.Result{}
 
 	// implement finalization tasks
@@ -327,7 +374,99 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 	rehErrs := ctx.WaitRestoreExecHook()
 	errs.Merge(&rehErrs)
 
-	return warnings, errs
+	// Phase 1B (Pass 2 - Safety Net / Catch-up):
+	ownerRefEnabled := features.IsEnabled(velerov1api.OwnerRefRelinkFeatureFlag) || features.IsEnabled("OwnerRefRemap") || len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || ctx.restore.Status.PendingPatchesConfigMap != "" || len(ctx.restore.Status.QuiescedObjects) > 0
+	if ownerRefEnabled && ctx.crClient != nil {
+		remapCtx := ctx.ctx
+		if remapCtx == nil {
+			remapCtx = context.Background()
+		}
+		if ctx.resourceTimeout > 0 {
+			var cancel context.CancelFunc
+			remapCtx, cancel = context.WithTimeout(remapCtx, ctx.resourceTimeout)
+			defer cancel()
+		}
+
+		// 1. Load pending patches from Layer 2 Status & overflow ConfigMap:
+		allPending, loadWarnings, overflowLoadFailed := pkgrestore.LoadPendingPatchesHybrid(remapCtx, ctx.crClient, ctx.restore)
+		warnings.Merge(&loadWarnings)
+
+		// 2. Retry transiently failed patches:
+		var remainingPending []velerov1api.PendingPatchRef
+		if len(allPending) > 0 {
+			retryWarnings, remaining := pkgrestore.RetryPendingPatches(remapCtx, ctx.logger, ctx.crClient, ctx.restore, allPending)
+			warnings.Merge(&retryWarnings)
+			remainingPending = remaining
+		}
+
+		// Overflow load failure is fail-closed: skip unquiesce and skip ConfigMap drain
+		// so an incomplete pending list cannot look empty.
+		if overflowLoadFailed {
+			warnings.Add(ctx.restore.Namespace, fmt.Errorf("failed to load overflow ConfigMap %s after retries; skipping unquiesce to avoid waking controllers over unpatched children", ctx.restore.Status.PendingPatchesConfigMap))
+		} else {
+			// Prepare copy-on-write storage before releasing any pauses. Failures keep
+			// the durable partition intact and retry finalization instead of dropping work.
+			if err := pkgrestore.ReconcilePendingPatchesConfigMap(remapCtx, ctx.crClient, ctx.restore, remainingPending); err != nil {
+				return warnings, errs, err
+			}
+			// 3. Unquiesce eligible objects via graph-free check against remaining pending patches:
+			if len(ctx.restore.Status.QuiescedObjects) > 0 {
+				stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restore.Status.QuiescedObjects, remainingPending)
+				warnings.Merge(&unquiesceWarnings)
+				ctx.restore.Status.QuiescedObjects = stillQuiesced
+			}
+		}
+
+		// 5. Layer 1 leftover-pause catch-up (Finalizing-only leftover unpause):
+		// Catch-up is Finalizing + empty QuiescedObjects + empty PendingOwnerRefPatches + empty PendingPatchesConfigMap only.
+		// Never unpause a leftover object unless all pending patches are resolved (labels cannot rebuild uidMap).
+		// InProgress death never reaches Finalizing; InProgress leftovers stay a kubectl path.
+		if len(ctx.restore.Status.PendingOwnerRefPatches) == 0 && ctx.restore.Status.PendingPatchesConfigMap == "" && len(ctx.restore.Status.QuiescedObjects) == 0 {
+			rules := pkgrestore.LoadQuiesceRulesForCatchUp(remapCtx, ctx.crClient, ctx.restore, ctx.ownerRefConfigMap)
+			if leftovers := pkgrestore.CatchLeftoverPausedObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restMapper, ctx.restore.Name, rules); len(leftovers) > 0 {
+				stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, leftovers, nil)
+				warnings.Merge(&unquiesceWarnings)
+				ctx.restore.Status.QuiescedObjects = stillQuiesced
+			}
+		}
+
+		// 6. Strict Terminal Completion Invariant:
+		// If both queues and overflow reference are empty -> restore proceeds to Completed.
+		// If any remain -> add fatal error to errs.Velero (forcing PartiallyFailed), log kubectl unpause commands, and retain status entries in etcd.
+		if len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || ctx.restore.Status.PendingPatchesConfigMap != "" || len(ctx.restore.Status.QuiescedObjects) > 0 {
+			var msg string
+			totalPending := len(ctx.restore.Status.PendingOwnerRefPatches)
+			if ctx.restore.Status.PendingPatchesConfigMap != "" {
+				totalPending = len(remainingPending)
+			}
+			if len(ctx.restore.Status.QuiescedObjects) > 0 {
+				msg = fmt.Sprintf("Restore finalization encountered %d unresolvable patches and left %d objects paused to prevent cascading controller failures. Check restore.status.pendingOwnerRefPatches and restore.status.quiescedObjects for details.",
+					totalPending, len(ctx.restore.Status.QuiescedObjects))
+			} else {
+				msg = fmt.Sprintf("Restore finalization encountered %d unresolvable patches. Check restore.status.pendingOwnerRefPatches for details.",
+					totalPending)
+			}
+			ctx.logger.Error(msg)
+			for _, q := range ctx.restore.Status.QuiescedObjects {
+				if q.AnnotationKey != "" {
+					targetResource := q.Kind
+					if q.Group != "" {
+						targetResource = fmt.Sprintf("%s.%s", q.Kind, q.Group)
+					}
+					if q.Namespace != "" {
+						ctx.logger.Errorf("To manually unpause %s %s/%s: kubectl annotate %s %s %s- velero.io/quiesced-key- -n %s && kubectl label %s %s %s- -n %s",
+							q.Kind, q.Namespace, q.Name, targetResource, q.Name, q.AnnotationKey, q.Namespace, targetResource, q.Name, pkgrestore.LabelQuiescedByRestore, q.Namespace)
+					} else {
+						ctx.logger.Errorf("To manually unpause %s %s: kubectl annotate %s %s %s- velero.io/quiesced-key- && kubectl label %s %s %s-",
+							q.Kind, q.Name, targetResource, q.Name, q.AnnotationKey, targetResource, q.Name, pkgrestore.LabelQuiescedByRestore)
+					}
+				}
+			}
+			errs.AddVeleroError(errors.New(msg))
+		}
+	}
+
+	return warnings, errs, nil
 }
 
 // patchDynamicPV patches newly dynamically provisioned PV using volume info
@@ -595,6 +734,9 @@ func needPatch(newPV *corev1api.PersistentVolume, pvInfo *volume.PVInfo) bool {
 }
 
 func (ctx *finalizerContext) updateVolumeInfos() (errs results.Result) {
+	if ctx.backupStore == nil || ctx.crClient == nil {
+		return errs
+	}
 	dataDownloads := &velerov2alpha1.DataDownloadList{}
 	if err := ctx.crClient.List(context.Background(), dataDownloads, client.InNamespace(ctx.restore.Namespace), client.MatchingLabels{velerov1api.RestoreNameLabel: ctx.restore.Name}); err != nil {
 		errs.Add("cluster", errors.Wrapf(err, "failed to list data downloads of restore %s", ctx.restore.Name))
@@ -677,6 +819,8 @@ func (ctx *finalizerContext) WaitRestoreExecHook() (errs results.Result) {
 		log.WithError(errors.WithStack((err))).Error("Updating restore status")
 		errs.Add(ctx.restore.Namespace, err)
 	}
+
+	ctx.restore.SetResourceVersion(updated.GetResourceVersion())
 
 	// delete the hook data for this restore
 	ctx.multiHookTracker.Delete(ctx.restore.Name)

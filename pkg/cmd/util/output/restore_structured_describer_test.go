@@ -1006,4 +1006,35 @@ func TestDescribeRestoreInSF(t *testing.T) {
 		out := DescribeRestoreInSF(ctx, kbClient, r, nil, false, false, "", "json")
 		require.Contains(t, out, `"phase": "New"`)
 	})
+
+	t.Run("ownerReferenceRelinking includes unquiesceBlocked", func(t *testing.T) {
+		r := builder.ForRestore("velero", "restore-ownerref").Result()
+		r.Spec.OwnerRefConfigMap = &corev1api.TypedLocalObjectReference{Name: "my-cm"}
+		r.Status.OwnerRefsRelinked = 5
+		r.Status.SpecRefsRelinked = 3
+		r.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+			{
+				Group:            "cluster.x-k8s.io",
+				Version:          "v1beta1",
+				Kind:             "Cluster",
+				Namespace:        "default",
+				Name:             "c1",
+				AnnotationKey:    "cluster.x-k8s.io/paused",
+				UnquiesceBlocked: true,
+			},
+		}
+		out := DescribeRestoreInSF(ctx, kbClient, r, nil, false, false, "", "json")
+		var p map[string]any
+		require.NoError(t, json.Unmarshal([]byte(out), &p))
+		relink, ok := p["ownerReferenceRelinking"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, float64(5), relink["relinkedOwnerRefs"])
+		assert.Equal(t, float64(3), relink["relinkedSpecRefs"])
+		assert.Equal(t, "my-cm", relink["configMap"])
+		quiesced, ok := relink["quiescedObjects"].([]any)
+		require.True(t, ok)
+		require.Len(t, quiesced, 1)
+		q0 := quiesced[0].(map[string]any)
+		assert.Equal(t, true, q0["unquiesceBlocked"])
+	})
 }

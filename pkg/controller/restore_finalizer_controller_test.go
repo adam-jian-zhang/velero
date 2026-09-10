@@ -35,7 +35,9 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -46,16 +48,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
+	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	persistencemocks "github.com/vmware-tanzu/velero/pkg/persistence/mocks"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
 	pluginmocks "github.com/vmware-tanzu/velero/pkg/plugin/mocks"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	pkgrestore "github.com/vmware-tanzu/velero/pkg/restore"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	csiutil "github.com/vmware-tanzu/velero/pkg/util/csi"
@@ -165,6 +171,8 @@ func TestRestoreFinalizerReconcile(t *testing.T) {
 				fakeClient,
 				hook.NewMultiHookTracker(),
 				10*time.Minute,
+				nil,
+				"",
 			)
 			r.clock = testclocks.NewFakeClock(now)
 
@@ -235,6 +243,8 @@ func TestUpdateResult(t *testing.T) {
 		fakeClient,
 		hook.NewMultiHookTracker(),
 		10*time.Minute,
+		nil,
+		"",
 	)
 	restore := builder.ForRestore(velerov1api.DefaultNamespace, "restore-1").Result()
 	res := map[string]results.Result{"warnings": {}, "errors": {}}
@@ -1404,4 +1414,1267 @@ func TestUpdateVolumeInfos(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOwnerRefRelinkingPass2(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	// Create child and cluster object in fake client
+	childObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-pass2",
+				"namespace": "default",
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), childObj))
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-pass2",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					"velero.io/quiesced-key":  "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-pass2",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-pass2"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "worker-pass2",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "ms-1",
+					UID:        "new-parent-uid",
+				},
+			},
+		},
+	}
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-pass2",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	// Child object must have remapped ownerReference
+	liveChild := &unstructured.Unstructured{}
+	liveChild.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Machine"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "worker-pass2"}, liveChild)
+	require.NoError(t, err)
+	require.Len(t, liveChild.GetOwnerReferences(), 1)
+	assert.Equal(t, types.UID("new-parent-uid"), liveChild.GetOwnerReferences()[0].UID)
+
+	// Cluster object must be unquiesced (pause annotation removed)
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err = fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-pass2"}, liveCluster)
+	require.NoError(t, err)
+	assert.NotContains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+
+	// Status queues must be cleared
+	assert.Empty(t, restoreObj.Status.PendingOwnerRefPatches)
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+}
+
+func TestOwnerRefRelinkingPass2_UnpauseWhenNoPendingPatches(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-pass2-clean",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					"velero.io/quiesced-key":  "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-clean",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-clean"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	// All patches succeeded in Pass 1, so PendingOwnerRefPatches is empty.
+	restoreObj.Status.PendingOwnerRefPatches = nil
+	// QuiescedObjects records the object that was kept paused across the volume wait.
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-pass2-clean",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	// Cluster object must be unquiesced (pause annotation and tracking labels removed)
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-pass2-clean"}, liveCluster)
+	require.NoError(t, err)
+	assert.NotContains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+	assert.NotContains(t, liveCluster.GetAnnotations(), "velero.io/quiesced-key")
+	assert.NotContains(t, liveCluster.GetLabels(), "velero.io/quiesced-by-restore")
+
+	// Status queues must be cleared
+	assert.Empty(t, restoreObj.Status.PendingOwnerRefPatches)
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+}
+
+func TestOwnerRefRelinkingPass2_StrictTerminalCompletionInvariant(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-unresolved",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-unresolved"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	// Pending patch targets a non-existent child object -> patch retry fails
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "non-existent-worker",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "Cluster",
+					Name:       "cluster-unresolved",
+					UID:        "cluster-uid",
+				},
+			},
+		},
+	}
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-unresolved",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	// Must emit error in errs.Velero (strict terminal completion invariant forces PartiallyFailed)
+	require.NotEmpty(t, errs.Velero)
+	assert.Contains(t, errs.Velero[0], "Restore finalization encountered")
+
+	// Cluster object must REMAIN quiesced (safe fail-stop)
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-unresolved"}, liveCluster)
+	require.NoError(t, err)
+	assert.Contains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+
+	// Status entries must be retained for inspection
+	assert.NotEmpty(t, restoreObj.Status.PendingOwnerRefPatches)
+	assert.NotEmpty(t, restoreObj.Status.QuiescedObjects)
+	assert.NotEmpty(t, warnings)
+}
+
+func TestOwnerRefRelinkingPass2_EmptySpecPatchJSONForcesPartiallyFailed(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-empty-specpatch"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	// Pending specRef patch has empty SpecPatchJSON
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:         "kubevirt.io",
+			Version:       "v1",
+			Kind:          "VirtualMachine",
+			Namespace:     "default",
+			Name:          "my-vm",
+			PatchType:     "specRef",
+			SpecPatchJSON: "",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	// Must emit error in errs.Velero (strict terminal completion invariant forces PartiallyFailed)
+	require.NotEmpty(t, errs.Velero)
+	assert.Contains(t, errs.Velero[0], "Restore finalization encountered 1 unresolvable patches")
+
+	// Empty SpecPatchJSON patch must remain in PendingOwnerRefPatches to prevent false completion
+	require.Len(t, restoreObj.Status.PendingOwnerRefPatches, 1)
+	assert.Equal(t, "my-vm", restoreObj.Status.PendingOwnerRefPatches[0].Name)
+	assert.NotEmpty(t, warnings)
+}
+
+func TestOwnerRefRelinkingPass2_OriginallyPausedNotCaughtUp(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-prepaused",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "pre-existing",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-prepaused"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+
+	// Pre-existing pause is preserved; leftover catch-up only matches Velero tracking labels.
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-prepaused"}, liveCluster)
+	require.NoError(t, err)
+	assert.Equal(t, "pre-existing", liveCluster.GetAnnotations()["cluster.x-k8s.io/paused"])
+}
+
+// TestOwnerRefRelinkingPass2_CrashRecoveryFromStatus simulates a Velero pod restart during the
+// WaitingForPluginOperations async window. Pass 1 persisted leftover work to Restore.Status
+// (Layer 2) before crashing; the in-memory uidMap is gone. A fresh finalizer reconcile must
+// recover purely from Status: retry the pending ownerRef patch (which already carries the
+// remapped live UID recorded before the crash), then unquiesce the parent via graph-free
+// evaluation. This locks in the dual-layer crash-proof guarantee without any in-memory state.
+func TestOwnerRefRelinkingPass2_CrashRecoveryFromStatus(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	// Live child object exists but its ownerRef was NOT patched before the crash
+	// (Pass 1 failed transiently and deferred it to Status). It has no ownerReferences yet.
+	childObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-crash",
+				"namespace": "default",
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), childObj))
+
+	// Parent Cluster is still paused by Velero, carrying the tracking label/annotation.
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-crash",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					"velero.io/quiesced-key":  "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-crash",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-crash"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	// Status carries the pending patch with the ALREADY-REMAPPED live UID (captured before crash).
+	// No uidMap is reconstructed; Pass 2 applies this patch directly.
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "worker-crash",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "Cluster",
+					Name:       "cluster-crash",
+					UID:        "live-cluster-uid-after-crash",
+				},
+			},
+			// Targets names the parent so graph-free unquiesce keeps the Cluster paused until this patch succeeds.
+			Targets: []velerov1api.TargetRef{
+				{
+					Group: "cluster.x-k8s.io",
+					Kind:  "Cluster",
+					Name:  "cluster-crash",
+				},
+			},
+		},
+	}
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-crash",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty(), "no warnings expected on successful crash recovery")
+	assert.True(t, errs.IsEmpty(), "no errors expected on successful crash recovery")
+
+	// Child ownerRef must now point to the live parent UID carried in Status.
+	liveChild := &unstructured.Unstructured{}
+	liveChild.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Machine"})
+	require.NoError(t, fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "worker-crash"}, liveChild))
+	require.Len(t, liveChild.GetOwnerReferences(), 1)
+	assert.Equal(t, types.UID("live-cluster-uid-after-crash"), liveChild.GetOwnerReferences()[0].UID)
+
+	// Parent Cluster must be unquiesced (pause annotation and tracking label/annotation removed).
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	require.NoError(t, fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-crash"}, liveCluster))
+	assert.NotContains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+	assert.NotContains(t, liveCluster.GetAnnotations(), "velero.io/quiesced-key")
+	assert.NotContains(t, liveCluster.GetLabels(), "velero.io/quiesced-by-restore")
+
+	// Both Status queues must be drained -> restore can reach Completed.
+	assert.Empty(t, restoreObj.Status.PendingOwnerRefPatches)
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+}
+
+func TestOwnerRefRelinkingPass2_ServerConfigMapCatchUp(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	serverCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "custom-server-ownerref-cm",
+		},
+		Data: map[string]string{
+			ownerref.ConfigMapKeyQuiesceOnRestore: `
+- group: custom.x-k8s.io
+  kind: CustomCluster
+  annotationKey: custom.x-k8s.io/paused
+`,
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), serverCM))
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "custom.x-k8s.io/v1beta1",
+			"kind":       "CustomCluster",
+			"metadata": map[string]any{
+				"name":      "cluster-custom-server",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"custom.x-k8s.io/paused": "",
+					"velero.io/quiesced-key": "custom.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-server-cm",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreObj := builder.ForRestore("default", "restore-server-cm").Result()
+	// QuiescedObjects is initially empty to simulate Layer 1 catch-up
+	restoreObj.Status.QuiescedObjects = nil
+
+	finalizerCtx := &finalizerContext{
+		logger:            logger,
+		restore:           restoreObj,
+		crClient:          fakeClient,
+		multiHookTracker:  hook.NewMultiHookTracker(),
+		resourceTimeout:   10 * time.Second,
+		ownerRefConfigMap: "custom-server-ownerref-cm",
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "custom.x-k8s.io", Version: "v1beta1", Kind: "CustomCluster"})
+	require.NoError(t, fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-custom-server"}, liveCluster))
+	assert.NotContains(t, liveCluster.GetAnnotations(), "custom.x-k8s.io/paused")
+	assert.NotContains(t, liveCluster.GetLabels(), "velero.io/quiesced-by-restore")
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+}
+
+func TestOwnerRefRelinkingPass2_LeftoverCatchUp_SkippedWhenPatchesPending(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	serverCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "custom-server-ownerref-cm",
+		},
+		Data: map[string]string{
+			ownerref.ConfigMapKeyQuiesceOnRestore: `
+- group: custom.x-k8s.io
+  kind: CustomCluster
+  annotationKey: custom.x-k8s.io/paused
+`,
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), serverCM))
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "custom.x-k8s.io/v1beta1",
+			"kind":       "CustomCluster",
+			"metadata": map[string]any{
+				"name":      "cluster-custom-leftover",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"custom.x-k8s.io/paused": "",
+					"velero.io/quiesced-key": "custom.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-pending-catchup",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreObj := builder.ForRestore("default", "restore-pending-catchup").Result()
+	// PendingOwnerRefPatches has an unresolved patch (for a resource that does not exist in cluster):
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "custom.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "CustomMachine",
+			Namespace: "default",
+			Name:      "missing-machine",
+			PatchType: "ownerRef",
+		},
+	}
+	// QuiescedObjects is initially empty:
+	restoreObj.Status.QuiescedObjects = nil
+
+	finalizerCtx := &finalizerContext{
+		logger:            logger,
+		restore:           restoreObj,
+		crClient:          fakeClient,
+		multiHookTracker:  hook.NewMultiHookTracker(),
+		resourceTimeout:   10 * time.Second,
+		ownerRefConfigMap: "custom-server-ownerref-cm",
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	_, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.False(t, errs.IsEmpty(), "Must return error forcing PartiallyFailed when patches remain")
+
+	// Invariant: Never unpause leftovers while PendingOwnerRefPatches is non-empty!
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "custom.x-k8s.io", Version: "v1beta1", Kind: "CustomCluster"})
+	require.NoError(t, fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-custom-leftover"}, liveCluster))
+	assert.Contains(t, liveCluster.GetAnnotations(), "custom.x-k8s.io/paused", "Cluster must remain safely paused")
+	assert.Equal(t, "restore-pending-catchup", liveCluster.GetLabels()["velero.io/quiesced-by-restore"])
+	assert.NotEmpty(t, restoreObj.Status.PendingOwnerRefPatches)
+}
+
+func TestOwnerRefRelinkingPass2_LeftoverCatchUp_LongRestoreName(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	serverCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "custom-server-ownerref-cm",
+		},
+		Data: map[string]string{
+			ownerref.ConfigMapKeyQuiesceOnRestore: `
+- group: custom.x-k8s.io
+  kind: CustomCluster
+  annotationKey: custom.x-k8s.io/paused
+`,
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), serverCM))
+
+	longRestoreName := "a-very-long-restore-name-that-definitely-exceeds-the-kubernetes-maximum-limit-of-63-characters"
+	validLabelVal := label.GetValidName(longRestoreName)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "custom.x-k8s.io/v1beta1",
+			"kind":       "CustomCluster",
+			"metadata": map[string]any{
+				"name":      "cluster-custom-long",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"custom.x-k8s.io/paused": "",
+					"velero.io/quiesced-key": "custom.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": validLabelVal,
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreObj := builder.ForRestore("default", longRestoreName).Result()
+	restoreObj.Status.QuiescedObjects = nil
+	restoreObj.Status.PendingOwnerRefPatches = nil
+
+	finalizerCtx := &finalizerContext{
+		logger:            logger,
+		restore:           restoreObj,
+		crClient:          fakeClient,
+		multiHookTracker:  hook.NewMultiHookTracker(),
+		resourceTimeout:   10 * time.Second,
+		ownerRefConfigMap: "custom-server-ownerref-cm",
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "custom.x-k8s.io", Version: "v1beta1", Kind: "CustomCluster"})
+	require.NoError(t, fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-custom-long"}, liveCluster))
+	assert.NotContains(t, liveCluster.GetAnnotations(), "custom.x-k8s.io/paused")
+	assert.NotContains(t, liveCluster.GetLabels(), "velero.io/quiesced-by-restore")
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+}
+
+func TestOwnerRefRelinkingPass2_FinalizingPartiallyFailed(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	// Create child and cluster object in fake client
+	childObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-pass2-pf",
+				"namespace": "default",
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), childObj))
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-pass2-pf",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					"velero.io/quiesced-key":  "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-pass2-pf",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-pass2-pf"
+	restoreObj := builder.ForRestore("default", restoreName).
+		Phase(velerov1api.RestorePhaseFinalizingPartiallyFailed).
+		Result()
+	restoreObj.Status.Errors = 1 // Already had an error during earlier phases
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "worker-pass2-pf",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "ms-pf-1",
+					UID:        "new-parent-uid-pf",
+				},
+			},
+		},
+	}
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-pass2-pf",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	// Execute Pass 2 in FinalizingPartiallyFailed
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	// Child object must have remapped ownerReference
+	liveChild := &unstructured.Unstructured{}
+	liveChild.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Machine"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "worker-pass2-pf"}, liveChild)
+	require.NoError(t, err)
+	require.Len(t, liveChild.GetOwnerReferences(), 1)
+	assert.Equal(t, types.UID("new-parent-uid-pf"), liveChild.GetOwnerReferences()[0].UID)
+
+	// Cluster object must be unquiesced (pause annotation removed)
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err = fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-pass2-pf"}, liveCluster)
+	require.NoError(t, err)
+	assert.NotContains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+
+	// Status queues must be cleared
+	assert.Empty(t, restoreObj.Status.PendingOwnerRefPatches)
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+
+	// Verify terminal phase determination logic: FinalizingPartiallyFailed -> PartiallyFailed
+	finalPhase := velerov1api.RestorePhaseCompleted
+	if restoreObj.Status.Phase == velerov1api.RestorePhaseFinalizingPartiallyFailed {
+		finalPhase = velerov1api.RestorePhasePartiallyFailed
+	}
+	assert.Equal(t, velerov1api.RestorePhasePartiallyFailed, finalPhase, "FinalizingPartiallyFailed must transition to PartiallyFailed even when Pass 2 retries succeed")
+}
+
+func TestOwnerRefRelinkingPass2_WithOverflowConfigMap(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	// Create child 1 (in status) and child 2 (in overflow ConfigMap)
+	child1 := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-status",
+				"namespace": "default",
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), child1))
+
+	child2 := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-overflow",
+				"namespace": "default",
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), child2))
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-hybrid",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					"velero.io/quiesced-key":  "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-hybrid",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	// Create overflow ConfigMap containing patch for child 2
+	overflowPatch := []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "worker-overflow",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "ms-2",
+					UID:        "new-parent-uid-2",
+				},
+			},
+		},
+	}
+	compressed, err := pkgrestore.CompressPendingPatches(overflowPatch)
+	require.NoError(t, err)
+
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "restore-hybrid-pending-patches",
+			Namespace: "default",
+		},
+		BinaryData: map[string][]byte{
+			pkgrestore.PendingPatchesDataKey: compressed,
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), cm))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-hybrid"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "worker-status",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "ms-1",
+					UID:        "new-parent-uid-1",
+				},
+			},
+		},
+	}
+	restoreObj.Status.PendingPatchesConfigMap = "restore-hybrid-pending-patches"
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-hybrid",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	// Verify both child1 and child2 were patched
+	liveChild1 := &unstructured.Unstructured{}
+	liveChild1.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Machine"})
+	err = fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "worker-status"}, liveChild1)
+	require.NoError(t, err)
+	require.Len(t, liveChild1.GetOwnerReferences(), 1)
+	assert.Equal(t, types.UID("new-parent-uid-1"), liveChild1.GetOwnerReferences()[0].UID)
+
+	liveChild2 := &unstructured.Unstructured{}
+	liveChild2.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Machine"})
+	err = fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "worker-overflow"}, liveChild2)
+	require.NoError(t, err)
+	require.Len(t, liveChild2.GetOwnerReferences(), 1)
+	assert.Equal(t, types.UID("new-parent-uid-2"), liveChild2.GetOwnerReferences()[0].UID)
+
+	// Cluster must be unquiesced
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err = fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-hybrid"}, liveCluster)
+	require.NoError(t, err)
+	assert.NotContains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+
+	// Status and ConfigMap drained
+	assert.Empty(t, restoreObj.Status.PendingOwnerRefPatches)
+	assert.Empty(t, restoreObj.Status.PendingPatchesConfigMap)
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+
+	// Preparing status must retain overflow until the durable commit
+	checkCM := &corev1api.ConfigMap{}
+	err = fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "restore-hybrid-pending-patches"}, checkCM)
+	require.NoError(t, err)
+}
+
+func TestOwnerRefRelinkingPass2_WithOverflowConfigMap_UnresolvedForcesPartiallyFailed(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	// Only child1 exists; child2 does not exist (will fail patch retry)
+	child1 := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-status",
+				"namespace": "default",
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), child1))
+
+	// Create overflow ConfigMap with non-existent child2
+	overflowPatch := []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "nonexistent-worker",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "ms-2",
+					UID:        "new-parent-uid-2",
+				},
+			},
+		},
+	}
+	compressed, err := pkgrestore.CompressPendingPatches(overflowPatch)
+	require.NoError(t, err)
+
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "restore-hybrid-fail-pending-patches",
+			Namespace: "default",
+		},
+		BinaryData: map[string][]byte{
+			pkgrestore.PendingPatchesDataKey: compressed,
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), cm))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-hybrid-fail"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "worker-status",
+			PatchType: "ownerRef",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "ms-1",
+					UID:        "new-parent-uid-1",
+				},
+			},
+		},
+	}
+	restoreObj.Status.PendingPatchesConfigMap = "restore-hybrid-fail-pending-patches"
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.False(t, warnings.IsEmpty())
+	// Fatal error recorded because pending patch remains unresolved
+	assert.False(t, errs.IsEmpty())
+	assert.Contains(t, errs.Velero[0], "Restore finalization encountered 1 unresolvable patches")
+
+	// The 1 unresolved patch drained to Status, and ConfigMap reference was cleared
+	assert.Len(t, restoreObj.Status.PendingOwnerRefPatches, 1)
+	assert.Equal(t, "nonexistent-worker", restoreObj.Status.PendingOwnerRefPatches[0].Name)
+	assert.Empty(t, restoreObj.Status.PendingPatchesConfigMap)
+}
+
+func TestOwnerRefRelinkingPass2_OverflowConfigMapLoadFailure_FailClosed(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-load-fail",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					"velero.io/quiesced-key":  "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-load-fail",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreObj := builder.ForRestore("default", "restore-load-fail").Result()
+	restoreObj.Status.PendingPatchesConfigMap = "restore-load-fail-pending-patches"
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-load-fail",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	require.NoError(t, persistenceErr)
+	assert.False(t, warnings.IsEmpty())
+	assert.False(t, errs.IsEmpty())
+
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-load-fail"}, liveCluster)
+	require.NoError(t, err)
+	assert.Contains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+
+	assert.Equal(t, "restore-load-fail-pending-patches", restoreObj.Status.PendingPatchesConfigMap)
+	require.Len(t, restoreObj.Status.QuiescedObjects, 1)
+	assert.Equal(t, "cluster-load-fail", restoreObj.Status.QuiescedObjects[0].Name)
+}
+
+func TestOverflowStatusCommit_RejectsStaleWriter(t *testing.T) {
+	c := velerotest.NewFakeControllerRuntimeClient(t)
+	ctx := context.Background()
+	restore := builder.ForRestore("velero", "stale-overflow").Phase(velerov1api.RestorePhaseFinalizing).Result()
+	restore.SetUID("restore-stale-overflow")
+	restore.Status.PendingPatchesConfigMap = "snapshot-A"
+	require.NoError(t, c.Create(ctx, restore))
+	staleOriginal := restore.DeepCopy()
+	staleUpdated := restore.DeepCopy()
+	// Another writer has already committed B. A stale finalizer must not clear B.
+	restore.Status.PendingPatchesConfigMap = "snapshot-B"
+	require.NoError(t, c.Update(ctx, restore))
+	staleUpdated.Status.PendingPatchesConfigMap = ""
+	r := &restoreFinalizerReconciler{Client: c, metrics: metrics.NewServerMetrics(), clock: testclocks.NewFakeClock(time.Now()), resourceTimeout: time.Second}
+	err := r.finishProcessing(velerov1api.RestorePhaseCompleted, staleUpdated, staleOriginal)
+	require.True(t, apierrors.IsConflict(err))
+	live := &velerov1api.Restore{}
+	require.NoError(t, c.Get(ctx, crclient.ObjectKeyFromObject(restore), live))
+	require.Equal(t, "snapshot-B", live.Status.PendingPatchesConfigMap)
+	require.Equal(t, velerov1api.RestorePhaseFinalizing, live.Status.Phase)
+}
+
+type failSnapshotDeletionClient struct {
+	crclient.Client
+	fail bool
+}
+
+func (c *failSnapshotDeletionClient) Delete(ctx context.Context, obj crclient.Object, opts ...crclient.DeleteOption) error {
+	if c.fail {
+		return errors.New("temporary cleanup failure")
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+func TestOverflowCleanup_TerminalReconcileRetriesWithoutRestoreWork(t *testing.T) {
+	base := velerotest.NewFakeControllerRuntimeClient(t)
+	ctx := context.Background()
+	restore := builder.ForRestore("velero", "cleanup-overflow").Phase(velerov1api.RestorePhaseCompleted).Result()
+	restore.SetUID("restore-cleanup-overflow")
+	require.NoError(t, base.Create(ctx, restore))
+	immutable := true
+	snapshot := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "obsolete-snapshot", Namespace: restore.Namespace,
+		Labels:          map[string]string{pkgrestore.PendingPatchesRestoreUIDLabel: string(restore.UID)},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: velerov1api.SchemeGroupVersion.String(), Kind: "Restore", Name: restore.Name, UID: restore.UID, Controller: &immutable}},
+	}, Immutable: &immutable}
+	require.NoError(t, base.Create(ctx, snapshot))
+	failing := &failSnapshotDeletionClient{Client: base, fail: true}
+	r := &restoreFinalizerReconciler{Client: base, crClient: failing, logger: velerotest.NewLogger()}
+	req := ctrl.Request{NamespacedName: crclient.ObjectKeyFromObject(restore)}
+	result, err := r.Reconcile(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 30*time.Second, result.RequeueAfter)
+	require.NoError(t, base.Get(ctx, crclient.ObjectKeyFromObject(snapshot), &corev1api.ConfigMap{}))
+	failing.fail = false
+	result, err = r.Reconcile(ctx, req)
+	require.NoError(t, err)
+	require.Zero(t, result.RequeueAfter)
+	require.True(t, apierrors.IsNotFound(base.Get(ctx, crclient.ObjectKeyFromObject(snapshot), &corev1api.ConfigMap{})))
+	live := &velerov1api.Restore{}
+	require.NoError(t, base.Get(ctx, req.NamespacedName, live))
+	require.Equal(t, velerov1api.RestorePhaseCompleted, live.Status.Phase)
+}
+
+func TestOverflowPreparationFailure_KeepsParentPaused(t *testing.T) {
+	ctx := context.Background()
+	base := velerotest.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "prepare-failure").Phase(velerov1api.RestorePhaseFinalizing).Result()
+	restore.SetUID("restore-prepare-failure")
+	pending := make([]velerov1api.PendingPatchRef, 501)
+	for i := range pending {
+		pending[i] = velerov1api.PendingPatchRef{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Machine", Namespace: "default", Name: fmt.Sprintf("missing-%d", i), PatchType: "ownerRef"}
+	}
+	data, err := pkgrestore.CompressPendingPatches(pending[500:])
+	require.NoError(t, err)
+	oldSnapshot := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "prepare-failure-pending-patches", Namespace: "velero"}, BinaryData: map[string][]byte{pkgrestore.PendingPatchesDataKey: data}}
+	require.NoError(t, base.Create(ctx, oldSnapshot))
+	restore.Status.PendingOwnerRefPatches = pending[:500]
+	restore.Status.PendingPatchesConfigMap = oldSnapshot.Name
+	restore.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster", Namespace: "default", Name: "paused-root", AnnotationKey: "cluster.x-k8s.io/paused"}}
+	require.NoError(t, base.Create(ctx, restore))
+	root := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "cluster.x-k8s.io/v1beta1", "kind": "Cluster", "metadata": map[string]any{"name": "paused-root", "namespace": "default", "annotations": map[string]any{"cluster.x-k8s.io/paused": "", pkgrestore.AnnotationQuiescedKey: "cluster.x-k8s.io/paused"}}}}
+	require.NoError(t, base.Create(ctx, root))
+	failing := &failSnapshotCreationClient{Client: base}
+	finalizer := &finalizerContext{ctx: ctx, logger: velerotest.NewLogger(), restore: restore, crClient: failing, multiHookTracker: hook.NewMultiHookTracker(), resourceTimeout: time.Second}
+	_, _, persistenceErr := finalizer.execute()
+	require.Error(t, persistenceErr)
+	require.Equal(t, oldSnapshot.Name, restore.Status.PendingPatchesConfigMap)
+	require.Equal(t, pending[:500], restore.Status.PendingOwnerRefPatches)
+	require.NoError(t, base.Get(ctx, crclient.ObjectKeyFromObject(root), root))
+	require.Contains(t, root.GetAnnotations(), "cluster.x-k8s.io/paused")
+	loaded, _, failed := pkgrestore.LoadPendingPatchesHybrid(ctx, base, restore)
+	require.False(t, failed)
+	require.Equal(t, pending, loaded)
+}
+
+type ambiguousStatusCommitClient struct {
+	crclient.Client
+	committed bool
+}
+
+func (c *ambiguousStatusCommitClient) Patch(ctx context.Context, obj crclient.Object, patch crclient.Patch, opts ...crclient.PatchOption) error {
+	err := c.Client.Patch(ctx, obj, patch, opts...)
+	if err == nil && !c.committed {
+		c.committed = true
+		return apierrors.NewTimeoutError("response lost after status committed", 1)
+	}
+	return err
+}
+
+func TestOverflowStatusCommit_AmbiguousSuccessReloadsDurablePartition(t *testing.T) {
+	ctx := context.Background()
+	base := velerotest.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "ambiguous").Phase(velerov1api.RestorePhaseFinalizing).Result()
+	restore.SetUID("restore-ambiguous")
+	restore.Status.PendingPatchesConfigMap = "snapshot-A"
+	require.NoError(t, base.Create(ctx, restore))
+	original := restore.DeepCopy()
+	restore.Status.PendingPatchesConfigMap = ""
+	ambiguous := &ambiguousStatusCommitClient{Client: base}
+	r := &restoreFinalizerReconciler{Client: ambiguous, metrics: metrics.NewServerMetrics(), clock: testclocks.NewFakeClock(time.Now()), resourceTimeout: time.Second}
+	// The first write commits but its response is lost. Retrying with the old
+	// resourceVersion must conflict instead of replaying a stale transition.
+	err := r.finishProcessing(velerov1api.RestorePhaseCompleted, restore, original)
+	require.True(t, apierrors.IsConflict(err))
+	live := &velerov1api.Restore{}
+	require.NoError(t, base.Get(ctx, crclient.ObjectKeyFromObject(restore), live))
+	require.Equal(t, velerov1api.RestorePhaseCompleted, live.Status.Phase)
+	require.Empty(t, live.Status.PendingPatchesConfigMap)
+}
+
+type failSnapshotCreationClient struct{ crclient.Client }
+
+func (c *failSnapshotCreationClient) Create(context.Context, crclient.Object, ...crclient.CreateOption) error {
+	return errors.New("cannot create replacement snapshot")
 }
