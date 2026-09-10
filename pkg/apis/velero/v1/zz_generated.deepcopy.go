@@ -1442,6 +1442,11 @@ func (in *RestoreSpec) DeepCopyInto(out *RestoreSpec) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.OwnerRefConfigMap != nil {
+		in, out := &in.OwnerRefConfigMap, &out.OwnerRefConfigMap
+		*out = new(corev1.TypedLocalObjectReference)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.UploaderConfig != nil {
 		in, out := &in.UploaderConfig, &out.UploaderConfig
 		*out = new(UploaderConfigForRestore)

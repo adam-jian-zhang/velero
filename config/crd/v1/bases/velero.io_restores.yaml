@@ -404,6 +404,30 @@ spec:
                   x-kubernetes-map-type: atomic
                 nullable: true
                 type: array
+              ownerRefConfigMap:
+                description: |-
+                  OwnerRefConfigMap specifies an optional ConfigMap reference containing
+                  custom inScope GVKs, specRefPaths, and quiesceOnRestore rules for ownerReference remapping.
+                  If not set, falls back to the server-level --owner-ref-configmap or built-in defaults.
+                nullable: true
+                properties:
+                  apiGroup:
+                    description: |-
+                      APIGroup is the group for the resource being referenced.
+                      If APIGroup is not specified, the specified Kind must be in the core API group.
+                      For any other third-party types, APIGroup is required.
+                    type: string
+                  kind:
+                    description: Kind is the type of resource being referenced
+                    type: string
+                  name:
+                    description: Name is the name of resource being referenced
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+                x-kubernetes-map-type: atomic
               preserveNodePorts:
                 description: PreserveNodePorts specifies whether to restore old nodePorts
                   from backup.

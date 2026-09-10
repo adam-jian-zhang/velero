@@ -30,11 +30,13 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/resourcemodifiers"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -117,6 +119,8 @@ func TestFetchBackupInfo(t *testing.T) {
 				fakeGlobalClient,
 				10*time.Minute,
 				"",
+				nil,
+				"",
 			)
 
 			if test.backupStoreError == nil {
@@ -198,6 +202,8 @@ func TestProcessQueueItemSkips(t *testing.T) {
 				false,
 				fakeGlobalClient,
 				10*time.Minute,
+				"",
+				nil,
 				"",
 			)
 
@@ -615,6 +621,8 @@ func TestRestoreReconcile(t *testing.T) {
 				fakeGlobalClient,
 				10*time.Minute,
 				"",
+				nil,
+				"",
 			)
 
 			r.clock = clocktesting.NewFakeClock(now)
@@ -804,6 +812,8 @@ func TestValidateAndCompleteWhenScheduleNameSpecified(t *testing.T) {
 		fakeGlobalClient,
 		10*time.Minute,
 		"",
+		nil,
+		"",
 	)
 
 	restore := &velerov1api.Restore{
@@ -900,6 +910,8 @@ func TestValidateAndCompleteWithResourcePolicySpecified(t *testing.T) {
 		false,
 		fakeGlobalClient,
 		10*time.Minute,
+		"",
+		nil,
 		"",
 	)
 
@@ -1030,6 +1042,8 @@ func TestValidateAndCompleteWithResourceModifierSpecified(t *testing.T) {
 		false,
 		fakeGlobalClient,
 		10*time.Minute,
+		"",
+		nil,
 		"",
 	)
 
@@ -1179,6 +1193,8 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 			fakeGlobalClient,
 			10*time.Minute,
 			defaultCM,
+			nil,
+			"",
 		)
 
 		location := builder.ForBackupStorageLocation("velero", "default").Provider("myCloud").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
@@ -1217,7 +1233,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.NotNil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1232,7 +1248,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("per-restore-rm", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.NotNil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1246,7 +1262,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 
 		skipTrue := true
 		restore := newRestore("", &skipTrue)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1261,7 +1277,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1270,7 +1286,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		r := setupReconciler(t, "nonexistent-cm")
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1279,7 +1295,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		r := setupReconciler(t, "")
 
 		restore := newRestore("nonexistent-cm", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.NotEmpty(t, restore.Status.ValidationErrors)
 		assert.Contains(t, restore.Status.ValidationErrors[0], "failed to get resource modifiers configmap")
@@ -1289,7 +1305,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		r := setupReconciler(t, "")
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1306,7 +1322,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 			Kind: "Secret",
 			Name: "some-secret",
 		}
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1321,7 +1337,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1462,4 +1478,107 @@ func (r *fakeRestorer) RestoreWithResolvers(req *pkgrestore.Request,
 	r.calledWithPVBs = req.PodVolumeBackups
 
 	return res.Get(0).(results.Result), res.Get(1).(results.Result)
+}
+
+func TestLoadOwnerRefScope(t *testing.T) {
+	ctx := t.Context()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	// Case 1: Built-in defaults when no CM specified
+	r := &restoreReconciler{
+		kbClient: fakeClient,
+		logger:   velerotest.NewLogger(),
+	}
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-1"},
+	}
+	scope := r.loadOwnerRefScope(ctx, restore)
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}))
+
+	// Case 2: Per-restore OwnerRefConfigMap
+	cmExplicit := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "custom-scope-cm"},
+		Data: map[string]string{
+			"inScope": "- group: custom.io\n  kind: CustomKind\n",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmExplicit))
+
+	restore.Spec.OwnerRefConfigMap = &corev1api.TypedLocalObjectReference{Name: "custom-scope-cm"}
+	scope = r.loadOwnerRefScope(ctx, restore)
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "CustomKind"}))
+
+	// Case 3: Server default flag
+	restore.Spec.OwnerRefConfigMap = nil
+	r.ownerRefConfigMap = "custom-scope-cm"
+	scope = r.loadOwnerRefScope(ctx, restore)
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "CustomKind"}))
+
+	// Case 4: Conventional default velero-ownerref-config
+	r.ownerRefConfigMap = ""
+	cmConventional := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: defaultOwnerRefConfigMap},
+		Data: map[string]string{
+			"inScope": "- group: conventional.io\n",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmConventional))
+	scope = r.loadOwnerRefScope(ctx, restore)
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "conventional.io", Version: "v1", Kind: "Foo"}))
+
+	// Case 5: Per-restore non-existent ConfigMap records validation error
+	restoreErrNotFound := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-not-found"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "non-existent-cm"},
+		},
+	}
+	_ = r.loadOwnerRefScope(ctx, restoreErrNotFound)
+	require.NotEmpty(t, restoreErrNotFound.Status.ValidationErrors)
+	assert.Contains(t, restoreErrNotFound.Status.ValidationErrors[0], "failed to get owner-ref configmap")
+
+	// Case 6: Per-restore invalid YAML records validation error
+	cmInvalidYAML := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "invalid-yaml-cm"},
+		Data: map[string]string{
+			"inScope": ":::malformed yaml:::",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmInvalidYAML))
+	restoreErrInvalidYAML := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-invalid-yaml"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "invalid-yaml-cm"},
+		},
+	}
+	_ = r.loadOwnerRefScope(ctx, restoreErrInvalidYAML)
+	require.NotEmpty(t, restoreErrInvalidYAML.Status.ValidationErrors)
+	assert.Contains(t, restoreErrInvalidYAML.Status.ValidationErrors[0], "error parsing owner-ref configmap")
+
+	// Case 7: Conventional ConfigMap with invalid YAML falls back to built-in defaults
+	cmConventionalInvalid := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero-bad", Name: defaultOwnerRefConfigMap},
+		Data: map[string]string{
+			"inScope": ":::invalid yaml:::",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmConventionalInvalid))
+	restoreConventionalBad := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero-bad", Name: "restore-conv-bad"},
+	}
+	scope = r.loadOwnerRefScope(ctx, restoreConventionalBad)
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}))
+}
+
+func TestOwnerRefRemappingPass1Tracker(t *testing.T) {
+	tracker := ownerref.NewOwnerRefRemapTracker()
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.EnqueueOwnerPatch(ownerref.OwnerPatchRequest{
+		Namespace: "default",
+		Name:      "machine-1",
+	})
+	tracker.Set("restore-1", state)
+	assert.NotNil(t, tracker.Get("restore-1"))
+	assert.Len(t, tracker.Get("restore-1").GetOwnerPatchQueue(), 1)
 }

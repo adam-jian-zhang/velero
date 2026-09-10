@@ -55,6 +55,7 @@ import (
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/resourcemodifiers"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
@@ -330,6 +331,21 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 
 	req.RestoredItems = make(map[itemKey]restoredItemStatus)
 
+	if req.OwnerRefRemap == nil {
+		req.OwnerRefRemap = ownerref.NewOwnerRefRemapState()
+		req.OwnerRefRemap.Enabled = true
+	}
+	if req.OwnerRefScope == nil {
+		if scope := req.OwnerRefRemap.GetScope(); scope != nil {
+			req.OwnerRefScope = scope
+		} else {
+			req.OwnerRefScope = ownerref.NewScope()
+			req.OwnerRefRemap.SetScope(req.OwnerRefScope)
+		}
+	} else if req.OwnerRefRemap.GetScope() == nil {
+		req.OwnerRefRemap.SetScope(req.OwnerRefScope)
+	}
+
 	restoreCtx := &restoreContext{
 		backup:                         req.Backup,
 		backupReader:                   req.BackupReader,
@@ -375,6 +391,8 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		namespacedFilterMap:            namespacedFilterMap,
 		namespacedFilterPatterns:       namespacedFilterPatterns,
 		namespaceFilterCache:           make(map[string]*resolvedNamespaceFilter),
+		ownerRefRemap:                  req.OwnerRefRemap,
+		ownerRefScope:                  req.OwnerRefScope,
 	}
 
 	return restoreCtx.execute()
@@ -440,6 +458,10 @@ type restoreContext struct {
 	// namespaceFilterCache memoizes the resolved filter for a given namespace
 	// to avoid re-evaluating glob patterns on every call.
 	namespaceFilterCache map[string]*resolvedNamespaceFilter
+
+	// ownerRefRemap tracks dynamic UID mappings and patch queues for in-scope CRDs.
+	ownerRefRemap *ownerref.OwnerRefRemapState
+	ownerRefScope *ownerref.Scope
 }
 
 type resolvedResourceFilter struct {
@@ -1400,6 +1422,71 @@ func (ctx *restoreContext) getResource(groupResource schema.GroupResource, obj *
 	return u, nil
 }
 
+func copyOwnerReferences(refs []metav1.OwnerReference) []metav1.OwnerReference {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]metav1.OwnerReference, len(refs))
+	copy(out, refs)
+	return out
+}
+
+func ownerRefSourceNamespaces(refs []metav1.OwnerReference, srcNS string) []string {
+	out := make([]string, len(refs))
+	for i := range refs {
+		out[i] = srcNS
+	}
+	return out
+}
+
+func (ctx *restoreContext) registerAndMaybeEnqueue(
+	itemFromBackup *unstructured.Unstructured,
+	liveObj *unstructured.Unstructured,
+	groupResource schema.GroupResource,
+	originalOwnerRefs []metav1.OwnerReference,
+	ownerRefSourceNS []string,
+) {
+	if ctx.ownerRefRemap == nil || itemFromBackup == nil || liveObj == nil {
+		return
+	}
+	oldUID := itemFromBackup.GetUID()
+	newUID := liveObj.GetUID()
+	ctx.ownerRefRemap.RegisterUIDMapping(oldUID, newUID)
+
+	// Prefer the live object's GVK as served on the target cluster;
+	// fall back to backup manifest GVK only if liveObj GVK is empty.
+	gvk := liveObj.GroupVersionKind()
+	if gvk.Empty() {
+		gvk = itemFromBackup.GroupVersionKind()
+	}
+	if ctx.ownerRefScope != nil {
+		if ctx.ownerRefScope.IsInScope(gvk) && len(originalOwnerRefs) > 0 {
+			req := ownerref.OwnerPatchRequest{
+				Group:             gvk.Group,
+				Version:           gvk.Version,
+				Kind:              gvk.Kind,
+				Resource:          groupResource.Resource,
+				Namespace:         liveObj.GetNamespace(),
+				Name:              liveObj.GetName(),
+				OriginalOwnerRefs: append([]metav1.OwnerReference(nil), originalOwnerRefs...),
+				OwnerRefSourceNS:  append([]string(nil), ownerRefSourceNS...),
+			}
+			ctx.ownerRefRemap.EnqueueOwnerPatch(req)
+		}
+		if ctx.ownerRefScope.HasSpecRefPaths(gvk) {
+			req := ownerref.OwnerPatchRequest{
+				Group:     gvk.Group,
+				Version:   gvk.Version,
+				Kind:      gvk.Kind,
+				Resource:  groupResource.Resource,
+				Namespace: liveObj.GetNamespace(),
+				Name:      liveObj.GetName(),
+			}
+			ctx.ownerRefRemap.EnqueueSpecPatch(req)
+		}
+	}
+}
+
 func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupResource schema.GroupResource, namespace string, mustInclude bool) (results.Result, results.Result, bool) {
 	warnings, errs := results.Result{}, results.Result{}
 	// itemExists bool is used to determine whether to include this item in the "wait for additional items" list
@@ -1481,6 +1568,8 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	// Make a copy of object retrieved from backup to make it available unchanged
 	//inside restore actions.
 	itemFromBackup := obj.DeepCopy()
+	originalOwnerRefs := copyOwnerReferences(itemFromBackup.GetOwnerReferences())
+	ownerRefSourceNS := ownerRefSourceNamespaces(originalOwnerRefs, itemFromBackup.GetNamespace())
 
 	complete, err := isCompleted(obj, groupResource)
 	if err != nil {
@@ -1894,6 +1983,13 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	if err != nil || fromCluster == nil {
 		// couldn't find the resource, attempt to create
 		restoreLogger.Debugf("Creating %s", obj.GetName())
+		var quiescedRecord *ownerref.QuiescedObjectRecord
+		if ctx.ownerRefRemap != nil && ctx.ownerRefScope != nil {
+			if rule, ok := ctx.ownerRefScope.MatchesQuiesceRule(obj.GroupVersionKind()); ok {
+				rec, _ := InjectQuiesceMetadata(obj, rule, restoreLogger)
+				quiescedRecord = &rec
+			}
+		}
 		createdObj, restoreErr = resourceClient.Create(obj)
 		if restoreErr == nil {
 			itemExists = true
@@ -1901,6 +1997,16 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				action:      ItemRestoreResultCreated,
 				itemExists:  itemExists,
 				createdName: createdObj.GetName(),
+			}
+			if ctx.ownerRefRemap != nil {
+				if quiescedRecord != nil {
+					quiescedRecord.Name = createdObj.GetName()
+					if createdNS := createdObj.GetNamespace(); createdNS != "" {
+						quiescedRecord.Namespace = createdNS
+					}
+					ctx.ownerRefRemap.RecordQuiescedObject(*quiescedRecord)
+				}
+				ctx.registerAndMaybeEnqueue(itemFromBackup, createdObj, groupResource, originalOwnerRefs, ownerRefSourceNS)
 			}
 		}
 	}
@@ -1932,6 +2038,8 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		itemStatus := ctx.restoredItems[itemKey]
 		itemStatus.itemExists = itemExists
 		ctx.restoredItems[itemKey] = itemStatus
+		// Capture live UID before metadata sanitization strips it.
+		liveObjForUID := fromCluster.DeepCopy()
 		// Remove insubstantial metadata.
 		fromCluster, err = resetMetadataAndStatus(fromCluster)
 		if err != nil {
@@ -1966,6 +2074,9 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				if patchBytes == nil {
 					// In-cluster and desired state are the same, so move on to
 					// the next item.
+					if ctx.ownerRefRemap != nil {
+						ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+					}
 					return warnings, errs, itemExists
 				}
 
@@ -1980,11 +2091,17 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 						warningsFromUpdate, errsFromUpdate := ctx.updateBackupRestoreLabels(fromCluster, fromClusterWithLabels, namespace, resourceClient)
 						warnings.Merge(&warningsFromUpdate)
 						errs.Merge(&errsFromUpdate)
+						if errsFromUpdate.IsEmpty() && ctx.ownerRefRemap != nil {
+							ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+						}
 					}
 				} else {
 					itemStatus.action = ItemRestoreResultUpdated
 					ctx.restoredItems[itemKey] = itemStatus
 					restoreLogger.Infof("ServiceAccount %s successfully updated", kube.NamespaceAndName(obj))
+					if ctx.ownerRefRemap != nil {
+						ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+					}
 				}
 			default:
 				// check for the presence of existingResourcePolicy
@@ -2006,6 +2123,9 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 						if warningsFromUpdateRP.IsEmpty() && errsFromUpdateRP.IsEmpty() {
 							itemStatus.action = ItemRestoreResultUpdated
 							ctx.restoredItems[itemKey] = itemStatus
+							if ctx.ownerRefRemap != nil {
+								ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+							}
 						}
 						warnings.Merge(&warningsFromUpdateRP)
 						errs.Merge(&errsFromUpdateRP)
@@ -2035,6 +2155,9 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		}
 
 		restoreLogger.Infof("Restore of %s skipped: it already exists in the cluster and is the same as the backed up version", obj.GetName())
+		if ctx.ownerRefRemap != nil {
+			ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+		}
 		return warnings, errs, itemExists
 	}
 

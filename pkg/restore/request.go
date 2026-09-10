@@ -25,6 +25,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/resourcemodifiers"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
@@ -68,6 +69,8 @@ type Request struct {
 	BackupVolumeInfoMap           map[string]volume.BackupVolumeInfo
 	RestoreVolumeInfoTracker      *volume.RestoreVolumeInfoTracker
 	ResourceDeletionStatusTracker kube.ResourceDeletionStatusTracker
+	OwnerRefRemap                 *ownerref.OwnerRefRemapState
+	OwnerRefScope                 *ownerref.Scope
 }
 
 type restoredItemStatus struct {

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	serverconfig "github.com/vmware-tanzu/velero/pkg/cmd/server/config"
@@ -46,6 +48,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	pkgrestore "github.com/vmware-tanzu/velero/pkg/restore"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/util/results"
@@ -53,15 +56,16 @@ import (
 
 type restoreFinalizerReconciler struct {
 	client.Client
-	namespace         string
-	logger            logrus.FieldLogger
-	newPluginManager  func(logger logrus.FieldLogger) clientmgmt.Manager
-	backupStoreGetter persistence.ObjectBackupStoreGetter
-	metrics           *metrics.ServerMetrics
-	clock             clock.WithTickerAndDelayedExecution
-	crClient          client.Client
-	multiHookTracker  *hook.MultiHookTracker
-	resourceTimeout   time.Duration
+	namespace            string
+	logger               logrus.FieldLogger
+	newPluginManager     func(logger logrus.FieldLogger) clientmgmt.Manager
+	backupStoreGetter    persistence.ObjectBackupStoreGetter
+	metrics              *metrics.ServerMetrics
+	clock                clock.WithTickerAndDelayedExecution
+	crClient             client.Client
+	multiHookTracker     *hook.MultiHookTracker
+	resourceTimeout      time.Duration
+	ownerRefRemapTracker *ownerref.OwnerRefRemapTracker
 }
 
 func NewRestoreFinalizerReconciler(
@@ -74,18 +78,20 @@ func NewRestoreFinalizerReconciler(
 	crClient client.Client,
 	multiHookTracker *hook.MultiHookTracker,
 	resourceTimeout time.Duration,
+	ownerRefRemapTracker *ownerref.OwnerRefRemapTracker,
 ) *restoreFinalizerReconciler {
 	return &restoreFinalizerReconciler{
-		Client:            client,
-		logger:            logger,
-		namespace:         namespace,
-		newPluginManager:  newPluginManager,
-		backupStoreGetter: backupStoreGetter,
-		metrics:           metrics,
-		clock:             &clock.RealClock{},
-		crClient:          crClient,
-		multiHookTracker:  multiHookTracker,
-		resourceTimeout:   resourceTimeout,
+		Client:               client,
+		logger:               logger,
+		namespace:            namespace,
+		newPluginManager:     newPluginManager,
+		backupStoreGetter:    backupStoreGetter,
+		metrics:              metrics,
+		clock:                &clock.RealClock{},
+		crClient:             crClient,
+		multiHookTracker:     multiHookTracker,
+		resourceTimeout:      resourceTimeout,
+		ownerRefRemapTracker: ownerRefRemapTracker,
 	}
 }
 
@@ -169,13 +175,15 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	finalizerCtx := &finalizerContext{
-		logger:           log,
-		restore:          restore,
-		crClient:         r.crClient,
-		volumeInfo:       volumeInfo,
-		restoredPVCList:  restoredPVCList,
-		multiHookTracker: r.multiHookTracker,
-		resourceTimeout:  r.resourceTimeout,
+		ctx:                  ctx,
+		logger:               log,
+		restore:              restore,
+		crClient:             r.crClient,
+		volumeInfo:           volumeInfo,
+		restoredPVCList:      restoredPVCList,
+		multiHookTracker:     r.multiHookTracker,
+		resourceTimeout:      r.resourceTimeout,
+		ownerRefRemapTracker: r.ownerRefRemapTracker,
 		restoreItemOperationList: restoreItemOperationList{
 			items: restoreItemOperations,
 		},
@@ -285,6 +293,7 @@ func (r *restoreItemOperationList) SelectByPVC(ns, name string) []*itemoperation
 // finalizerContext includes all the dependencies required by finalization tasks and
 // a function execute() to orderly implement task logic.
 type finalizerContext struct {
+	ctx                      context.Context
 	logger                   logrus.FieldLogger
 	restore                  *velerov1api.Restore
 	crClient                 client.Client
@@ -293,6 +302,7 @@ type finalizerContext struct {
 	restoreItemOperationList restoreItemOperationList
 	multiHookTracker         *hook.MultiHookTracker
 	resourceTimeout          time.Duration
+	ownerRefRemapTracker     *ownerref.OwnerRefRemapTracker
 }
 
 func (ctx *finalizerContext) execute() (results.Result, results.Result) {
@@ -309,6 +319,86 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 
 	rehErrs := ctx.WaitRestoreExecHook()
 	errs.Merge(&rehErrs)
+
+	// Phase 1B (Pass 2 - Safety Net / Catch-up):
+	if ctx.ownerRefRemapTracker != nil && ctx.crClient != nil {
+		if state := ctx.ownerRefRemapTracker.Get(ctx.restore.Name); state != nil {
+			remapCtx := ctx.ctx
+			if remapCtx == nil {
+				remapCtx = context.Background()
+			}
+			if ctx.resourceTimeout > 0 {
+				var cancel context.CancelFunc
+				remapCtx, cancel = context.WithTimeout(remapCtx, ctx.resourceTimeout)
+				defer cancel()
+			}
+
+			remapWarnings := pkgrestore.ApplyOwnerRefRemapping(remapCtx, ctx.logger, ctx.crClient, ctx.restore, state)
+			warnings.Merge(&remapWarnings)
+			remainingOwnerPatches := state.GetOwnerPatchQueue()
+			remainingSpecPatches := state.GetSpecPatchQueue()
+			if len(remainingOwnerPatches) == 0 && len(remainingSpecPatches) == 0 {
+				unquiesceWarnings := pkgrestore.UnquiesceObjects(remapCtx, ctx.logger, ctx.crClient, state.GetQuiescedObjects())
+				warnings.Merge(&unquiesceWarnings)
+			} else {
+				hasAutoQuiesced := false
+				for _, rec := range state.GetQuiescedObjects() {
+					if !rec.OriginallyQuiesced {
+						hasAutoQuiesced = true
+						break
+					}
+				}
+				if hasAutoQuiesced {
+					msg := fmt.Sprintf("Quiesced objects remain paused because %d in-scope child resources have unresolved ownerReferences after finalization; manual unquiescing may be required", len(remainingOwnerPatches)+len(remainingSpecPatches))
+					ctx.logger.Warn(msg)
+					warnings.AddVeleroError(errors.New(msg))
+				}
+				for _, req := range remainingOwnerPatches {
+					hasAPIError := false
+					if req.Namespace == "" {
+						for _, msg := range remapWarnings.Cluster {
+							if strings.Contains(msg, req.Name) {
+								hasAPIError = true
+								break
+							}
+						}
+					} else if remapWarnings.Namespaces != nil {
+						for _, msg := range remapWarnings.Namespaces[req.Namespace] {
+							if strings.Contains(msg, req.Name) {
+								hasAPIError = true
+								break
+							}
+						}
+					}
+					if !hasAPIError {
+						warnings.Add(req.Namespace, fmt.Errorf("ownerReference on %s/%s could not be remapped: parent resource was not restored", req.Kind, req.Name))
+					}
+				}
+				for _, req := range remainingSpecPatches {
+					hasAPIError := false
+					if req.Namespace == "" {
+						for _, msg := range remapWarnings.Cluster {
+							if strings.Contains(msg, req.Name) {
+								hasAPIError = true
+								break
+							}
+						}
+					} else if remapWarnings.Namespaces != nil {
+						for _, msg := range remapWarnings.Namespaces[req.Namespace] {
+							if strings.Contains(msg, req.Name) {
+								hasAPIError = true
+								break
+							}
+						}
+					}
+					if !hasAPIError {
+						warnings.Add(req.Namespace, fmt.Errorf("spec-reference pointer on %s/%s could not be remapped: target resource was not restored", req.Kind, req.Name))
+					}
+				}
+			}
+			ctx.ownerRefRemapTracker.Delete(ctx.restore.Name)
+		}
+	}
 
 	return warnings, errs
 }

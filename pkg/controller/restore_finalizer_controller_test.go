@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	testclocks "k8s.io/utils/clock/testing"
@@ -37,6 +38,7 @@ import (
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
@@ -144,6 +146,7 @@ func TestRestoreFinalizerReconcile(t *testing.T) {
 				fakeClient,
 				hook.NewMultiHookTracker(),
 				10*time.Minute,
+				nil,
 			)
 			r.clock = testclocks.NewFakeClock(now)
 
@@ -208,6 +211,7 @@ func TestUpdateResult(t *testing.T) {
 		fakeClient,
 		hook.NewMultiHookTracker(),
 		10*time.Minute,
+		nil,
 	)
 	restore := builder.ForRestore(velerov1api.DefaultNamespace, "restore-1").Result()
 	res := map[string]results.Result{"warnings": {}, "errors": {}}
@@ -1170,4 +1174,240 @@ func TestCleanupStubVGSC(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOwnerRefRemappingPass2(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	// Create child and cluster object in fake client
+	childObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-pass2",
+				"namespace": "default",
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), childObj))
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-pass2",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	tracker := ownerref.NewOwnerRefRemapTracker()
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-parent-uid", "new-parent-uid")
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-pass2",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "MachineSet",
+				Name:       "ms-1",
+				UID:        "old-parent-uid",
+			},
+		},
+	}
+	state.EnqueueOwnerPatch(req)
+	state.RecordQuiescedObject(ownerref.QuiescedObjectRecord{
+		Group:              "cluster.x-k8s.io",
+		Version:            "v1beta1",
+		Kind:               "Cluster",
+		Namespace:          "default",
+		Name:               "cluster-pass2",
+		AnnotationKey:      "cluster.x-k8s.io/paused",
+		OriginallyQuiesced: false,
+	})
+
+	restoreName := "restore-pass2"
+	tracker.Set(restoreName, state)
+
+	finalizerCtx := &finalizerContext{
+		logger:               logger,
+		restore:              builder.ForRestore("default", restoreName).Result(),
+		crClient:             fakeClient,
+		multiHookTracker:     hook.NewMultiHookTracker(),
+		resourceTimeout:      10 * time.Second,
+		ownerRefRemapTracker: tracker,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs := finalizerCtx.execute()
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	// Tracker entry must be deleted after Pass 2
+	assert.Nil(t, tracker.Get(restoreName))
+
+	// Child object must have remapped ownerReference
+	liveChild := &unstructured.Unstructured{}
+	liveChild.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Machine"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "worker-pass2"}, liveChild)
+	require.NoError(t, err)
+	require.Len(t, liveChild.GetOwnerReferences(), 1)
+	assert.Equal(t, types.UID("new-parent-uid"), liveChild.GetOwnerReferences()[0].UID)
+
+	// Cluster object must be unquiesced (pause annotation removed)
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err = fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-pass2"}, liveCluster)
+	require.NoError(t, err)
+	assert.NotContains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+}
+
+func TestOwnerRefRemappingPass2_UnresolvedWarning(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-unresolved",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	tracker := ownerref.NewOwnerRefRemapTracker()
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	// Do NOT register UID mapping for old-parent-uid; parent was missing/omitted
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-unresolved",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "MachineSet",
+				Name:       "ms-missing",
+				UID:        "old-parent-uid",
+			},
+		},
+	}
+	state.EnqueueOwnerPatch(req)
+	state.RecordQuiescedObject(ownerref.QuiescedObjectRecord{
+		Group:              "cluster.x-k8s.io",
+		Version:            "v1beta1",
+		Kind:               "Cluster",
+		Namespace:          "default",
+		Name:               "cluster-unresolved",
+		AnnotationKey:      "cluster.x-k8s.io/paused",
+		OriginallyQuiesced: false,
+	})
+
+	restoreName := "restore-unresolved"
+	tracker.Set(restoreName, state)
+
+	finalizerCtx := &finalizerContext{
+		logger:               logger,
+		restore:              builder.ForRestore("default", restoreName).Result(),
+		crClient:             fakeClient,
+		multiHookTracker:     hook.NewMultiHookTracker(),
+		resourceTimeout:      10 * time.Second,
+		ownerRefRemapTracker: tracker,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs := finalizerCtx.execute()
+	assert.True(t, errs.IsEmpty())
+	// Must emit a warning about unresolved ownerReferences keeping objects quiesced
+	require.NotEmpty(t, warnings.Velero)
+	assert.Contains(t, warnings.Velero[0], "Quiesced objects remain paused")
+
+	// Cluster object must REMAIN quiesced (safe fail-stop)
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-unresolved"}, liveCluster)
+	require.NoError(t, err)
+	assert.Contains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+}
+
+func TestOwnerRefRemappingPass2_OriginallyQuiescedNoFalseAlarm(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	tracker := ownerref.NewOwnerRefRemapTracker()
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-unresolved",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "MachineSet",
+				Name:       "ms-missing",
+				UID:        "old-parent-uid",
+			},
+		},
+	}
+	state.EnqueueOwnerPatch(req)
+	// Object was originally paused in production (OriginallyQuiesced: true)
+	state.RecordQuiescedObject(ownerref.QuiescedObjectRecord{
+		Group:              "cluster.x-k8s.io",
+		Version:            "v1beta1",
+		Kind:               "Cluster",
+		Namespace:          "default",
+		Name:               "cluster-prepaused",
+		AnnotationKey:      "cluster.x-k8s.io/paused",
+		OriginallyQuiesced: true,
+	})
+
+	restoreName := "restore-prepaused"
+	tracker.Set(restoreName, state)
+
+	finalizerCtx := &finalizerContext{
+		logger:               logger,
+		restore:              builder.ForRestore("default", restoreName).Result(),
+		crClient:             fakeClient,
+		multiHookTracker:     hook.NewMultiHookTracker(),
+		resourceTimeout:      10 * time.Second,
+		ownerRefRemapTracker: tracker,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs := finalizerCtx.execute()
+	assert.True(t, errs.IsEmpty())
+	// Should NOT emit false-alarm Velero warning about manual unquiescing required
+	assert.Empty(t, warnings.Velero, "no manual unquiescing warning should be emitted for objects originally paused pre-backup")
+	// But should emit normal namespace warning that parent resource was not restored
+	require.NotEmpty(t, warnings.Namespaces["default"])
+	assert.Contains(t, warnings.Namespaces["default"][0], "parent resource was not restored")
 }

@@ -57,6 +57,7 @@ import (
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/storage"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -839,6 +840,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 	}
 
 	multiHookTracker := hook.NewMultiHookTracker()
+	ownerRefRemapTracker := ownerref.NewOwnerRefRemapTracker()
 
 	if _, ok := enabledRuntimeControllers[constant.ControllerRestore]; ok {
 		restorer, err := restore.NewKubernetesRestorer(
@@ -883,6 +885,8 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.crClient,
 			s.config.ResourceTimeout,
 			s.config.DefaultResourceModifierConfigMap,
+			ownerRefRemapTracker,
+			s.config.OwnerRefConfigMap,
 		)
 
 		if err = r.SetupWithManager(s.mgr); err != nil {
@@ -919,6 +923,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.crClient,
 			multiHookTracker,
 			s.config.ResourceTimeout,
+			ownerRefRemapTracker,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerRestoreFinalizer)
 		}

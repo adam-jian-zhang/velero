@@ -148,6 +148,13 @@ type RestoreSpec struct {
 	// +nullable
 	SkipDefaultResourceModifier *bool `json:"skipDefaultResourceModifier,omitempty"`
 
+	// OwnerRefConfigMap specifies an optional ConfigMap reference containing
+	// custom inScope GVKs, specRefPaths, and quiesceOnRestore rules for ownerReference remapping.
+	// If not set, falls back to the server-level --owner-ref-configmap or built-in defaults.
+	// +optional
+	// +nullable
+	OwnerRefConfigMap *corev1api.TypedLocalObjectReference `json:"ownerRefConfigMap,omitempty"`
+
 	// UploaderConfig specifies the configuration for the restore.
 	// +optional
 	// +nullable
