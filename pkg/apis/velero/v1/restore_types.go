@@ -148,6 +148,13 @@ type RestoreSpec struct {
 	// +nullable
 	SkipDefaultResourceModifier *bool `json:"skipDefaultResourceModifier,omitempty"`
 
+	// OwnerRefConfigMap specifies an optional ConfigMap reference containing
+	// custom inScope GVKs, specRefPaths, and quiesceOnRestore rules for ownerReference remapping.
+	// If not set, falls back to the server-level --owner-ref-configmap or built-in defaults.
+	// +optional
+	// +nullable
+	OwnerRefConfigMap *corev1api.TypedLocalObjectReference `json:"ownerRefConfigMap,omitempty"`
+
 	// UploaderConfig specifies the configuration for the restore.
 	// +optional
 	// +nullable
@@ -417,6 +424,49 @@ type RestoreStatus struct {
 	// +optional
 	// +nullable
 	HookStatus *HookStatus `json:"hookStatus,omitempty"`
+
+	// QuiescedObjects records references to resources currently paused by Velero for crash-proof unquiescing.
+	// +optional
+	// +nullable
+	QuiescedObjects []QuiescedObjectRef `json:"quiescedObjects,omitempty"`
+
+	// PendingOwnerRefPatches records items that encountered transient API errors during Pass 1 and require Pass 2 retry.
+	// +optional
+	// +nullable
+	PendingOwnerRefPatches []PendingPatchRef `json:"pendingOwnerRefPatches,omitempty"`
+}
+
+// QuiescedObjectRef records metadata about an object quiesced during restore.
+type QuiescedObjectRef struct {
+	Group              string `json:"group"`
+	Version            string `json:"version"`
+	Kind               string `json:"kind"`
+	Namespace          string `json:"namespace"`
+	Name               string `json:"name"`
+	AnnotationKey      string `json:"annotationKey,omitempty"`
+	OriginallyQuiesced bool   `json:"originallyQuiesced"`
+}
+
+// TargetRef records an owner or spec reference target for dependency matching.
+type TargetRef struct {
+	Group string `json:"group,omitempty"`
+	Kind  string `json:"kind,omitempty"`
+	Name  string `json:"name,omitempty"`
+}
+
+// PendingPatchRef records an item that requires ownerReference or specRef patching retry in Pass 2.
+type PendingPatchRef struct {
+	Group           string                  `json:"group"`
+	Version         string                  `json:"version"`
+	Kind            string                  `json:"kind"`
+	Namespace       string                  `json:"namespace"`
+	Name            string                  `json:"name"`
+	PatchType       string                  `json:"patchType,omitempty"` // "ownerRef" or "specRef"
+	OwnerReferences []metav1.OwnerReference `json:"ownerReferences,omitempty"`
+	SpecRefPaths    []string                `json:"specRefPaths,omitempty"`
+	SpecPatchJSON   string                  `json:"specPatchJSON,omitempty"`
+	Targets         []TargetRef             `json:"targets,omitempty"`
+	Error           string                  `json:"error,omitempty"`
 }
 
 // RestoreProgress stores information about the restore's execution progress

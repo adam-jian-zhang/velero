@@ -80,6 +80,7 @@ func TestCreateCommand(t *testing.T) {
 		itemOperationTimeout := "10m0s"
 		resourceModifierConfigMap := "modifier-cm"
 		ResourcePoliciesConfigMap := "policies-cm"
+		ownerRefConfigMap := "ownerref-cm"
 		writeSparseFiles := "true"
 		deleteExtraFiles := "true"
 		parallel := 2
@@ -108,6 +109,7 @@ func TestCreateCommand(t *testing.T) {
 		flags.Parse([]string{"--item-operation-timeout", itemOperationTimeout})
 		flags.Parse([]string{"--resource-modifier-configmap", resourceModifierConfigMap})
 		flags.Parse([]string{"--resource-policies-configmap", ResourcePoliciesConfigMap})
+		flags.Parse([]string{"--owner-ref-configmap", ownerRefConfigMap})
 		flags.Parse([]string{"--skip-default-resource-modifier"})
 		flags.Parse([]string{"--write-sparse-files", writeSparseFiles})
 		flags.Parse([]string{"--delete-extra-files", deleteExtraFiles})
@@ -151,6 +153,7 @@ func TestCreateCommand(t *testing.T) {
 		require.Equal(t, itemOperationTimeout, o.ItemOperationTimeout.String())
 		require.Equal(t, resourceModifierConfigMap, o.ResourceModifierConfigMap)
 		require.Equal(t, ResourcePoliciesConfigMap, o.ResourcePoliciesConfigMap)
+		require.Equal(t, ownerRefConfigMap, o.OwnerRefConfigMap)
 		require.True(t, o.SkipDefaultResourceModifier)
 		require.Equal(t, writeSparseFiles, o.WriteSparseFiles.String())
 		require.Equal(t, parallel, o.ParallelFilesDownload)

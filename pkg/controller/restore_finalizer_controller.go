@@ -45,11 +45,13 @@ import (
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	serverconfig "github.com/vmware-tanzu/velero/pkg/cmd/server/config"
 	"github.com/vmware-tanzu/velero/pkg/constant"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	pkgrestore "github.com/vmware-tanzu/velero/pkg/restore"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/util/results"
@@ -179,15 +181,16 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	finalizerCtx := &finalizerContext{
-		logger:             log,
-		backupStore:        backupStore,
-		restore:            restore,
-		crClient:           r.crClient,
-		backupVolumeInfos:  backupVolumeInfos,
-		restoreVolumeInfos: restoreVolumeInfos,
-		restoredPVCList:    restoredPVCList,
-		multiHookTracker:   r.multiHookTracker,
-		resourceTimeout:    r.resourceTimeout,
+		ctx:                      ctx,
+		logger:                   log,
+		backupStore:              backupStore,
+		restore:                  restore,
+		crClient:                 r.crClient,
+		backupVolumeInfos:        backupVolumeInfos,
+		restoreVolumeInfos:       restoreVolumeInfos,
+		restoredPVCList:          restoredPVCList,
+		multiHookTracker:         r.multiHookTracker,
+		resourceTimeout:          r.resourceTimeout,
 		restoreItemOperationList: restoreItemOperationList{
 			items: restoreItemOperations,
 		},
@@ -297,6 +300,7 @@ func (r *restoreItemOperationList) SelectByPVC(ns, name string) []*itemoperation
 // finalizerContext includes all the dependencies required by finalization tasks and
 // a function execute() to orderly implement task logic.
 type finalizerContext struct {
+	ctx                      context.Context
 	logger                   logrus.FieldLogger
 	restore                  *velerov1api.Restore
 	crClient                 client.Client
@@ -326,6 +330,55 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 
 	rehErrs := ctx.WaitRestoreExecHook()
 	errs.Merge(&rehErrs)
+
+	// Phase 1B (Pass 2 - Safety Net / Catch-up):
+	ownerRefEnabled := features.IsEnabled(velerov1api.OwnerRefRemapFeatureFlag) || ctx.restore.Spec.OwnerRefConfigMap != nil
+	if ownerRefEnabled && (len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || len(ctx.restore.Status.QuiescedObjects) > 0) && ctx.crClient != nil {
+		remapCtx := ctx.ctx
+		if remapCtx == nil {
+			remapCtx = context.Background()
+		}
+		if ctx.resourceTimeout > 0 {
+			var cancel context.CancelFunc
+			remapCtx, cancel = context.WithTimeout(remapCtx, ctx.resourceTimeout)
+			defer cancel()
+		}
+
+		// 1. Retry transiently failed patches:
+		if len(ctx.restore.Status.PendingOwnerRefPatches) > 0 {
+			retryWarnings, remainingPending := pkgrestore.RetryPendingPatches(remapCtx, ctx.logger, ctx.crClient, ctx.restore, ctx.restore.Status.PendingOwnerRefPatches)
+			warnings.Merge(&retryWarnings)
+			ctx.restore.Status.PendingOwnerRefPatches = remainingPending
+		}
+
+		// 2. Unquiesce eligible objects via graph-free check against remaining pending patches:
+		if len(ctx.restore.Status.QuiescedObjects) > 0 {
+			stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restore.Status.QuiescedObjects, ctx.restore.Status.PendingOwnerRefPatches)
+			warnings.Merge(&unquiesceWarnings)
+			ctx.restore.Status.QuiescedObjects = stillQuiesced
+		}
+
+		// 3. Strict Terminal Completion Invariant:
+		// If both queues are empty -> restore proceeds to Completed.
+		// If any remain -> add fatal error to errs.Velero (forcing PartiallyFailed), log kubectl unpause commands, and retain status entries in etcd.
+		if len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || len(ctx.restore.Status.QuiescedObjects) > 0 {
+			msg := fmt.Sprintf("Restore finalization encountered %d unresolvable patches and left %d objects paused to prevent cascading controller failures. Check restore.status.pendingOwnerRefPatches and restore.status.quiescedObjects for details.",
+				len(ctx.restore.Status.PendingOwnerRefPatches), len(ctx.restore.Status.QuiescedObjects))
+			ctx.logger.Error(msg)
+			for _, q := range ctx.restore.Status.QuiescedObjects {
+				if !q.OriginallyQuiesced && q.AnnotationKey != "" {
+					if q.Namespace != "" {
+						ctx.logger.Errorf("To manually unpause %s/%s: kubectl annotate %s %s %s- -n %s",
+							q.Kind, q.Name, q.Kind, q.Name, q.AnnotationKey, q.Namespace)
+					} else {
+						ctx.logger.Errorf("To manually unpause %s: kubectl annotate %s %s %s-",
+							q.Name, q.Kind, q.Name, q.AnnotationKey)
+					}
+				}
+			}
+			errs.AddVeleroError(errors.New(msg))
+		}
+	}
 
 	return warnings, errs
 }
@@ -591,6 +644,9 @@ func needPatch(newPV *corev1api.PersistentVolume, pvInfo *volume.PVInfo) bool {
 }
 
 func (ctx *finalizerContext) updateVolumeInfos() (errs results.Result) {
+	if ctx.backupStore == nil || ctx.crClient == nil {
+		return errs
+	}
 	dataDownloads := &velerov2alpha1.DataDownloadList{}
 	if err := ctx.crClient.List(context.Background(), dataDownloads, client.InNamespace(ctx.restore.Namespace), client.MatchingLabels{velerov1api.RestoreNameLabel: ctx.restore.Name}); err != nil {
 		errs.Add("cluster", errors.Wrapf(err, "failed to list data downloads of restore %s", ctx.restore.Name))

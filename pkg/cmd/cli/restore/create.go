@@ -113,6 +113,7 @@ type CreateOptions struct {
 	ItemOperationTimeout        time.Duration
 	ResourceModifierConfigMap   string
 	ResourcePoliciesConfigMap   string
+	OwnerRefConfigMap           string
 	SkipDefaultResourceModifier bool
 	WriteSparseFiles            flag.OptionalBool
 	ParallelFilesDownload       int
@@ -172,6 +173,8 @@ func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&o.ResourceModifierConfigMap, "resource-modifier-configmap", "", "Reference to the resource modifier configmap that restore will use")
 
 	flags.StringVar(&o.ResourcePoliciesConfigMap, "resource-policies-configmap", "", "Reference to the ConfigMap containing restore resource filter policies")
+
+	flags.StringVar(&o.OwnerRefConfigMap, "owner-ref-configmap", "", "Reference to a ConfigMap containing custom inScope GVKs, specRefPaths, and quiesce rules for ownerReference remapping")
 
 	flags.BoolVar(&o.SkipDefaultResourceModifier, "skip-default-resource-modifier", false, "Skip applying the server-configured default resource modifier for this restore")
 
@@ -347,6 +350,16 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		}
 	}
 
+	var ownerRefConfigMap *corev1api.TypedLocalObjectReference
+
+	if o.OwnerRefConfigMap != "" {
+		ownerRefConfigMap = &corev1api.TypedLocalObjectReference{
+			APIGroup: &corev1api.SchemeGroupVersion.Group,
+			Kind:     "ConfigMap",
+			Name:     o.OwnerRefConfigMap,
+		}
+	}
+
 	restore := &api.Restore{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   f.Namespace(),
@@ -371,6 +384,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 			IncludeClusterResources:  o.IncludeClusterResources.Value,
 			ResourceModifier:         resModifiers,
 			ResourcePolicy:           resPolicies,
+			OwnerRefConfigMap:        ownerRefConfigMap,
 			ItemOperationTimeout: metav1.Duration{
 				Duration: o.ItemOperationTimeout,
 			},
