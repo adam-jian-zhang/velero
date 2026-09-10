@@ -469,3 +469,63 @@ func TestDescribeRestore(t *testing.T) {
 	assert.Contains(t, out, "Existing Resource Policy:      update")
 	assert.Contains(t, out, "Existing Volume Data Policy:   full")
 }
+
+func TestDescribeRestore_OwnerReferenceRelinking_QualifiedRemediation(t *testing.T) {
+	kbClient := velerotest.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "test-restore").
+		Backup("test-backup").
+		Result()
+
+	restore.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "prod-ns",
+			Name:          "prod-cluster",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+		{
+			Group:         "",
+			Version:       "v1",
+			Kind:          "ConfigMap",
+			Namespace:     "",
+			Name:          "cluster-cm",
+			AnnotationKey: "example.io/paused",
+		},
+	}
+
+	out := DescribeRestore(context.Background(), kbClient, restore, nil, false, false, "")
+	assert.Contains(t, out, "kubectl annotate Cluster.cluster.x-k8s.io -n prod-ns prod-cluster cluster.x-k8s.io/paused- velero.io/quiesced-key-")
+	assert.Contains(t, out, "kubectl label Cluster.cluster.x-k8s.io -n prod-ns prod-cluster velero.io/quiesced-by-restore-")
+	assert.Contains(t, out, "kubectl annotate ConfigMap cluster-cm example.io/paused- velero.io/quiesced-key-")
+	assert.Contains(t, out, "kubectl label ConfigMap cluster-cm velero.io/quiesced-by-restore-")
+}
+
+func TestDescribeRestore_OwnerReferenceRelinking_OverflowConfigMap(t *testing.T) {
+	kbClient := velerotest.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "test-restore").
+		Backup("test-backup").
+		Result()
+
+	restore.Status.PendingPatchesConfigMap = "test-restore-pending-patches"
+	restore.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "machine-0001",
+			PatchType: "ownerRef",
+		},
+	}
+
+	// Plain text output
+	out := DescribeRestore(context.Background(), kbClient, restore, nil, false, false, "")
+	assert.Contains(t, out, "Overflow ConfigMap:  test-restore-pending-patches")
+	assert.Contains(t, out, "machine-0001")
+
+	// Structured JSON output
+	jsonOut := DescribeRestoreInSF(context.Background(), kbClient, restore, nil, false, false, "", "json")
+	assert.Contains(t, jsonOut, `"pendingPatchesConfigMap": "test-restore-pending-patches"`)
+}

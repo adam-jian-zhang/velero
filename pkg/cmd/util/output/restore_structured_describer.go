@@ -79,6 +79,8 @@ func DescribeRestoreInSF(
 
 		describeRestoreItemOperationsInSF(ctx, kbClient, d, restore, details, insecureSkipTLSVerify, caCertFile)
 
+		describeOwnerRefRelinkingInSF(d, restore)
+
 		if restore.Status.HookStatus != nil {
 			hookStatus := map[string]any{
 				"hooksAttempted": restore.Status.HookStatus.HooksAttempted,
@@ -231,7 +233,67 @@ func describeRestoreSpecInSF(d *StructuredDescriber, spec velerov1api.RestoreSpe
 		specInfo["uploaderConfig"] = uploaderConfig
 	}
 
+	if spec.OwnerRefConfigMap != nil && spec.OwnerRefConfigMap.Name != "" {
+		specInfo["ownerRefConfigMap"] = spec.OwnerRefConfigMap.Name
+	}
+
 	d.Describe("spec", specInfo)
+}
+
+func describeOwnerRefRelinkingInSF(d *StructuredDescriber, restore *velerov1api.Restore) {
+	if restore == nil {
+		return
+	}
+	hasConfig := restore.Spec.OwnerRefConfigMap != nil && restore.Spec.OwnerRefConfigMap.Name != ""
+	hasStatus := restore.Status.OwnerRefsRelinked > 0 ||
+		restore.Status.SpecRefsRelinked > 0 ||
+		len(restore.Status.QuiescedObjects) > 0 ||
+		len(restore.Status.PendingOwnerRefPatches) > 0 ||
+		restore.Status.PendingPatchesConfigMap != ""
+	if !hasConfig && !hasStatus {
+		return
+	}
+
+	info := map[string]any{
+		"relinkedOwnerRefs": restore.Status.OwnerRefsRelinked,
+		"relinkedSpecRefs":  restore.Status.SpecRefsRelinked,
+	}
+	if hasConfig {
+		info["configMap"] = restore.Spec.OwnerRefConfigMap.Name
+	}
+	if len(restore.Status.QuiescedObjects) > 0 {
+		quiesced := make([]map[string]any, 0, len(restore.Status.QuiescedObjects))
+		for _, q := range restore.Status.QuiescedObjects {
+			quiesced = append(quiesced, map[string]any{
+				"group":            q.Group,
+				"version":          q.Version,
+				"kind":             q.Kind,
+				"namespace":        q.Namespace,
+				"name":             q.Name,
+				"annotationKey":    q.AnnotationKey,
+				"unquiesceBlocked": q.UnquiesceBlocked,
+			})
+		}
+		info["quiescedObjects"] = quiesced
+	}
+	if len(restore.Status.PendingOwnerRefPatches) > 0 {
+		pending := make([]map[string]any, 0, len(restore.Status.PendingOwnerRefPatches))
+		for _, p := range restore.Status.PendingOwnerRefPatches {
+			pending = append(pending, map[string]any{
+				"group":     p.Group,
+				"version":   p.Version,
+				"kind":      p.Kind,
+				"namespace": p.Namespace,
+				"name":      p.Name,
+				"patchType": p.PatchType,
+			})
+		}
+		info["pendingPatches"] = pending
+	}
+	if restore.Status.PendingPatchesConfigMap != "" {
+		info["pendingPatchesConfigMap"] = restore.Status.PendingPatchesConfigMap
+	}
+	d.Describe("ownerReferenceRelinking", info)
 }
 
 func describeResourceModifierInSF(resModifier *corev1api.TypedLocalObjectReference) map[string]any {

@@ -153,6 +153,14 @@ type RestoreSpec struct {
 	// +nullable
 	SkipDefaultResourceModifier *bool `json:"skipDefaultResourceModifier,omitempty"`
 
+	// OwnerRefConfigMap specifies an optional ConfigMap reference containing
+	// custom inScope GVKs, specRefPaths, and quiesceOnRestore rules for ownerReference remapping.
+	// If not set, falls back to the server-level --owner-ref-configmap or built-in defaults.
+	// Set via velero restore create --owner-ref-restore-configmap.
+	// +optional
+	// +nullable
+	OwnerRefConfigMap *corev1api.TypedLocalObjectReference `json:"ownerRefConfigMap,omitempty"`
+
 	// UploaderConfig specifies the configuration for the restore.
 	// +optional
 	// +nullable
@@ -357,6 +365,17 @@ const (
 	VolumeDataPolicyTypeIncremental VolumeDataPolicyType = "incremental"
 )
 
+const (
+	// MaxPendingPatches defines the maximum number of pending patches kept inline in Restore.Status
+	// to prevent etcd 1.5MB request limit issues. Excess patches spill over to an ephemeral ConfigMap.
+	MaxPendingPatches = 500
+
+	// MaxTotalPendingPatches is the hard cap on Status + overflow ConfigMap pending patches.
+	// Items beyond this count are dropped, overflow roots are blocked, and the restore
+	// is forced PartiallyFailed without unpausing. This design uses a single overflow ConfigMap.
+	MaxTotalPendingPatches = 10000
+)
+
 // RestoreStatus captures the current status of a Velero restore
 type RestoreStatus struct {
 	// Phase is the current state of the Restore
@@ -422,6 +441,66 @@ type RestoreStatus struct {
 	// +optional
 	// +nullable
 	HookStatus *HookStatus `json:"hookStatus,omitempty"`
+
+	// QuiescedObjects records resources Velero paused on create and has not yet unpaused.
+	// Originally-paused production objects are never recorded here.
+	// +optional
+	// +nullable
+	QuiescedObjects []QuiescedObjectRef `json:"quiescedObjects,omitempty"`
+
+	// PendingOwnerRefPatches records items that encountered transient API errors during Pass 1 and require Pass 2 retry.
+	// Up to MaxPendingPatches (500) items are kept inline.
+	// +optional
+	// +nullable
+	PendingOwnerRefPatches []PendingPatchRef `json:"pendingOwnerRefPatches,omitempty"`
+
+	// PendingPatchesConfigMap names the single ephemeral overflow ConfigMap in the Velero namespace
+	// (`<restore-name>-pending-patches`, gzipped binaryData["patches.json.gz"]) storing items
+	// 501 through MaxTotalPendingPatches. Gzip plus key must be ≤ 1 MiB; oversize, create/update
+	// failure after retry, or items beyond MaxTotalPendingPatches drop those patches, block roots,
+	// and force PartiallyFailed without unpausing.
+	// +optional
+	PendingPatchesConfigMap string `json:"pendingPatchesConfigMap,omitempty"`
+
+	// OwnerRefsRelinked is the count of objects whose ownerReferences were successfully patched.
+	// +optional
+	OwnerRefsRelinked int `json:"ownerRefsRelinked,omitempty"`
+
+	// SpecRefsRelinked is the count of objects whose specRefPaths were successfully patched.
+	// +optional
+	SpecRefsRelinked int `json:"specRefsRelinked,omitempty"`
+}
+
+// QuiescedObjectRef records metadata about an object Velero paused during restore.
+type QuiescedObjectRef struct {
+	Group            string `json:"group"`
+	Version          string `json:"version"`
+	Kind             string `json:"kind"`
+	Namespace        string `json:"namespace"`
+	Name             string `json:"name"`
+	AnnotationKey    string `json:"annotationKey,omitempty"`
+	UnquiesceBlocked bool   `json:"unquiesceBlocked,omitempty"`
+}
+
+// TargetRef records an owner or spec reference target for dependency matching.
+type TargetRef struct {
+	Group     string `json:"group,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
+}
+
+// PendingPatchRef records an item that requires ownerReference or specRef patching retry in Pass 2.
+type PendingPatchRef struct {
+	Group           string                  `json:"group"`
+	Version         string                  `json:"version"`
+	Kind            string                  `json:"kind"`
+	Namespace       string                  `json:"namespace"`
+	Name            string                  `json:"name"`
+	PatchType       string                  `json:"patchType,omitempty"` // "ownerRef" or "specRef"
+	OwnerReferences []metav1.OwnerReference `json:"ownerReferences,omitempty"`
+	SpecPatchJSON   string                  `json:"specPatchJSON,omitempty"`
+	Targets         []TargetRef             `json:"targets,omitempty"`
 }
 
 // RestoreProgress stores information about the restore's execution progress
