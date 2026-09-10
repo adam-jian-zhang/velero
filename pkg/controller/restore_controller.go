@@ -43,11 +43,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/resourcemodifiers"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/constant"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
@@ -97,6 +99,10 @@ var nonRestorableResources = []string{
 
 var ExternalResourcesFinalizer = "restores.velero.io/external-resources-finalizer"
 
+const (
+	defaultOwnerRefConfigMap = ownerref.DefaultConfigMapName
+)
+
 type restoreReconciler struct {
 	ctx                         context.Context
 	namespace                   string
@@ -116,6 +122,7 @@ type restoreReconciler struct {
 	globalCrClient                   client.Client
 	resourceTimeout                  time.Duration
 	defaultResourceModifierConfigMap string
+	ownerRefConfigMap                string
 }
 
 type backupInfo struct {
@@ -140,6 +147,7 @@ func NewRestoreReconciler(
 	globalCrClient client.Client,
 	resourceTimeout time.Duration,
 	defaultResourceModifierConfigMap string,
+	ownerRefConfigMap string,
 ) *restoreReconciler {
 	r := &restoreReconciler{
 		ctx:                         ctx,
@@ -163,6 +171,7 @@ func NewRestoreReconciler(
 		globalCrClient:                   globalCrClient,
 		resourceTimeout:                  resourceTimeout,
 		defaultResourceModifierConfigMap: defaultResourceModifierConfigMap,
+		ownerRefConfigMap:                ownerRefConfigMap,
 	}
 
 	// Move the periodical backup and restore metrics computing logic from controllers to here.
@@ -240,7 +249,7 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	original := restore.DeepCopy()
 
 	// Validate the restore and fetch the backup
-	info, resourceModifiers, restoreResPolicies := r.validateAndComplete(ctx, restore)
+	info, resourceModifiers, restoreResPolicies, ownerRefScope := r.validateAndComplete(ctx, restore)
 
 	// Register attempts after validation so we don't have to fetch the backup multiple times
 	backupScheduleName := restore.Spec.ScheduleName
@@ -279,7 +288,7 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.runValidatedRestore(restore, info, resourceModifiers, restoreResPolicies); err != nil {
+	if err := r.runValidatedRestore(restore, info, resourceModifiers, restoreResPolicies, ownerRefScope); err != nil {
 		log.WithError(err).Debug("Restore failed")
 		restore.Status.Phase = api.RestorePhaseFailed
 		restore.Status.FailureReason = fmt.Sprintf("restore execution failed: %v", err)
@@ -315,7 +324,7 @@ func (r *restoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *api.Restore) (backupInfo, *resourcemodifiers.ResourceModifiers, *resourcepolicies.Policies) {
+func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *api.Restore) (backupInfo, *resourcemodifiers.ResourceModifiers, *resourcepolicies.Policies, *ownerref.Scope) {
 	// add non-restorable resources to restore's excluded resources
 	excludedResources := sets.NewString(restore.Spec.ExcludedResources...)
 	for _, nonrestorable := range nonRestorableResources {
@@ -350,7 +359,7 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 	// validate that exactly one of BackupName and ScheduleName have been specified
 	if !backupXorScheduleProvided(restore) {
 		restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "Either a backup or schedule must be specified as a source for the restore, but not both")
-		return backupInfo{}, nil, nil
+		return backupInfo{}, nil, nil, nil
 	}
 
 	// validate Restore Init Hook's InitContainers
@@ -391,7 +400,7 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 		backupList := &api.BackupList{}
 		if err := r.kbClient.List(ctx, backupList, &client.ListOptions{LabelSelector: selector}); err != nil {
 			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "Unable to list backups for schedule")
-			return backupInfo{}, nil, nil
+			return backupInfo{}, nil, nil, nil
 		}
 		if len(backupList.Items) == 0 {
 			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "No backups found for schedule")
@@ -401,19 +410,19 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 			restore.Spec.BackupName = backup.Name
 		} else {
 			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "No completed backups found for schedule")
-			return backupInfo{}, nil, nil
+			return backupInfo{}, nil, nil, nil
 		}
 	}
 
 	info, err := r.fetchBackupInfo(restore.Spec.BackupName)
 	if err != nil {
 		restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, fmt.Sprintf("Error retrieving backup: %v", err))
-		return backupInfo{}, nil, nil
+		return backupInfo{}, nil, nil, nil
 	}
 
 	if !veleroutil.BSLIsAvailable(*info.location) {
 		restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, fmt.Sprintf("The BSL %s is unavailable, cannot retrieve the backup", info.location.Name))
-		return backupInfo{}, nil, nil
+		return backupInfo{}, nil, nil, nil
 	}
 
 	// reject restores from backups that are not in a usable phase
@@ -424,7 +433,7 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 		restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
 			fmt.Sprintf("backup %q is in phase %q and cannot be used as a restore source",
 				info.backup.Name, info.backup.Status.Phase))
-		return backupInfo{}, nil, nil
+		return backupInfo{}, nil, nil, nil
 	}
 
 	// Fill in the ScheduleName so it's easier to consume for metrics.
@@ -442,7 +451,7 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 			restore.Status.ValidationErrors = append(
 				restore.Status.ValidationErrors, fmt.Sprintf("invalid restore resource policies: %v", err),
 			)
-			return backupInfo{}, nil, nil
+			return backupInfo{}, nil, nil, nil
 		}
 	}
 
@@ -451,7 +460,7 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 		if strings.EqualFold(restore.Spec.ResourceModifier.Kind, resourcemodifiers.ConfigmapRefType) {
 			resourceModifiers = r.loadResourceModifierConfigMap(ctx, restore, restore.Spec.ResourceModifier.Name, false)
 			if resourceModifiers == nil && len(restore.Status.ValidationErrors) > 0 {
-				return backupInfo{}, nil, nil
+				return backupInfo{}, nil, nil, nil
 			}
 		} else {
 			r.logger.Warnf("Unsupported resource modifier kind %q, only %q is supported", restore.Spec.ResourceModifier.Kind, resourcemodifiers.ConfigmapRefType)
@@ -464,7 +473,13 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 		}
 	}
 
-	return info, resourceModifiers, restoreResPolicies
+	// Validate ownerRefConfigMap early; any errors are recorded in restore.Status.ValidationErrors
+	ownerRefScope := r.loadOwnerRefScope(ctx, restore)
+	if len(restore.Status.ValidationErrors) > 0 {
+		return backupInfo{}, nil, nil, nil
+	}
+
+	return info, resourceModifiers, restoreResPolicies, ownerRefScope
 }
 
 // loadResourceModifierConfigMap loads and validates a resource modifier ConfigMap.
@@ -511,6 +526,72 @@ func (r *restoreReconciler) loadResourceModifierConfigMap(
 	}
 	r.logger.Infof("Retrieved %s resource modifiers from configmap %s/%s", source, restore.Namespace, cmName)
 	return modifiers
+}
+
+func (r *restoreReconciler) loadOwnerRefScope(ctx context.Context, restore *api.Restore) *ownerref.Scope {
+	if !features.IsEnabled(api.OwnerRefRelinkFeatureFlag) && !features.IsEnabled("OwnerRefRemap") {
+		if restore.Spec.OwnerRefConfigMap != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("ownerRefConfigMap cannot be specified because feature flag %s is not enabled on the Velero server", api.OwnerRefRelinkFeatureFlag))
+		}
+		return nil
+	}
+
+	scope := ownerref.NewScope()
+
+	// Tier 1 (Baseline): Load from server-configured flag or conventional velero-ownerref-config
+	baselineCMName := r.ownerRefConfigMap
+	isServerFlag := true
+	if baselineCMName == "" {
+		baselineCMName = defaultOwnerRefConfigMap
+		isServerFlag = false
+	}
+
+	baselineCM := &corev1api.ConfigMap{}
+	if err := r.kbClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: baselineCMName}, baselineCM); err == nil {
+		if err := scope.MergeConfigMap(baselineCM); err != nil {
+			r.logger.WithError(err).Warnf("Error parsing baseline owner-ref configmap %s/%s, proceeding with empty baseline", restore.Namespace, baselineCMName)
+		} else {
+			r.logger.Infof("Loaded baseline owner-ref configmap %s/%s", restore.Namespace, baselineCMName)
+		}
+	} else if isServerFlag {
+		r.logger.WithError(err).Warnf("Failed to retrieve server-configured baseline owner-ref configmap %s/%s", restore.Namespace, baselineCMName)
+	}
+
+	// Tier 2 (Restore Delta): Merge per-restore ConfigMap, if specified
+	if restore.Spec.OwnerRefConfigMap != nil {
+		if restore.Spec.OwnerRefConfigMap.APIGroup != nil && *restore.Spec.OwnerRefConfigMap.APIGroup != "" {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("invalid ownerRefConfigMap: apiGroup must be empty, got %q", *restore.Spec.OwnerRefConfigMap.APIGroup))
+			return nil
+		}
+		if restore.Spec.OwnerRefConfigMap.Kind != "" && !strings.EqualFold(restore.Spec.OwnerRefConfigMap.Kind, "ConfigMap") {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("invalid ownerRefConfigMap: kind must be ConfigMap, got %q", restore.Spec.OwnerRefConfigMap.Kind))
+			// Per-restore validation failure: return nil so a caller that forgets to check
+			// ValidationErrors cannot accidentally activate the engine with bare built-in scope.
+			return nil
+		}
+		if restore.Spec.OwnerRefConfigMap.Name == "" {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "ownerRefConfigMap name cannot be empty")
+			return nil
+		}
+		restoreCMName := restore.Spec.OwnerRefConfigMap.Name
+		restoreCM := &corev1api.ConfigMap{}
+		if err := r.kbClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: restoreCMName}, restoreCM); err != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("failed to get owner-ref configmap %s/%s: %v", restore.Namespace, restoreCMName, err))
+			return nil
+		}
+		if err := scope.MergeConfigMap(restoreCM); err != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("error parsing owner-ref configmap %s/%s: %v", restore.Namespace, restoreCMName, err))
+			return nil
+		}
+		r.logger.Infof("Merged per-restore owner-ref configmap %s/%s onto baseline", restore.Namespace, restoreCMName)
+	}
+
+	return scope
 }
 
 // backupXorScheduleProvided returns true if exactly one of BackupName and
@@ -583,7 +664,13 @@ func fetchBackupInfoInternal(kbClient client.Client, namespace, backupName strin
 // The log and results files are uploaded to backup storage. Any error returned from this function
 // means that the restore failed. This function updates the restore API object with warning and error
 // counts, but *does not* update its phase or patch it via the API.
-func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backupInfo, resourceModifiers *resourcemodifiers.ResourceModifiers, restoreResPolicies *resourcepolicies.Policies) error {
+func (r *restoreReconciler) runValidatedRestore(
+	restore *api.Restore,
+	info backupInfo,
+	resourceModifiers *resourcemodifiers.ResourceModifiers,
+	restoreResPolicies *resourcepolicies.Policies,
+	ownerRefScope *ownerref.Scope,
+) error {
 	// instantiate the per-restore logger that will output both to a temp file
 	// (for upload to object storage) and to stdout.
 	restoreLog, err := logging.NewTempFileLogger(r.restoreLogLevel, r.logFormat, nil, logrus.Fields{"restore": kubeutil.NamespaceAndName(restore)})
@@ -654,6 +741,17 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 		podVolumeBackups = append(podVolumeBackups, &podVolumeBackupList.Items[i])
 	}
 
+	var ownerRefRelink *ownerref.OwnerRefRelinkState
+	ownerRefEnabled := features.IsEnabled(api.OwnerRefRelinkFeatureFlag) || features.IsEnabled("OwnerRefRemap")
+	if ownerRefEnabled {
+		if ownerRefScope == nil {
+			ownerRefScope = ownerref.NewScope()
+		}
+		ownerRefRelink = ownerref.NewOwnerRefRelinkState()
+		ownerRefRelink.Enabled = true
+		ownerRefRelink.SetScope(ownerRefScope)
+	}
+
 	restoreReq := &pkgrestore.Request{
 		Log:                           restoreLog,
 		Restore:                       restore,
@@ -668,8 +766,40 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 		BackupVolumeInfoMap:           backupVolumeInfoMap,
 		RestoreVolumeInfoTracker:      volume.NewRestoreVolInfoTracker(restore, restoreLog, r.globalCrClient),
 		ResourceDeletionStatusTracker: kubeutil.NewResourceDeletionStatusTracker(),
+		OwnerRefRelink:                ownerRefRelink,
+		OwnerRefScope:                 ownerRefScope,
 	}
 	restoreWarnings, restoreErrors := r.restorer.RestoreWithResolvers(restoreReq, actionsResolver, pluginManager)
+
+	// Phase 1B (Pass 1 - Immediate Execution):
+	// Relink ownerReferences and specRefPaths immediately in local memory.
+	patchClient := r.globalCrClient
+	if patchClient == nil {
+		patchClient = r.kbClient
+	}
+	if ownerRefEnabled && restoreReq.OwnerRefRelink != nil && restoreReq.OwnerRefRelink.Enabled && patchClient != nil {
+		remapCtx := r.ctx
+		if remapCtx == nil {
+			remapCtx = context.Background()
+		}
+		var cancel context.CancelFunc
+		if r.resourceTimeout > 0 {
+			remapCtx, cancel = context.WithTimeout(remapCtx, r.resourceTimeout)
+		}
+
+		relinkWarnings, pendingPatches := pkgrestore.ApplyOwnerRefRelinking(remapCtx, restoreLog, patchClient, restore, restoreReq.OwnerRefRelink)
+		restoreWarnings.Merge(&relinkWarnings)
+		if cancel != nil {
+			cancel()
+		}
+
+		// Persist state into Restore.Status and hybrid overflow ConfigMap for crash-proof recovery.
+		// Quiesced objects remain paused until Phase 1B Pass 2 in RestoreFinalizerController
+		// after asynchronous volume snapshot operations complete.
+		saveWarnings := pkgrestore.SavePendingPatchesHybrid(r.ctx, patchClient, restore, pendingPatches, restoreReq.OwnerRefRelink, restoreLog)
+		restoreWarnings.Merge(&saveWarnings)
+		restore.Status.QuiescedObjects = restoreReq.OwnerRefRelink.GetQuiescedObjects()
+	}
 
 	// Iterate over restore item operations and update progress.
 	// Any errors on operations at this point should be added to restore errors.
