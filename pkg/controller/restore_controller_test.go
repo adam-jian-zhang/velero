@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -39,6 +40,7 @@ import (
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	persistencemocks "github.com/vmware-tanzu/velero/pkg/persistence/mocks"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
@@ -117,6 +119,7 @@ func TestFetchBackupInfo(t *testing.T) {
 				false,
 				fakeGlobalClient,
 				10*time.Minute,
+				"",
 				"",
 			)
 
@@ -201,6 +204,7 @@ func TestProcessQueueItemSkips(t *testing.T) {
 				fakeGlobalClient,
 				10*time.Minute,
 				"",
+				"",
 			)
 
 			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{
@@ -267,6 +271,7 @@ func TestRestoreReconcile_CSISnapshotTimeoutDefaulting(t *testing.T) {
 				false,
 				fakeGlobalClient,
 				10*time.Minute,
+				"",
 				"",
 			)
 
@@ -708,6 +713,7 @@ func TestRestoreReconcile(t *testing.T) {
 				fakeGlobalClient,
 				10*time.Minute,
 				"",
+				"",
 			)
 
 			r.clock = clocktesting.NewFakeClock(now)
@@ -898,6 +904,7 @@ func TestValidateAndCompleteWhenScheduleNameSpecified(t *testing.T) {
 		fakeGlobalClient,
 		10*time.Minute,
 		"",
+		"",
 	)
 
 	restore := &velerov1api.Restore{
@@ -995,6 +1002,7 @@ func TestValidateAndCompleteWithResourcePolicySpecified(t *testing.T) {
 		false,
 		fakeGlobalClient,
 		10*time.Minute,
+		"",
 		"",
 	)
 
@@ -1126,6 +1134,7 @@ func TestValidateAndCompleteWithResourceModifierSpecified(t *testing.T) {
 		false,
 		fakeGlobalClient,
 		10*time.Minute,
+		"",
 		"",
 	)
 
@@ -1276,6 +1285,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 			fakeGlobalClient,
 			10*time.Minute,
 			defaultCM,
+			"",
 		)
 
 		location := builder.ForBackupStorageLocation("velero", "default").Provider("myCloud").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
@@ -1314,7 +1324,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.NotNil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1329,7 +1339,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("per-restore-rm", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.NotNil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1343,7 +1353,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 
 		skipTrue := true
 		restore := newRestore("", &skipTrue)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1358,7 +1368,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1367,7 +1377,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		r := setupReconciler(t, "nonexistent-cm")
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1376,7 +1386,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		r := setupReconciler(t, "")
 
 		restore := newRestore("nonexistent-cm", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.NotEmpty(t, restore.Status.ValidationErrors)
 		assert.Contains(t, restore.Status.ValidationErrors[0], "failed to get resource modifiers configmap")
@@ -1386,7 +1396,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		r := setupReconciler(t, "")
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1403,7 +1413,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 			Kind: "Secret",
 			Name: "some-secret",
 		}
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1418,7 +1428,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 		}))
 
 		restore := newRestore("", nil)
-		_, rm, _ := r.validateAndComplete(t.Context(), restore)
+		_, rm, _, _ := r.validateAndComplete(t.Context(), restore)
 		assert.Nil(t, rm)
 		assert.Empty(t, restore.Status.ValidationErrors)
 	})
@@ -1559,4 +1569,213 @@ func (r *fakeRestorer) RestoreWithResolvers(req *pkgrestore.Request,
 	r.calledWithPVBs = req.PodVolumeBackups
 
 	return res.Get(0).(results.Result), res.Get(1).(results.Result)
+}
+
+func TestLoadOwnerRefScope(t *testing.T) {
+	ctx := t.Context()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	r := &restoreReconciler{
+		kbClient: fakeClient,
+		logger:   velerotest.NewLogger(),
+	}
+
+	// Case 0: Feature flag disabled and no OwnerRefConfigMap -> returns nil (legacy mode)
+	features.NewFeatureFlagSet()
+	restoreLegacy := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-legacy"},
+	}
+	assert.Nil(t, r.loadOwnerRefScope(ctx, restoreLegacy))
+	assert.Empty(t, restoreLegacy.Status.ValidationErrors)
+
+	// Case 0b: Feature flag disabled and OwnerRefConfigMap specified -> returns nil and appends validation error
+	restoreFlagDisabledWithCM := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-disabled-with-cm"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "some-cm"},
+		},
+	}
+	assert.Nil(t, r.loadOwnerRefScope(ctx, restoreFlagDisabledWithCM))
+	require.NotEmpty(t, restoreFlagDisabledWithCM.Status.ValidationErrors)
+	assert.Contains(t, restoreFlagDisabledWithCM.Status.ValidationErrors[0], "ownerRefConfigMap cannot be specified because feature flag OwnerRefRelink is not enabled")
+
+	// Enable feature flag for subsequent test cases
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	// Case 1: Baseline conventional velero-ownerref-config loaded when feature flag enabled
+	cmBaseline, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
+	require.NoError(t, err)
+	require.NoError(t, fakeClient.Create(ctx, cmBaseline))
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-1"},
+	}
+	scope := r.loadOwnerRefScope(ctx, restore)
+	require.NotNil(t, scope)
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}))
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"}))
+
+	// Case 2: 2-Tier Union: Baseline ConfigMap (CAPI + PVC) + Per-restore OwnerRefConfigMap (custom.io)
+	cmExplicit := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "custom-scope-cm"},
+		Data: map[string]string{
+			"inScope": "- group: custom.io\n  kind: CustomKind\n",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmExplicit))
+
+	restore.Spec.OwnerRefConfigMap = &corev1api.TypedLocalObjectReference{Name: "custom-scope-cm"}
+	scope = r.loadOwnerRefScope(ctx, restore)
+	require.NotNil(t, scope)
+	// Both baseline CAPI and per-restore custom.io must be in scope!
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}), "Baseline CAPI should remain in scope")
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "CustomKind"}), "Per-restore custom.io should be unioned into scope")
+
+	// Case 3: Server default flag overriding conventional baseline name
+	restore.Spec.OwnerRefConfigMap = nil
+	cmServer := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "server-baseline-cm"},
+		Data: map[string]string{
+			"inScope": "- group: server.io\n  kind: ServerKind\n",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmServer))
+	r.ownerRefConfigMap = "server-baseline-cm"
+	scope = r.loadOwnerRefScope(ctx, restore)
+	require.NotNil(t, scope)
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "server.io", Version: "v1", Kind: "ServerKind"}))
+
+	// Reset server flag
+	r.ownerRefConfigMap = ""
+
+	// Case 4a: Per-restore OwnerRefConfigMap with non-empty APIGroup fails validation
+	invalidGroup := "custom.group"
+	restoreErrAPIGroup := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-apigroup"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				APIGroup: &invalidGroup,
+				Kind:     "ConfigMap",
+				Name:     "some-cm",
+			},
+		},
+	}
+	resScope := r.loadOwnerRefScope(ctx, restoreErrAPIGroup)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrAPIGroup.Status.ValidationErrors)
+	assert.Contains(t, restoreErrAPIGroup.Status.ValidationErrors[0], "invalid ownerRefConfigMap: apiGroup must be empty")
+
+	// Case 4b: Per-restore OwnerRefConfigMap with invalid Kind fails validation
+	restoreErrKind := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-kind"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: "Secret",
+				Name: "some-cm",
+			},
+		},
+	}
+	resScope = r.loadOwnerRefScope(ctx, restoreErrKind)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrKind.Status.ValidationErrors)
+	assert.Contains(t, restoreErrKind.Status.ValidationErrors[0], "invalid ownerRefConfigMap: kind must be ConfigMap")
+
+	// Case 4c: Per-restore OwnerRefConfigMap with empty Name fails validation
+	restoreErrName := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-name"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: "ConfigMap",
+				Name: "",
+			},
+		},
+	}
+	resScope = r.loadOwnerRefScope(ctx, restoreErrName)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrName.Status.ValidationErrors)
+	assert.Contains(t, restoreErrName.Status.ValidationErrors[0], "ownerRefConfigMap name cannot be empty")
+
+	// Case 4d: Per-restore non-existent ConfigMap records validation error and returns nil
+	restoreErrNotFound := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-not-found"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "non-existent-cm"},
+		},
+	}
+	resScope = r.loadOwnerRefScope(ctx, restoreErrNotFound)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrNotFound.Status.ValidationErrors)
+	assert.Contains(t, restoreErrNotFound.Status.ValidationErrors[0], "failed to get owner-ref configmap")
+
+	// Case 5: Per-restore invalid YAML records validation error and returns nil
+	cmInvalidYAML := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "invalid-yaml-cm"},
+		Data: map[string]string{
+			"inScope": ":::malformed yaml:::",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmInvalidYAML))
+	restoreErrInvalidYAML := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-invalid-yaml"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "invalid-yaml-cm"},
+		},
+	}
+	resScope = r.loadOwnerRefScope(ctx, restoreErrInvalidYAML)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrInvalidYAML.Status.ValidationErrors)
+	assert.Contains(t, restoreErrInvalidYAML.Status.ValidationErrors[0], "error parsing owner-ref configmap")
+
+	// Case 6: Conventional ConfigMap with invalid YAML falls back to empty baseline without fatal error
+	cmConventionalInvalid := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero-bad", Name: defaultOwnerRefConfigMap},
+		Data: map[string]string{
+			"inScope": ":::invalid yaml:::",
+		},
+	}
+	require.NoError(t, fakeClient.Create(ctx, cmConventionalInvalid))
+	restoreConventionalBad := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero-bad", Name: "restore-conv-bad"},
+	}
+	scope = r.loadOwnerRefScope(ctx, restoreConventionalBad)
+	require.NotNil(t, scope)
+	// Invalid YAML was skipped, scope contains only deny list
+	assert.False(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}))
+}
+
+func TestOwnerRefStatusPersistence(t *testing.T) {
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-restore",
+			Namespace: "velero",
+		},
+	}
+	pending := []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "machine-1",
+			PatchType: "ownerRef",
+		},
+	}
+	quiesced := []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-1",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+	restore.Status.PendingOwnerRefPatches = pending
+	restore.Status.QuiescedObjects = quiesced
+
+	assert.Len(t, restore.Status.PendingOwnerRefPatches, 1)
+	assert.Len(t, restore.Status.QuiescedObjects, 1)
+	assert.Equal(t, "machine-1", restore.Status.PendingOwnerRefPatches[0].Name)
+	assert.Equal(t, "cluster-1", restore.Status.QuiescedObjects[0].Name)
 }

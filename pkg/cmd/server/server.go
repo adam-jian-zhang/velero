@@ -884,6 +884,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.crClient,
 			s.config.ResourceTimeout,
 			s.config.DefaultResourceModifierConfigMap,
+			s.config.OwnerRefConfigMap,
 		)
 
 		if err = r.SetupWithManager(s.mgr); err != nil {
@@ -920,6 +921,8 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.crClient,
 			multiHookTracker,
 			s.config.ResourceTimeout,
+			s.mgr.GetRESTMapper(),
+			s.config.OwnerRefConfigMap,
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerRestoreFinalizer)
 		}

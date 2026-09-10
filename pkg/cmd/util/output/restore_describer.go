@@ -217,6 +217,8 @@ func DescribeRestore(
 
 		describeUploaderConfigForRestore(d, restore.Spec)
 
+		describeOwnerRefRelinking(d, restore)
+
 		d.Println()
 		describeRestoreItemOperations(ctx, kbClient, d, restore, details, insecureSkipTLSVerify, caCertFile)
 
@@ -243,6 +245,98 @@ func describeUploaderConfigForRestore(d *Describer, spec velerov1api.RestoreSpec
 		}
 		if spec.UploaderConfig.ParallelFilesDownload > 0 {
 			d.Printf("\tParallel Restore:\t%d\n", spec.UploaderConfig.ParallelFilesDownload)
+		}
+	}
+}
+
+func describeOwnerRefRelinking(d *Describer, restore *velerov1api.Restore) {
+	if restore == nil {
+		return
+	}
+	hasConfig := restore.Spec.OwnerRefConfigMap != nil && restore.Spec.OwnerRefConfigMap.Name != ""
+	hasStatus := restore.Status.OwnerRefsRelinked > 0 ||
+		restore.Status.SpecRefsRelinked > 0 ||
+		len(restore.Status.QuiescedObjects) > 0 ||
+		len(restore.Status.PendingOwnerRefPatches) > 0 ||
+		restore.Status.PendingPatchesConfigMap != ""
+	if !hasConfig && !hasStatus {
+		return
+	}
+
+	d.Println()
+	d.Printf("OwnerReference Relinking:\n")
+	if hasConfig {
+		d.Printf("  ConfigMap:\t%s\n", restore.Spec.OwnerRefConfigMap.Name)
+	} else {
+		d.Printf("  ConfigMap:\t%s\n", emptyDisplay)
+	}
+	d.Printf("  Relinked OwnerRefs:\t%d items\n", restore.Status.OwnerRefsRelinked)
+	d.Printf("  Relinked SpecRefs:\t%d items\n", restore.Status.SpecRefsRelinked)
+
+	if len(restore.Status.QuiescedObjects) == 0 {
+		d.Printf("  Quiesced Resources:\tnone\n")
+	} else {
+		d.Printf("  Quiesced Resources:\n")
+		for _, q := range restore.Status.QuiescedObjects {
+			nsName := q.Name
+			if q.Namespace != "" {
+				nsName = q.Namespace + "/" + q.Name
+			}
+			paused := ""
+			if q.AnnotationKey != "" {
+				paused = fmt.Sprintf(" (paused via %s)", q.AnnotationKey)
+			}
+			if q.UnquiesceBlocked {
+				paused += " [unquiesce blocked]"
+			}
+			d.Printf("    - %s/%s/%s %s%s\n", q.Group, q.Version, q.Kind, nsName, paused)
+		}
+	}
+
+	if len(restore.Status.PendingOwnerRefPatches) == 0 && restore.Status.PendingPatchesConfigMap == "" {
+		d.Printf("  Pending Patches:\tnone\n")
+	} else {
+		d.Printf("  Pending Patches:\n")
+		if restore.Status.PendingPatchesConfigMap != "" {
+			d.Printf("    Overflow ConfigMap:\t%s\n", restore.Status.PendingPatchesConfigMap)
+		}
+		isTerminal := restore.Status.Phase == velerov1api.RestorePhaseCompleted ||
+			restore.Status.Phase == velerov1api.RestorePhasePartiallyFailed ||
+			restore.Status.Phase == velerov1api.RestorePhaseFailed
+		for _, p := range restore.Status.PendingOwnerRefPatches {
+			nsName := p.Name
+			if p.Namespace != "" {
+				nsName = p.Namespace + "/" + p.Name
+			}
+			statusText := "retrying in Pass 2"
+			if isTerminal {
+				statusText = "failed in Pass 2"
+			}
+			d.Printf("    - %s/%s/%s %s (%s: %s)\n", p.Group, p.Version, p.Kind, nsName, p.PatchType, statusText)
+		}
+	}
+
+	if len(restore.Status.QuiescedObjects) > 0 {
+		d.Printf("  Remediation:\n")
+		d.Printf("    To inspect and manually unquiesce paused objects after resolving dependencies:\n")
+		for _, q := range restore.Status.QuiescedObjects {
+			if q.AnnotationKey == "" {
+				continue
+			}
+			// Format resource as <kind>.<group> when Group is non-empty, or bare <kind> for core resources.
+			// kubectl resolves <kind>.<group> directly via discovery, avoiding pluralization issues (e.g. Ingress)
+			// and eliminating ambiguity when multiple API groups share the same Kind.
+			resource := q.Kind
+			if q.Group != "" {
+				resource = fmt.Sprintf("%s.%s", q.Kind, q.Group)
+			}
+			if q.Namespace != "" {
+				d.Printf("      kubectl annotate %s -n %s %s %s- velero.io/quiesced-key-\n", resource, q.Namespace, q.Name, q.AnnotationKey)
+				d.Printf("      kubectl label %s -n %s %s velero.io/quiesced-by-restore-\n", resource, q.Namespace, q.Name)
+			} else {
+				d.Printf("      kubectl annotate %s %s %s- velero.io/quiesced-key-\n", resource, q.Name, q.AnnotationKey)
+				d.Printf("      kubectl label %s %s velero.io/quiesced-by-restore-\n", resource, q.Name)
+			}
 		}
 	}
 }

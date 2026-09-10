@@ -46,4 +46,10 @@ const (
 
 	// APIGroupVersionsFeatureFlag is the feature flag string that defines whether or not to handle multiple API Group Versions
 	APIGroupVersionsFeatureFlag = "EnableAPIGroupVersions"
+
+	// OwnerRefRelinkFeatureFlag is the feature flag string that defines whether or not dynamic ownerReference relinking and automated quiescing are enabled.
+	OwnerRefRelinkFeatureFlag = "OwnerRefRelink"
+
+	// OwnerRefRemapFeatureFlag is a backward-compatible alias for OwnerRefRelinkFeatureFlag.
+	OwnerRefRemapFeatureFlag = OwnerRefRelinkFeatureFlag
 )

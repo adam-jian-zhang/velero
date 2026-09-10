@@ -409,6 +409,31 @@ spec:
                   x-kubernetes-map-type: atomic
                 nullable: true
                 type: array
+              ownerRefConfigMap:
+                description: |-
+                  OwnerRefConfigMap specifies an optional ConfigMap reference containing
+                  custom inScope GVKs, specRefPaths, and quiesceOnRestore rules for ownerReference remapping.
+                  If not set, falls back to the server-level --owner-ref-configmap or built-in defaults.
+                  Set via velero restore create --owner-ref-restore-configmap.
+                nullable: true
+                properties:
+                  apiGroup:
+                    description: |-
+                      APIGroup is the group for the resource being referenced.
+                      If APIGroup is not specified, the specified Kind must be in the core API group.
+                      For any other third-party types, APIGroup is required.
+                    type: string
+                  kind:
+                    description: Kind is the type of resource being referenced
+                    type: string
+                  name:
+                    description: Name is the name of resource being referenced
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+                x-kubernetes-map-type: atomic
               preserveNodePorts:
                 description: PreserveNodePorts specifies whether to restore old nodePorts
                   from backup.
@@ -562,6 +587,102 @@ spec:
                       with an error
                     type: integer
                 type: object
+              pendingOwnerRefPatches:
+                description: PendingOwnerRefPatches records items that encountered
+                  transient API errors during Pass 1 and require Pass 2 retry.
+                items:
+                  description: PendingPatchRef records an item that requires ownerReference
+                    or specRef patching retry in Pass 2.
+                  properties:
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    ownerReferences:
+                      items:
+                        description: |-
+                          OwnerReference contains enough information to let you identify an owning
+                          object. An owning object must be in the same namespace as the dependent, or
+                          be cluster-scoped, so there is no namespace field.
+                        properties:
+                          apiVersion:
+                            description: API version of the referent.
+                            type: string
+                          blockOwnerDeletion:
+                            description: |-
+                              If true, AND if the owner has the "foregroundDeletion" finalizer, then
+                              the owner cannot be deleted from the key-value store until this
+                              reference is removed.
+                              See https://kubernetes.io/docs/concepts/architecture/garbage-collection/#foreground-deletion
+                              for how the garbage collector interacts with this field and enforces the foreground deletion.
+                              Defaults to false.
+                              To set this field, a user needs "delete" permission of the owner,
+                              otherwise 422 (Unprocessable Entity) will be returned.
+                            type: boolean
+                          controller:
+                            description: If true, this reference points to the managing
+                              controller.
+                            type: boolean
+                          kind:
+                            description: |-
+                              Kind of the referent.
+                              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                            type: string
+                          name:
+                            description: |-
+                              Name of the referent.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names
+                            type: string
+                          uid:
+                            description: |-
+                              UID of the referent.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#uids
+                            type: string
+                        required:
+                        - apiVersion
+                        - kind
+                        - name
+                        - uid
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      type: array
+                    patchType:
+                      type: string
+                    specPatchJSON:
+                      type: string
+                    targets:
+                      items:
+                        description: TargetRef records an owner or spec reference
+                          target for dependency matching.
+                        properties:
+                          group:
+                            type: string
+                          kind:
+                            type: string
+                          name:
+                            type: string
+                        type: object
+                      type: array
+                    version:
+                      type: string
+                  required:
+                  - group
+                  - kind
+                  - name
+                  - namespace
+                  - version
+                  type: object
+                nullable: true
+                type: array
+              pendingPatchesConfigMap:
+                description: PendingPatchesConfigMap names an ephemeral ConfigMap
+                  storing overflow pending patches (gzipped binaryData) when total
+                  pending patches exceed MaxPendingPatches.
+                type: string
               phase:
                 description: Phase is the current state of the Restore
                 enum:
@@ -594,6 +715,45 @@ spec:
                       items to restore
                     type: integer
                 type: object
+              ownerRefsRelinked:
+                description: OwnerRefsRelinked is the count of objects whose ownerReferences
+                  were successfully patched.
+                type: integer
+              specRefsRelinked:
+                description: SpecRefsRelinked is the count of objects whose specRefPaths
+                  were successfully patched.
+                type: integer
+              quiescedObjects:
+                description: QuiescedObjects records resources Velero paused on create
+                  and has not yet unpaused. Originally-paused production objects are
+                  never recorded here.
+                items:
+                  description: QuiescedObjectRef records metadata about an object
+                    Velero paused during restore.
+                  properties:
+                    annotationKey:
+                      type: string
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    unquiesceBlocked:
+                      type: boolean
+                    version:
+                      type: string
+                  required:
+                  - group
+                  - kind
+                  - name
+                  - namespace
+                  - version
+                  type: object
+                nullable: true
+                type: array
               restoreItemOperationsAttempted:
                 description: |-
                   RestoreItemOperationsAttempted is the total number of attempted
