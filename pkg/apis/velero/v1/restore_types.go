@@ -425,7 +425,8 @@ type RestoreStatus struct {
 	// +nullable
 	HookStatus *HookStatus `json:"hookStatus,omitempty"`
 
-	// QuiescedObjects records references to resources currently paused by Velero for crash-proof unquiescing.
+	// QuiescedObjects records resources Velero paused on create and has not yet unpaused.
+	// Originally-paused production objects are never recorded here.
 	// +optional
 	// +nullable
 	QuiescedObjects []QuiescedObjectRef `json:"quiescedObjects,omitempty"`
@@ -434,17 +435,24 @@ type RestoreStatus struct {
 	// +optional
 	// +nullable
 	PendingOwnerRefPatches []PendingPatchRef `json:"pendingOwnerRefPatches,omitempty"`
+
+	// OwnerRefsRemapped is the count of objects whose ownerReferences were successfully patched.
+	// +optional
+	OwnerRefsRemapped int `json:"ownerRefsRemapped,omitempty"`
+
+	// SpecRefsRemapped is the count of objects whose specRefPaths were successfully patched.
+	// +optional
+	SpecRefsRemapped int `json:"specRefsRemapped,omitempty"`
 }
 
-// QuiescedObjectRef records metadata about an object quiesced during restore.
+// QuiescedObjectRef records metadata about an object Velero paused during restore.
 type QuiescedObjectRef struct {
-	Group              string `json:"group"`
-	Version            string `json:"version"`
-	Kind               string `json:"kind"`
-	Namespace          string `json:"namespace"`
-	Name               string `json:"name"`
-	AnnotationKey      string `json:"annotationKey,omitempty"`
-	OriginallyQuiesced bool   `json:"originallyQuiesced"`
+	Group         string `json:"group"`
+	Version       string `json:"version"`
+	Kind          string `json:"kind"`
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"`
+	AnnotationKey string `json:"annotationKey,omitempty"`
 }
 
 // TargetRef records an owner or spec reference target for dependency matching.

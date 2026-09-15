@@ -920,6 +920,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.crClient,
 			multiHookTracker,
 			s.config.ResourceTimeout,
+			s.mgr.GetRESTMapper(),
 		).SetupWithManager(s.mgr); err != nil {
 			s.logger.Fatal(err, "unable to create controller", "controller", constant.ControllerRestoreFinalizer)
 		}

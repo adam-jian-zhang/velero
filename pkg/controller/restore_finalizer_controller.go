@@ -32,6 +32,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	storagev1api "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -68,6 +69,7 @@ type restoreFinalizerReconciler struct {
 	crClient          client.Client
 	multiHookTracker  *hook.MultiHookTracker
 	resourceTimeout   time.Duration
+	restMapper        meta.RESTMapper
 }
 
 func NewRestoreFinalizerReconciler(
@@ -80,6 +82,7 @@ func NewRestoreFinalizerReconciler(
 	crClient client.Client,
 	multiHookTracker *hook.MultiHookTracker,
 	resourceTimeout time.Duration,
+	restMapper meta.RESTMapper,
 ) *restoreFinalizerReconciler {
 	return &restoreFinalizerReconciler{
 		Client:            client,
@@ -92,6 +95,7 @@ func NewRestoreFinalizerReconciler(
 		crClient:          crClient,
 		multiHookTracker:  multiHookTracker,
 		resourceTimeout:   resourceTimeout,
+		restMapper:        restMapper,
 	}
 }
 
@@ -181,16 +185,17 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	finalizerCtx := &finalizerContext{
-		ctx:                      ctx,
-		logger:                   log,
-		backupStore:              backupStore,
-		restore:                  restore,
-		crClient:                 r.crClient,
-		backupVolumeInfos:        backupVolumeInfos,
-		restoreVolumeInfos:       restoreVolumeInfos,
-		restoredPVCList:          restoredPVCList,
-		multiHookTracker:         r.multiHookTracker,
-		resourceTimeout:          r.resourceTimeout,
+		ctx:                ctx,
+		logger:             log,
+		backupStore:        backupStore,
+		restore:            restore,
+		crClient:           r.crClient,
+		backupVolumeInfos:  backupVolumeInfos,
+		restoreVolumeInfos: restoreVolumeInfos,
+		restoredPVCList:    restoredPVCList,
+		multiHookTracker:   r.multiHookTracker,
+		resourceTimeout:    r.resourceTimeout,
+		restMapper:         r.restMapper,
 		restoreItemOperationList: restoreItemOperationList{
 			items: restoreItemOperations,
 		},
@@ -311,6 +316,7 @@ type finalizerContext struct {
 	restoreItemOperationList restoreItemOperationList
 	multiHookTracker         *hook.MultiHookTracker
 	resourceTimeout          time.Duration
+	restMapper               meta.RESTMapper
 }
 
 func (ctx *finalizerContext) execute() (results.Result, results.Result) {
@@ -333,7 +339,7 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 
 	// Phase 1B (Pass 2 - Safety Net / Catch-up):
 	ownerRefEnabled := features.IsEnabled(velerov1api.OwnerRefRemapFeatureFlag) || ctx.restore.Spec.OwnerRefConfigMap != nil
-	if ownerRefEnabled && (len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || len(ctx.restore.Status.QuiescedObjects) > 0) && ctx.crClient != nil {
+	if ownerRefEnabled && ctx.crClient != nil {
 		remapCtx := ctx.ctx
 		if remapCtx == nil {
 			remapCtx = context.Background()
@@ -342,6 +348,18 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 			var cancel context.CancelFunc
 			remapCtx, cancel = context.WithTimeout(remapCtx, ctx.resourceTimeout)
 			defer cancel()
+		}
+
+		// Layer 1 leftover-pause catch-up: Status persist may have raced; labels cannot rebuild patches or uidMap.
+		if len(ctx.restore.Status.QuiescedObjects) == 0 {
+			rules := pkgrestore.LoadQuiesceRulesForCatchUp(remapCtx, ctx.crClient, ctx.restore)
+			if leftovers := pkgrestore.CatchLeftoverPausedObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restMapper, ctx.restore.Name, rules); len(leftovers) > 0 {
+				ctx.restore.Status.QuiescedObjects = leftovers
+			}
+		}
+
+		if len(ctx.restore.Status.PendingOwnerRefPatches) == 0 && len(ctx.restore.Status.QuiescedObjects) == 0 {
+			return warnings, errs
 		}
 
 		// 1. Retry transiently failed patches:
@@ -366,7 +384,7 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 				len(ctx.restore.Status.PendingOwnerRefPatches), len(ctx.restore.Status.QuiescedObjects))
 			ctx.logger.Error(msg)
 			for _, q := range ctx.restore.Status.QuiescedObjects {
-				if !q.OriginallyQuiesced && q.AnnotationKey != "" {
+				if q.AnnotationKey != "" {
 					if q.Namespace != "" {
 						ctx.logger.Errorf("To manually unpause %s/%s: kubectl annotate %s %s %s- -n %s",
 							q.Kind, q.Name, q.Kind, q.Name, q.AnnotationKey, q.Namespace)

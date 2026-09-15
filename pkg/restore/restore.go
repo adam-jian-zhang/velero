@@ -1438,6 +1438,31 @@ func ownerRefSourceNamespaces(refs []metav1.OwnerReference, srcNS string) []stri
 	return out
 }
 
+// filterDeniedPVCOwnerRefs omits PVC ownerRefs whose parent GVK is on the deny list
+// (Pod, ReplicaSet, ReplicationController, Job) so ephemeral volume PVCs are not relinked.
+func filterDeniedPVCOwnerRefs(
+	gvk schema.GroupVersionKind,
+	refs []metav1.OwnerReference,
+	sourceNS []string,
+	scope *ownerref.Scope,
+) ([]metav1.OwnerReference, []string) {
+	if scope == nil || gvk.Group != "" || gvk.Kind != "PersistentVolumeClaim" {
+		return append([]metav1.OwnerReference(nil), refs...), append([]string(nil), sourceNS...)
+	}
+	var filtered []metav1.OwnerReference
+	var filteredNS []string
+	for i, ref := range refs {
+		if scope.IsDeniedOwner(ref.APIVersion, ref.Kind) {
+			continue
+		}
+		filtered = append(filtered, ref)
+		if i < len(sourceNS) {
+			filteredNS = append(filteredNS, sourceNS[i])
+		}
+	}
+	return filtered, filteredNS
+}
+
 func (ctx *restoreContext) registerAndMaybeEnqueue(
 	itemFromBackup *unstructured.Unstructured,
 	liveObj *unstructured.Unstructured,
@@ -1460,17 +1485,20 @@ func (ctx *restoreContext) registerAndMaybeEnqueue(
 	}
 	if ctx.ownerRefScope != nil {
 		if ctx.ownerRefScope.IsInScope(gvk) && len(originalOwnerRefs) > 0 {
-			req := ownerref.OwnerPatchRequest{
-				Group:             gvk.Group,
-				Version:           gvk.Version,
-				Kind:              gvk.Kind,
-				Resource:          groupResource.Resource,
-				Namespace:         liveObj.GetNamespace(),
-				Name:              liveObj.GetName(),
-				OriginalOwnerRefs: append([]metav1.OwnerReference(nil), originalOwnerRefs...),
-				OwnerRefSourceNS:  append([]string(nil), ownerRefSourceNS...),
+			filteredRefs, filteredNS := filterDeniedPVCOwnerRefs(gvk, originalOwnerRefs, ownerRefSourceNS, ctx.ownerRefScope)
+			if len(filteredRefs) > 0 {
+				req := ownerref.OwnerPatchRequest{
+					Group:             gvk.Group,
+					Version:           gvk.Version,
+					Kind:              gvk.Kind,
+					Resource:          groupResource.Resource,
+					Namespace:         liveObj.GetNamespace(),
+					Name:              liveObj.GetName(),
+					OriginalOwnerRefs: filteredRefs,
+					OwnerRefSourceNS:  filteredNS,
+				}
+				ctx.ownerRefRemap.EnqueueOwnerPatch(req)
 			}
-			ctx.ownerRefRemap.EnqueueOwnerPatch(req)
 		}
 		if ctx.ownerRefScope.HasSpecRefPaths(gvk) {
 			req := ownerref.OwnerPatchRequest{
@@ -1995,8 +2023,10 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				if ctx.restore != nil {
 					restoreName = ctx.restore.Name
 				}
-				rec, _ := InjectQuiesceMetadata(obj, rule, restoreName, restoreLogger)
-				quiescedRecord = &rec
+				rec, injected := InjectQuiesceMetadata(obj, rule, restoreName, restoreLogger)
+				if injected {
+					quiescedRecord = &rec
+				}
 			}
 		}
 		createdObj, restoreErr = resourceClient.Create(obj)

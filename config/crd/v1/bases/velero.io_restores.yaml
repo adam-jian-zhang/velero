@@ -710,12 +710,21 @@ spec:
                       items to restore
                     type: integer
                 type: object
+              ownerRefsRemapped:
+                description: OwnerRefsRemapped is the count of objects whose ownerReferences
+                  were successfully patched.
+                type: integer
+              specRefsRemapped:
+                description: SpecRefsRemapped is the count of objects whose specRefPaths
+                  were successfully patched.
+                type: integer
               quiescedObjects:
-                description: QuiescedObjects records references to resources currently
-                  paused by Velero for crash-proof unquiescing.
+                description: QuiescedObjects records resources Velero paused on create
+                  and has not yet unpaused. Originally-paused production objects are
+                  never recorded here.
                 items:
                   description: QuiescedObjectRef records metadata about an object
-                    quiesced during restore.
+                    Velero paused during restore.
                   properties:
                     annotationKey:
                       type: string
@@ -727,8 +736,6 @@ spec:
                       type: string
                     namespace:
                       type: string
-                    originallyQuiesced:
-                      type: boolean
                     version:
                       type: string
                   required:
@@ -736,7 +743,6 @@ spec:
                   - kind
                   - name
                   - namespace
-                  - originallyQuiesced
                   - version
                   type: object
                 nullable: true

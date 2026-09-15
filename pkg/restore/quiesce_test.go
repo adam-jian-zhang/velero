@@ -56,7 +56,6 @@ func TestInjectQuiesceMetadata(t *testing.T) {
 	}
 	rec, quiesced := InjectQuiesceMetadata(objUnpaused, rule, "restore-test-1", logrus.StandardLogger())
 	assert.True(t, quiesced)
-	assert.False(t, rec.OriginallyQuiesced)
 	assert.Equal(t, "cluster.x-k8s.io/paused", rec.AnnotationKey)
 	ann := objUnpaused.GetAnnotations()
 	assert.Contains(t, ann, "cluster.x-k8s.io/paused")
@@ -80,7 +79,7 @@ func TestInjectQuiesceMetadata(t *testing.T) {
 	}
 	recPre, quiescedPre := InjectQuiesceMetadata(objPrePaused, rule, "restore-test-1", logrus.StandardLogger())
 	assert.False(t, quiescedPre)
-	assert.True(t, recPre.OriginallyQuiesced)
+	assert.Equal(t, "", recPre.AnnotationKey)
 
 	// 3. Rule with empty annotation key -> should NOT inject anything
 	emptyRule := ownerref.QuiesceRule{
@@ -94,13 +93,12 @@ func TestInjectQuiesceMetadata(t *testing.T) {
 
 func TestCanUnquiesce(t *testing.T) {
 	clusterQ := velerov1api.QuiescedObjectRef{
-		Group:              "cluster.x-k8s.io",
-		Version:            "v1beta1",
-		Kind:               "Cluster",
-		Namespace:          "default",
-		Name:               "cluster-1",
-		AnnotationKey:      "cluster.x-k8s.io/paused",
-		OriginallyQuiesced: false,
+		Group:         "cluster.x-k8s.io",
+		Version:       "v1beta1",
+		Kind:          "Cluster",
+		Namespace:     "default",
+		Name:          "cluster-1",
+		AnnotationKey: "cluster.x-k8s.io/paused",
 	}
 
 	// Case 1: No pending patches -> eligible
@@ -238,22 +236,20 @@ func TestUnquiesceEligibleObjects(t *testing.T) {
 
 	records := []velerov1api.QuiescedObjectRef{
 		{
-			Group:              "cluster.x-k8s.io",
-			Version:            "v1beta1",
-			Kind:               "Cluster",
-			Namespace:          "default",
-			Name:               "cluster-ready",
-			AnnotationKey:      "cluster.x-k8s.io/paused",
-			OriginallyQuiesced: false,
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-ready",
+			AnnotationKey: "cluster.x-k8s.io/paused",
 		},
 		{
-			Group:              "cluster.x-k8s.io",
-			Version:            "v1beta1",
-			Kind:               "Cluster",
-			Namespace:          "default",
-			Name:               "cluster-blocked",
-			AnnotationKey:      "cluster.x-k8s.io/paused",
-			OriginallyQuiesced: false,
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-blocked",
+			AnnotationKey: "cluster.x-k8s.io/paused",
 		},
 	}
 
@@ -337,27 +333,26 @@ func TestUnquiesceObjects(t *testing.T) {
 
 	records := []velerov1api.QuiescedObjectRef{
 		{
-			Group:              "cluster.x-k8s.io",
-			Version:            "v1beta1",
-			Kind:               "Cluster",
-			Namespace:          "default",
-			Name:               "cluster-auto",
-			AnnotationKey:      "cluster.x-k8s.io/paused",
-			OriginallyQuiesced: false,
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-auto",
+			AnnotationKey: "cluster.x-k8s.io/paused",
 		},
 		{
-			Group:              "cluster.x-k8s.io",
-			Version:            "v1beta1",
-			Kind:               "Cluster",
-			Namespace:          "default",
-			Name:               "cluster-pre",
-			AnnotationKey:      "cluster.x-k8s.io/paused",
-			OriginallyQuiesced: true,
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-pre",
+			AnnotationKey: "cluster.x-k8s.io/paused",
 		},
 	}
 
-	warnings := UnquiesceObjects(context.Background(), logrus.StandardLogger(), fakeClient, records)
+	failed, warnings := UnquiesceObjects(context.Background(), logrus.StandardLogger(), fakeClient, records)
 	assert.True(t, warnings.IsEmpty())
+	assert.Empty(t, failed)
 
 	// Check cluster-auto: paused annotation and tracking label should be removed, others kept
 	liveAuto := &unstructured.Unstructured{}
@@ -515,3 +510,43 @@ func TestExistingResource_QuiesceNonInterference(t *testing.T) {
 	assert.Equal(t, types.UID("live-cluster-uid-1234"), newUID)
 }
 
+func TestCatchLeftoverPausedObjects(t *testing.T) {
+	scheme := runtime.NewScheme()
+	paused := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-leftover",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					AnnotationQuiescedKey:     "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					LabelQuiescedByRestore: "rst-leftover",
+				},
+			},
+		},
+	}
+	unrelated := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-other",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "pre-existing",
+				},
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(paused, unrelated).Build()
+	rules := ownerref.BuiltInQuiesceRules()
+
+	leftover := CatchLeftoverPausedObjects(context.Background(), logrus.StandardLogger(), fakeClient, nil, "rst-leftover", rules)
+	require.Len(t, leftover, 1)
+	assert.Equal(t, "cluster-leftover", leftover[0].Name)
+	assert.Equal(t, "cluster.x-k8s.io/paused", leftover[0].AnnotationKey)
+}

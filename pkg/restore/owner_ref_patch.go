@@ -70,6 +70,7 @@ func ApplyOwnerRefRemapping(
 
 	var pendingPatches []velerov1api.PendingPatchRef
 	var remainingQueue []ownerref.OwnerPatchRequest
+	ownerRefsRemapped := 0
 
 	for _, req := range state.GetOwnerPatchQueue() {
 		remapped, err := patchOwnerReferences(ctx, log, crClient, state, req, namespaceMapping)
@@ -87,13 +88,21 @@ func ApplyOwnerRefRemapping(
 				OwnerReferences: remapped,
 				Error:           err.Error(),
 			})
+			continue
+		}
+		if len(remapped) > 0 {
+			ownerRefsRemapped++
 		}
 	}
 	state.SetOwnerPatchQueue(remainingQueue)
 
-	specWarnings, specPending := processSpecReferences(ctx, log, crClient, state, namespaceMapping)
+	specWarnings, specPending, specRefsRemapped := processSpecReferences(ctx, log, crClient, state, namespaceMapping)
 	warnings.Merge(&specWarnings)
 	pendingPatches = append(pendingPatches, specPending...)
+	if restore != nil {
+		restore.Status.OwnerRefsRemapped += ownerRefsRemapped
+		restore.Status.SpecRefsRemapped += specRefsRemapped
+	}
 	return warnings, pendingPatches
 }
 
@@ -259,6 +268,11 @@ func mergeOwnerReferences(
 			}
 		}
 		if idx >= 0 {
+			// Update the existing live reference. APIVersion is overwritten with the backup's value
+			// because matching is by Group (parsed from APIVersion) + Kind + Name: when the live ref
+			// and the backup ref share a group/kind/name but differ in version (e.g. live v1beta1 vs
+			// backup v1), restore semantics favor the backed-up relationship's version. This is safe
+			// because the API server validates ownerReference apiVersion against served versions.
 			out[idx].APIVersion = r.APIVersion
 			out[idx].UID = r.UID
 			out[idx].BlockOwnerDeletion = r.BlockOwnerDeletion
@@ -347,47 +361,66 @@ func RetryPendingPatches(
 				warnings.Add(p.Namespace, err)
 				p.Error = err.Error()
 				remainingPending = append(remainingPending, p)
-			} else {
-				log.Infof("Pass 2 retry succeeded: patched ownerReferences on %s/%s", p.Namespace, p.Name)
+		} else {
+			log.Infof("Pass 2 retry succeeded: patched ownerReferences on %s/%s", p.Namespace, p.Name)
+			if restore != nil {
+				// Increment only on Pass 2 success. Safe from double-counting because
+				// PendingOwnerRefPatches only holds items that FAILED Pass 1 (so they were not counted
+				// in restore.Status.OwnerRefsRemapped during Pass 1). A successful retry removes the
+				// item from the pending list, so it cannot be counted again on a later reconcile.
+				// If this invariant ever changes (e.g. re-queueing successful items), this counter
+				// would double-count and must be revisited.
+				restore.Status.OwnerRefsRemapped++
 			}
+		}
 
-		case "specRef":
+	case "specRef":
+			if p.SpecPatchJSON == "" {
+				err := fmt.Errorf("empty SpecPatchJSON for specRef retry on %s/%s", p.Namespace, p.Name)
+				log.WithError(err).Warnf("Pass 2 retry failed for specRef patch on %s/%s", p.Namespace, p.Name)
+				warnings.Add(p.Namespace, err)
+				p.Error = err.Error()
+				remainingPending = append(remainingPending, p)
+				continue
+			}
 			err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 				liveObj := &unstructured.Unstructured{}
 				liveObj.SetGroupVersionKind(gvk)
 				if err := crClient.Get(ctx, key, liveObj); err != nil {
 					return fmt.Errorf("get %s for specRef retry: %w", key, err)
 				}
-				if p.SpecPatchJSON != "" {
-					patchBytes := []byte(p.SpecPatchJSON)
-					// If patch payload contains a stale metadata.resourceVersion, update it to liveObj's current RV to avoid 409 conflict
-					var patchMap map[string]any
-					if err := json.Unmarshal(patchBytes, &patchMap); err == nil {
-						if meta, ok := patchMap[metadataKey].(map[string]any); ok {
-							if _, hasRV := meta[resourceVersionKey]; hasRV {
-								if rv := liveObj.GetResourceVersion(); rv != "" {
-									meta[resourceVersionKey] = rv
-								} else {
-									delete(meta, resourceVersionKey)
-								}
-								if updatedBytes, err := json.Marshal(patchMap); err == nil {
-									patchBytes = updatedBytes
-								}
+				patchBytes := []byte(p.SpecPatchJSON)
+				// If patch payload contains a stale metadata.resourceVersion, update it to liveObj's current RV to avoid 409 conflict
+				var patchMap map[string]any
+				if err := json.Unmarshal(patchBytes, &patchMap); err == nil {
+					if meta, ok := patchMap[metadataKey].(map[string]any); ok {
+						if _, hasRV := meta[resourceVersionKey]; hasRV {
+							if rv := liveObj.GetResourceVersion(); rv != "" {
+								meta[resourceVersionKey] = rv
+							} else {
+								delete(meta, resourceVersionKey)
+							}
+							if updatedBytes, err := json.Marshal(patchMap); err == nil {
+								patchBytes = updatedBytes
 							}
 						}
 					}
-					return crClient.Patch(ctx, liveObj, client.RawPatch(types.MergePatchType, patchBytes))
 				}
-				return nil
+				return crClient.Patch(ctx, liveObj, client.RawPatch(types.MergePatchType, patchBytes))
 			})
 			if err != nil {
 				log.WithError(err).Warnf("Pass 2 retry failed for specRef patch on %s/%s", p.Namespace, p.Name)
 				warnings.Add(p.Namespace, err)
 				p.Error = err.Error()
 				remainingPending = append(remainingPending, p)
-			} else {
-				log.Infof("Pass 2 retry succeeded: patched spec references on %s/%s", p.Namespace, p.Name)
+		} else {
+			log.Infof("Pass 2 retry succeeded: patched spec references on %s/%s", p.Namespace, p.Name)
+			if restore != nil {
+				// Same double-counting invariant as the ownerRef branch above: only failed Pass 1
+				// items are retried, and a successful retry removes the item from the pending list.
+				restore.Status.SpecRefsRemapped++
 			}
+		}
 		}
 	}
 

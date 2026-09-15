@@ -534,11 +534,13 @@ func (r *restoreReconciler) loadOwnerRefScope(ctx context.Context, restore *api.
 		if restore.Spec.OwnerRefConfigMap.Kind != "" && !strings.EqualFold(restore.Spec.OwnerRefConfigMap.Kind, "ConfigMap") {
 			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
 				fmt.Sprintf("invalid ownerRefConfigMap: kind must be ConfigMap, got %q", restore.Spec.OwnerRefConfigMap.Kind))
-			return ownerref.NewScope()
+			// Per-restore validation failure: return nil so a caller that forgets to check
+			// ValidationErrors cannot accidentally activate the engine with bare built-in seeds.
+			return nil
 		}
 		if restore.Spec.OwnerRefConfigMap.Name == "" {
 			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "ownerRefConfigMap name cannot be empty")
-			return ownerref.NewScope()
+			return nil
 		}
 		cmName = restore.Spec.OwnerRefConfigMap.Name
 		isPerRestore = true
@@ -552,9 +554,9 @@ func (r *restoreReconciler) loadOwnerRefScope(ctx context.Context, restore *api.
 			if isPerRestore {
 				restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
 					fmt.Sprintf("failed to get owner-ref configmap %s/%s: %v", restore.Namespace, cmName, err))
-			} else {
-				r.logger.WithError(err).Warnf("Failed to retrieve default owner-ref configmap %s/%s, falling back to built-in defaults", restore.Namespace, cmName)
+				return nil
 			}
+			r.logger.WithError(err).Warnf("Failed to retrieve default owner-ref configmap %s/%s, falling back to built-in defaults", restore.Namespace, cmName)
 			return ownerref.NewScope()
 		}
 		scope, err := ownerref.LoadScopeFromConfigMap(cm)
@@ -562,9 +564,9 @@ func (r *restoreReconciler) loadOwnerRefScope(ctx context.Context, restore *api.
 			if isPerRestore {
 				restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
 					fmt.Sprintf("error parsing owner-ref configmap %s/%s: %v", restore.Namespace, cmName, err))
-			} else {
-				r.logger.WithError(err).Warnf("Error parsing default owner-ref configmap %s/%s, falling back to built-in defaults", restore.Namespace, cmName)
+				return nil
 			}
+			r.logger.WithError(err).Warnf("Error parsing default owner-ref configmap %s/%s, falling back to built-in defaults", restore.Namespace, cmName)
 			return ownerref.NewScope()
 		}
 		return scope

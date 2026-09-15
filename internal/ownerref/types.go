@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 )
 
@@ -40,11 +41,13 @@ type SpecRefPathEntry struct {
 }
 
 // QuiesceRule configures automatic controller quiescing for a GVK on restore create.
+// SpecFieldPath is rejected at ConfigMap load; v1 quiesce is annotation-only.
 type QuiesceRule struct {
 	Group           string `yaml:"group" json:"group"`
 	Kind            string `yaml:"kind" json:"kind"`
 	AnnotationKey   string `yaml:"annotationKey,omitempty" json:"annotationKey,omitempty"`
 	AnnotationValue string `yaml:"annotationValue,omitempty" json:"annotationValue,omitempty"`
+	SpecFieldPath   string `yaml:"specFieldPath,omitempty" json:"specFieldPath,omitempty"`
 }
 
 // QuiescedObjectRecord records metadata about an object quiesced during restore.

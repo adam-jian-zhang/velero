@@ -169,6 +169,20 @@ func (s *Scope) IsInScope(gvk schema.GroupVersionKind) bool {
 	return false
 }
 
+// IsDeniedOwner reports whether an ownerReference parent GVK is on the built-in deny list.
+func (s *Scope) IsDeniedOwner(apiVersion, kind string) bool {
+	if s == nil {
+		return false
+	}
+	gv, err := schema.ParseGroupVersion(apiVersion)
+	group := ""
+	if err == nil {
+		group = gv.Group
+	}
+	_, denied := s.denyGKs[schema.GroupKind{Group: group, Kind: kind}]
+	return denied
+}
+
 // HasSpecRefPaths returns true if there are spec JSONPaths defined for the GVK.
 func (s *Scope) HasSpecRefPaths(gvk schema.GroupVersionKind) bool {
 	if s == nil {
@@ -231,7 +245,11 @@ func LoadScopeFromConfigMap(cm *corev1api.ConfigMap) (*Scope, error) {
 		}
 		for _, e := range userEntries {
 			if strings.TrimSpace(e.Group) == "" && strings.TrimSpace(e.Kind) == "" {
-				continue
+				return nil, fmt.Errorf("%s entry has empty group and kind", ConfigMapKeyInScope)
+			}
+			gk := schema.GroupKind{Group: strings.TrimSpace(e.Group), Kind: strings.TrimSpace(e.Kind)}
+			if _, denied := s.denyGKs[gk]; denied {
+				return nil, fmt.Errorf("inScope entry %s/%s is a core leaf workload and is forbidden by the built-in deny list", e.Group, e.Kind)
 			}
 			s.userEntries = append(s.userEntries, e)
 		}
@@ -242,6 +260,19 @@ func LoadScopeFromConfigMap(cm *corev1api.ConfigMap) (*Scope, error) {
 		if err := yaml.Unmarshal([]byte(specRefRaw), &userSpecPaths); err != nil {
 			return nil, fmt.Errorf("unmarshaling %s: %w", ConfigMapKeySpecRefPaths, err)
 		}
+		for _, e := range userSpecPaths {
+			if strings.TrimSpace(e.Kind) == "" {
+				return nil, fmt.Errorf("%s entry requires kind", ConfigMapKeySpecRefPaths)
+			}
+			if len(e.JSONPaths) == 0 {
+				return nil, fmt.Errorf("%s entry %s/%s requires at least one jsonPath", ConfigMapKeySpecRefPaths, e.Group, e.Kind)
+			}
+			for _, p := range e.JSONPaths {
+				if err := validateDottedSpecPath(p); err != nil {
+					return nil, fmt.Errorf("%s path %q: %w", ConfigMapKeySpecRefPaths, p, err)
+				}
+			}
+		}
 		s.SpecRefPaths = append(s.SpecRefPaths, userSpecPaths...)
 	}
 
@@ -250,8 +281,46 @@ func LoadScopeFromConfigMap(cm *corev1api.ConfigMap) (*Scope, error) {
 		if err := yaml.Unmarshal([]byte(quiesceRaw), &userQuiesceRules); err != nil {
 			return nil, fmt.Errorf("unmarshaling %s: %w", ConfigMapKeyQuiesceOnRestore, err)
 		}
+		for _, r := range userQuiesceRules {
+			if strings.TrimSpace(r.SpecFieldPath) != "" {
+				return nil, fmt.Errorf("%s specFieldPath is not supported; v1 quiesce is annotation-only", ConfigMapKeyQuiesceOnRestore)
+			}
+			if strings.TrimSpace(r.Kind) == "" {
+				return nil, fmt.Errorf("%s entry requires kind", ConfigMapKeyQuiesceOnRestore)
+			}
+			if strings.TrimSpace(r.AnnotationKey) == "" {
+				return nil, fmt.Errorf("%s entry %s/%s requires annotationKey", ConfigMapKeyQuiesceOnRestore, r.Group, r.Kind)
+			}
+			if strings.ContainsAny(r.AnnotationKey, " \t") {
+				return nil, fmt.Errorf("%s annotationKey %q is not a valid Kubernetes annotation key", ConfigMapKeyQuiesceOnRestore, r.AnnotationKey)
+			}
+		}
 		s.QuiesceRules = append(s.QuiesceRules, userQuiesceRules...)
 	}
 
 	return s, nil
+}
+
+func validateDottedSpecPath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	if strings.HasPrefix(path, "$") || strings.Contains(path, "..") {
+		return fmt.Errorf("JSONPath syntax is not supported; use dotted spec.* paths with optional [*]")
+	}
+	if path != "spec" && !strings.HasPrefix(path, "spec.") {
+		return fmt.Errorf("must start with spec.")
+	}
+	normalized := strings.ReplaceAll(path, "[*]", ".[*].")
+	for _, seg := range strings.Split(normalized, ".") {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		if strings.HasPrefix(seg, "[") && seg != "[*]" {
+			return fmt.Errorf("wildcard array segments must be exactly [*]")
+		}
+	}
+	return nil
 }

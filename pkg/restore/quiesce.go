@@ -23,7 +23,9 @@ import (
 	"strings"
 
 	"github.com/sirupsen/logrus"
+	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -42,9 +44,9 @@ const (
 	AnnotationQuiescedKey = "velero.io/quiesced-key"
 )
 
-// InjectQuiesceMetadata inspects the backed-up object and injects pause metadata and live tracking label if applicable.
-// If the object was already paused in production (pre-backup), OriginallyQuiesced is marked true
-// and no changes are made.
+// InjectQuiesceMetadata injects a pause annotation and live tracking label on create.
+// If the object was already paused in the backup, no changes are made and injected is false.
+// Already-paused objects must not be recorded in Restore.Status.QuiescedObjects.
 func InjectQuiesceMetadata(
 	obj *unstructured.Unstructured,
 	rule ownerref.QuiesceRule,
@@ -58,6 +60,10 @@ func InjectQuiesceMetadata(
 	annotations := obj.GetAnnotations()
 	if annotations == nil {
 		annotations = make(map[string]string)
+	}
+
+	if _, alreadyPaused := annotations[rule.AnnotationKey]; alreadyPaused {
+		return velerov1api.QuiescedObjectRef{}, false
 	}
 
 	labels := obj.GetLabels()
@@ -74,11 +80,6 @@ func InjectQuiesceMetadata(
 		AnnotationKey: rule.AnnotationKey,
 	}
 
-	if _, alreadyPaused := annotations[rule.AnnotationKey]; alreadyPaused {
-		record.OriginallyQuiesced = true
-		return record, false
-	}
-
 	annotations[rule.AnnotationKey] = rule.AnnotationValue
 	annotations[AnnotationQuiescedKey] = rule.AnnotationKey
 	obj.SetAnnotations(annotations)
@@ -88,7 +89,6 @@ func InjectQuiesceMetadata(
 		obj.SetLabels(labels)
 	}
 
-	record.OriginallyQuiesced = false
 	if log != nil {
 		log.Infof("Auto-quiesced %s/%s via annotation %s=%q with tracking label %s=%q for restore",
 			obj.GetNamespace(), obj.GetName(), rule.AnnotationKey, rule.AnnotationValue, LabelQuiescedByRestore, restoreName)
@@ -152,29 +152,33 @@ func UnquiesceEligibleObjects(
 
 	warnings := results.Result{}
 	if len(eligible) > 0 {
-		unquiesceWarnings := UnquiesceObjects(ctx, log, crClient, eligible)
+		failed, unquiesceWarnings := UnquiesceObjects(ctx, log, crClient, eligible)
 		warnings.Merge(&unquiesceWarnings)
+		stillQuiesced = append(stillQuiesced, failed...)
 	}
 	return stillQuiesced, warnings
 }
 
-// UnquiesceObjects removes injected quiesce annotations and tracking labels on successfully remapped resources.
-// Objects that were already paused in production are left untouched.
-// Returns warnings for any resources that failed to be unquiesced.
+// UnquiesceObjects removes Velero-injected pause annotations and tracking labels.
+// It only strips a pause when the tracking label or velero.io/quiesced-key is present,
+// so originally-paused production objects are left untouched even if listed by mistake.
+// Objects that fail to unpause are returned so they remain in Restore.Status.QuiescedObjects.
 func UnquiesceObjects(
 	ctx context.Context,
 	log logrus.FieldLogger,
 	crClient client.Client,
 	records []velerov1api.QuiescedObjectRef,
-) results.Result {
+) ([]velerov1api.QuiescedObjectRef, results.Result) {
 	warnings := results.Result{}
+	var failed []velerov1api.QuiescedObjectRef
 	if crClient == nil || len(records) == 0 {
-		return warnings
+		return failed, warnings
 	}
 
 	for _, rec := range records {
-		if rec.OriginallyQuiesced || strings.TrimSpace(rec.AnnotationKey) == "" {
-			continue // Respect user's intentional production pause or skip invalid keys
+		if strings.TrimSpace(rec.AnnotationKey) == "" {
+			failed = append(failed, rec)
+			continue
 		}
 
 		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -194,16 +198,10 @@ func UnquiesceObjects(
 
 			annotations := liveObj.GetAnnotations()
 			labels := liveObj.GetLabels()
-			hasAnnotation := false
-			if annotations != nil {
-				_, hasAnnotation = annotations[rec.AnnotationKey]
-			}
-			hasTrackingLabel := false
-			if labels != nil {
-				_, hasTrackingLabel = labels[LabelQuiescedByRestore]
-			}
-
-			if !hasAnnotation && !hasTrackingLabel {
+			hasTrackingLabel := labels != nil && labels[LabelQuiescedByRestore] != ""
+			hasQuiescedKey := annotations != nil && annotations[AnnotationQuiescedKey] != ""
+			// Not a Velero-injected pause: leave the object alone.
+			if !hasTrackingLabel && !hasQuiescedKey {
 				return nil
 			}
 
@@ -231,9 +229,129 @@ func UnquiesceObjects(
 				log.WithError(err).Warnf("Failed to unquiesce %s/%s after restore remapping", rec.Namespace, rec.Name)
 			}
 			warnings.Add(rec.Namespace, fmt.Errorf("failed to unquiesce %s/%s: %w", rec.Namespace, rec.Name, err))
+			failed = append(failed, rec)
 		} else if log != nil {
 			log.Infof("Successfully unquiesced %s/%s; controllers may now resume reconciliation", rec.Namespace, rec.Name)
 		}
 	}
-	return warnings
+	return failed, warnings
+}
+
+// leftoverFallbackVersions is a best-effort list of common CRD API versions used only when a
+// RESTMapper is unavailable or cannot resolve a GVK (e.g. the type is not registered in the test
+// scheme). In a live cluster the RESTMapper discovers the actually-served version, so CRDs at
+// unusual versions (v1alpha3, v1gamma1, ...) are still found.
+var leftoverFallbackVersions = []string{"v1beta1", "v1", "v1beta2", "v1alpha1", "v1alpha2"}
+
+// CatchLeftoverPausedObjects lists objects still carrying velero.io/quiesced-by-restore=<restore-name>
+// for configured quiesce GVKs. Used in Finalizing when Status.QuiescedObjects is empty after a
+// partial persist. Labels cannot reconstruct PendingOwnerRefPatches or uidMap.
+//
+// restMapper, when non-nil, is preferred over the hardcoded fallback version list: it resolves the
+// GVK to the API server's preferred served version, so CRDs served at non-standard versions are
+// still discovered. When restMapper is nil or returns NoMatchError, the fallback version list is
+// used so this remains best-effort safe in tests and degraded environments.
+func CatchLeftoverPausedObjects(
+	ctx context.Context,
+	log logrus.FieldLogger,
+	crClient client.Client,
+	restMapper meta.RESTMapper,
+	restoreName string,
+	rules []ownerref.QuiesceRule,
+) []velerov1api.QuiescedObjectRef {
+	if crClient == nil || restoreName == "" || len(rules) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	var leftover []velerov1api.QuiescedObjectRef
+
+	for _, rule := range rules {
+		if strings.TrimSpace(rule.Kind) == "" {
+			continue
+		}
+		versions := resolvedVersionsFor(restMapper, rule.Group, rule.Kind, log)
+		for _, version := range versions {
+			list := &unstructured.UnstructuredList{}
+			gvk := schema.GroupVersionKind{Group: rule.Group, Version: version, Kind: rule.Kind}
+			list.SetGroupVersionKind(schema.GroupVersionKind{Group: gvk.Group, Version: gvk.Version, Kind: gvk.Kind + "List"})
+			if err := crClient.List(ctx, list, client.MatchingLabels{LabelQuiescedByRestore: restoreName}); err != nil {
+				continue
+			}
+			for i := range list.Items {
+				obj := &list.Items[i]
+				objGVK := obj.GroupVersionKind()
+				if objGVK.Empty() {
+					objGVK = schema.GroupVersionKind{Group: rule.Group, Version: version, Kind: rule.Kind}
+				}
+				if objGVK.Group != rule.Group || objGVK.Kind != rule.Kind {
+					continue
+				}
+				key := fmt.Sprintf("%s/%s/%s/%s/%s", objGVK.Group, objGVK.Version, objGVK.Kind, obj.GetNamespace(), obj.GetName())
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				annKey := rule.AnnotationKey
+				if anns := obj.GetAnnotations(); anns != nil {
+					if k := anns[AnnotationQuiescedKey]; k != "" {
+						annKey = k
+					}
+				}
+				leftover = append(leftover, velerov1api.QuiescedObjectRef{
+					Group:         objGVK.Group,
+					Version:        objGVK.Version,
+					Kind:           objGVK.Kind,
+					Namespace:     obj.GetNamespace(),
+					Name:          obj.GetName(),
+					AnnotationKey: annKey,
+				})
+			}
+		}
+	}
+
+	if log != nil && len(leftover) > 0 {
+		log.Infof("Layer 1 leftover-pause catch-up found %d objects still paused by restore %s", len(leftover), restoreName)
+	}
+	return leftover
+}
+
+// resolvedVersionsFor returns the API versions to try when listing objects of (group, kind).
+// When restMapper resolves the GVK, only the preferred served version is returned (Kubernetes serves
+// all stored objects of a kind at the requested version). On NoMatchError or a nil mapper, the
+// best-effort fallback list is returned so discovery gaps do not silently skip leftover pauses.
+func resolvedVersionsFor(restMapper meta.RESTMapper, group, kind string, log logrus.FieldLogger) []string {
+	if restMapper != nil {
+		if mapping, err := restMapper.RESTMapping(schema.GroupKind{Group: group, Kind: kind}); err == nil {
+			if v := mapping.GroupVersionKind.Version; v != "" {
+				return []string{v}
+			}
+		} else if log != nil && !meta.IsNoMatchError(err) {
+			log.WithError(err).Debugf("RESTMapper lookup for %s/%s failed; falling back to version list", group, kind)
+		}
+	}
+	return leftoverFallbackVersions
+}
+
+// LoadQuiesceRulesForCatchUp returns built-in ∪ ConfigMap quiesce rules for leftover-pause catch-up.
+func LoadQuiesceRulesForCatchUp(ctx context.Context, crClient client.Client, restore *velerov1api.Restore) []ownerref.QuiesceRule {
+	scope := ownerref.NewScope()
+	if crClient == nil || restore == nil {
+		return scope.QuiesceRules
+	}
+
+	cmName := ownerref.DefaultConfigMapName
+	if restore.Spec.OwnerRefConfigMap != nil && strings.TrimSpace(restore.Spec.OwnerRefConfigMap.Name) != "" {
+		cmName = restore.Spec.OwnerRefConfigMap.Name
+	}
+
+	cm := &corev1api.ConfigMap{}
+	if err := crClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: cmName}, cm); err != nil {
+		return scope.QuiesceRules
+	}
+	loaded, err := ownerref.LoadScopeFromConfigMap(cm)
+	if err != nil || loaded == nil {
+		return scope.QuiesceRules
+	}
+	return loaded.QuiesceRules
 }

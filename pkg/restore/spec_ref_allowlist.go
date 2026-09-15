@@ -42,10 +42,10 @@ func processSpecReferences(
 	crClient client.Client,
 	state *ownerref.OwnerRefRemapState,
 	namespaceMapping map[string]string,
-) (results.Result, []velerov1api.PendingPatchRef) {
+) (results.Result, []velerov1api.PendingPatchRef, int) {
 	warnings := results.Result{}
 	if state == nil || crClient == nil {
-		return warnings, nil
+		return warnings, nil, 0
 	}
 	if log == nil {
 		log = logrus.StandardLogger()
@@ -53,12 +53,13 @@ func processSpecReferences(
 
 	specPaths := state.GetSpecRefPaths()
 	if len(specPaths) == 0 {
-		return warnings, nil
+		return warnings, nil, 0
 	}
 
 	var pendingPatches []velerov1api.PendingPatchRef
 	var remainingQueue []ownerref.OwnerPatchRequest
 	seen := make(map[string]struct{})
+	specRefsRemapped := 0
 
 	for _, req := range state.GetSpecPatchQueue() {
 		gvk := req.GroupVersionKind()
@@ -80,6 +81,7 @@ func processSpecReferences(
 
 		var lastPatchBytes []byte
 		var targets []velerov1api.TargetRef
+		patched := false
 
 		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 			obj := &unstructured.Unstructured{}
@@ -102,6 +104,7 @@ func processSpecReferences(
 				return fmt.Errorf("marshal spec-ref patch for %s/%s: %w", req.Namespace, req.Name, err)
 			}
 			lastPatchBytes = patchBytes
+			patched = true
 			return crClient.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchBytes))
 		})
 
@@ -121,11 +124,13 @@ func processSpecReferences(
 				Targets:       targets,
 				Error:         err.Error(),
 			})
+		} else if patched {
+			specRefsRemapped++
 		}
 	}
 	state.SetSpecPatchQueue(remainingQueue)
 
-	return warnings, pendingPatches
+	return warnings, pendingPatches, specRefsRemapped
 }
 
 func specRefPathsForGVK(entries []ownerref.SpecRefPathEntry, gvk schema.GroupVersionKind) []string {

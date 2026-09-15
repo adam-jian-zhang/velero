@@ -248,9 +248,10 @@ func TestProcessSpecReferences_Integration(t *testing.T) {
 	}
 	state.EnqueueSpecPatch(req)
 
-	warnings, pending := processSpecReferences(context.Background(), logrus.StandardLogger(), fakeClient, state, nil)
+	warnings, pending, remapped := processSpecReferences(context.Background(), logrus.StandardLogger(), fakeClient, state, nil)
 	assert.True(t, warnings.IsEmpty())
 	assert.Empty(t, pending)
+	assert.Equal(t, 1, remapped)
 
 	liveVM := &unstructured.Unstructured{}
 	liveVM.SetGroupVersionKind(schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachine"})

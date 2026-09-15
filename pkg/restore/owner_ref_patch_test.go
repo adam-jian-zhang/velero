@@ -447,6 +447,8 @@ func TestApplyOwnerRefRemapping_PersistentVolumeClaim(t *testing.T) {
 	assert.Equal(t, "db-cluster-1", livePVC.GetOwnerReferences()[0].Name)
 	require.NotNil(t, livePVC.GetOwnerReferences()[0].Controller)
 	assert.True(t, *livePVC.GetOwnerReferences()[0].Controller)
+	assert.Equal(t, 1, restore.Status.OwnerRefsRemapped)
+	assert.Equal(t, 0, restore.Status.SpecRefsRemapped)
 }
 
 func TestRegisterAndMaybeEnqueue_Durability(t *testing.T) {
@@ -525,3 +527,71 @@ func TestRegisterAndMaybeEnqueue_Durability(t *testing.T) {
 	assert.Equal(t, "Cluster", specQueue[0].Kind)
 }
 
+func TestFilterDeniedPVCOwnerRefs(t *testing.T) {
+	scope := ownerref.NewScope()
+	refs := []metav1.OwnerReference{
+		{APIVersion: "v1", Kind: "Pod", Name: "pod-1", UID: "pod-uid"},
+		{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs-1", UID: "rs-uid"},
+		{APIVersion: "database.example.io/v1", Kind: "DatabaseCluster", Name: "db-1", UID: "db-uid"},
+	}
+	sourceNS := []string{"default", "default", "default"}
+
+	filtered, filteredNS := filterDeniedPVCOwnerRefs(
+		schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"},
+		refs,
+		sourceNS,
+		scope,
+	)
+	require.Len(t, filtered, 1)
+	assert.Equal(t, "DatabaseCluster", filtered[0].Kind)
+	require.Len(t, filteredNS, 1)
+
+	ctx := &restoreContext{
+		ownerRefRemap: ownerref.NewOwnerRefRemapState(),
+		ownerRefScope: scope,
+	}
+	ctx.ownerRefRemap.Enabled = true
+
+	backupPVC := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "PersistentVolumeClaim",
+		"metadata": map[string]any{
+			"name":      "ephemeral-pvc",
+			"namespace": "default",
+			"uid":       "backup-pvc-uid",
+		},
+	}}
+	livePVC := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "PersistentVolumeClaim",
+		"metadata": map[string]any{
+			"name":      "ephemeral-pvc",
+			"namespace": "default",
+			"uid":       "live-pvc-uid",
+		},
+	}}
+	ctx.registerAndMaybeEnqueue(backupPVC, livePVC, schema.GroupResource{Resource: "persistentvolumeclaims"}, refs[:1], sourceNS[:1])
+	assert.Empty(t, ctx.ownerRefRemap.GetOwnerPatchQueue(), "Pod-owned PVC ownerRefs must not be enqueued")
+}
+
+func TestRetryPendingPatches_EmptySpecPatchJSON(t *testing.T) {
+	scheme := runtime.NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	restore := &velerov1api.Restore{}
+	pending := []velerov1api.PendingPatchRef{
+		{
+			Group:     "kubevirt.io",
+			Version:   "v1",
+			Kind:      "VirtualMachine",
+			Namespace: "default",
+			Name:      "vm-1",
+			PatchType: "specRef",
+		},
+	}
+
+	warnings, remaining := RetryPendingPatches(context.Background(), logrus.StandardLogger(), fakeClient, restore, pending)
+	assert.False(t, warnings.IsEmpty())
+	require.Len(t, remaining, 1)
+	assert.Contains(t, remaining[0].Error, "empty SpecPatchJSON")
+	assert.Equal(t, 0, restore.Status.SpecRefsRemapped)
+}

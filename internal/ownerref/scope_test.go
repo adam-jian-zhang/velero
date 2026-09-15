@@ -211,10 +211,11 @@ func TestScopeEmptyEntryDoesNotMatchCoreResources(t *testing.T) {
 		},
 	}
 
-	scope, err := LoadScopeFromConfigMap(cm)
-	require.NoError(t, err)
+	_, err := LoadScopeFromConfigMap(cm)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty group and kind")
 
-	// Unseeded core resources should not be in scope because empty entries are ignored
+	scope := NewScope()
 	coreGVKs := []schema.GroupVersionKind{
 		{Group: "", Version: "v1", Kind: "ConfigMap"},
 		{Group: "", Version: "v1", Kind: "Secret"},
@@ -226,12 +227,67 @@ func TestScopeEmptyEntryDoesNotMatchCoreResources(t *testing.T) {
 		assert.False(t, scope.IsInScope(gvk), "Core resource %v must NOT match empty inScope entry", gvk)
 	}
 
-	// PersistentVolumeClaim is explicitly in-scope by built-in seed
 	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"}))
 
-	// Also test manual userEntry with empty group and empty kind
 	scope.userEntries = append(scope.userEntries, ScopeEntry{Group: "", Kind: ""})
 	for _, gvk := range coreGVKs {
 		assert.False(t, scope.IsInScope(gvk), "Core resource %v must NOT match even if empty ScopeEntry is in userEntries", gvk)
 	}
+}
+
+func TestLoadScopeFromConfigMapRejectsDenyList(t *testing.T) {
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "deny", Namespace: "velero"},
+		Data: map[string]string{
+			ConfigMapKeyInScope: `
+- group: apps
+  kind: ReplicaSet
+`,
+		},
+	}
+	_, err := LoadScopeFromConfigMap(cm)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deny list")
+}
+
+func TestLoadScopeFromConfigMapRejectsJSONPath(t *testing.T) {
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "jsonpath", Namespace: "velero"},
+		Data: map[string]string{
+			ConfigMapKeySpecRefPaths: `
+- group: custom.io
+  kind: App
+  jsonPaths:
+    - $.spec.targetRef
+`,
+		},
+	}
+	_, err := LoadScopeFromConfigMap(cm)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JSONPath syntax is not supported")
+}
+
+func TestLoadScopeFromConfigMapRejectsSpecFieldPath(t *testing.T) {
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "specfield", Namespace: "velero"},
+		Data: map[string]string{
+			ConfigMapKeyQuiesceOnRestore: `
+- group: custom.io
+  kind: App
+  annotationKey: custom.io/pause
+  specFieldPath: spec.paused
+`,
+		},
+	}
+	_, err := LoadScopeFromConfigMap(cm)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "annotation-only")
+}
+
+func TestIsDeniedOwner(t *testing.T) {
+	scope := NewScope()
+	assert.True(t, scope.IsDeniedOwner("v1", "Pod"))
+	assert.True(t, scope.IsDeniedOwner("apps/v1", "ReplicaSet"))
+	assert.False(t, scope.IsDeniedOwner("database.example.io/v1", "DatabaseCluster"))
+	assert.False(t, (*Scope)(nil).IsDeniedOwner("v1", "Pod"))
 }
