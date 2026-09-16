@@ -264,12 +264,13 @@ func describeOwnerRefRemappingInSF(d *StructuredDescriber, restore *velerov1api.
 		quiesced := make([]map[string]any, 0, len(restore.Status.QuiescedObjects))
 		for _, q := range restore.Status.QuiescedObjects {
 			quiesced = append(quiesced, map[string]any{
-				"group":         q.Group,
-				"version":       q.Version,
-				"kind":          q.Kind,
-				"namespace":     q.Namespace,
-				"name":          q.Name,
-				"annotationKey": q.AnnotationKey,
+				"group":            q.Group,
+				"version":          q.Version,
+				"kind":             q.Kind,
+				"namespace":        q.Namespace,
+				"name":             q.Name,
+				"annotationKey":    q.AnnotationKey,
+				"unquiesceBlocked": q.UnquiesceBlocked,
 			})
 		}
 		info["quiescedObjects"] = quiesced
@@ -284,7 +285,6 @@ func describeOwnerRefRemappingInSF(d *StructuredDescriber, restore *velerov1api.
 				"namespace": p.Namespace,
 				"name":      p.Name,
 				"patchType": p.PatchType,
-				"error":     p.Error,
 			})
 		}
 		info["pendingPatches"] = pending

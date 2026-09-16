@@ -36,6 +36,7 @@ import (
 
 	"github.com/vmware-tanzu/velero/internal/ownerref"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
 func TestMergeOwnerReferences(t *testing.T) {
@@ -405,8 +406,11 @@ func TestApplyOwnerRefRemapping_PersistentVolumeClaim(t *testing.T) {
 
 	state := ownerref.NewOwnerRefRemapState()
 	state.Enabled = true
-	// Built-in seed allowlist includes PersistentVolumeClaim
+	// Baseline ConfigMap allowlist includes PersistentVolumeClaim
 	scope := ownerref.NewScope()
+	baselineCM, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
+	require.NoError(t, err)
+	require.NoError(t, scope.MergeConfigMap(baselineCM))
 	state.SetScope(scope)
 	state.RegisterUIDMapping("old-operator-parent-uid", "new-operator-parent-uid")
 
@@ -439,7 +443,7 @@ func TestApplyOwnerRefRemapping_PersistentVolumeClaim(t *testing.T) {
 
 	livePVC := &unstructured.Unstructured{}
 	livePVC.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"})
-	err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "data-pvc"}, livePVC)
+	err = fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "data-pvc"}, livePVC)
 	require.NoError(t, err)
 	require.Len(t, livePVC.GetOwnerReferences(), 1)
 	assert.Equal(t, types.UID("new-operator-parent-uid"), livePVC.GetOwnerReferences()[0].UID)
@@ -455,11 +459,9 @@ func TestRegisterAndMaybeEnqueue_Durability(t *testing.T) {
 	state := ownerref.NewOwnerRefRemapState()
 	state.Enabled = true
 	scope := ownerref.NewScope()
-	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
-		Group:     "cluster.x-k8s.io",
-		Kind:      "Cluster",
-		JSONPaths: []string{"spec.infrastructureRef"},
-	})
+	baselineCM, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
+	require.NoError(t, err)
+	require.NoError(t, scope.MergeConfigMap(baselineCM))
 
 	ctx := &restoreContext{
 		ownerRefRemap: state,
@@ -529,6 +531,9 @@ func TestRegisterAndMaybeEnqueue_Durability(t *testing.T) {
 
 func TestFilterDeniedPVCOwnerRefs(t *testing.T) {
 	scope := ownerref.NewScope()
+	baselineCM, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
+	require.NoError(t, err)
+	require.NoError(t, scope.MergeConfigMap(baselineCM))
 	refs := []metav1.OwnerReference{
 		{APIVersion: "v1", Kind: "Pod", Name: "pod-1", UID: "pod-uid"},
 		{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs-1", UID: "rs-uid"},
@@ -592,6 +597,178 @@ func TestRetryPendingPatches_EmptySpecPatchJSON(t *testing.T) {
 	warnings, remaining := RetryPendingPatches(context.Background(), logrus.StandardLogger(), fakeClient, restore, pending)
 	assert.False(t, warnings.IsEmpty())
 	require.Len(t, remaining, 1)
-	assert.Contains(t, remaining[0].Error, "empty SpecPatchJSON")
+	assert.Contains(t, warnings.Namespaces["default"][0], "empty SpecPatchJSON")
 	assert.Equal(t, 0, restore.Status.SpecRefsRemapped)
+}
+
+type mockErrorPatchClient struct {
+	client.Client
+	patchErr error
+}
+
+func (m *mockErrorPatchClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if m.patchErr != nil {
+		return m.patchErr
+	}
+	return m.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestApplyOwnerRefRemapping_NonRetriableErrorDoesNotBloatStatus(t *testing.T) {
+	scheme := runtime.NewScheme()
+	childObj := &unstructured.Unstructured{}
+	childObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "Machine",
+	})
+	childObj.SetName("worker-1")
+	childObj.SetNamespace("default")
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(childObj).Build()
+	// Return a non-retriable 422 Invalid error on Patch
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewInvalid(
+			schema.GroupKind{Group: "cluster.x-k8s.io", Kind: "Machine"},
+			"worker-1",
+			nil,
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("cluster-old", "cluster-new")
+
+	// Parent cluster is quiesced
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObject(rec)
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-1",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "Cluster",
+				Name:       "cluster-1",
+				UID:        "cluster-old",
+			},
+		},
+		OwnerRefSourceNS: []string{"default"},
+	}
+	state.EnqueueOwnerPatch(req)
+
+	restore := &velerov1api.Restore{}
+	warnings, pending := ApplyOwnerRefRemapping(context.Background(), logrus.StandardLogger(), mockClient, restore, state)
+
+	// Warnings recorded, but pendingPatches is EMPTY to protect etcd from bloat
+	assert.False(t, warnings.IsEmpty())
+	assert.Empty(t, pending, "Non-retriable patch failure must not enter PendingOwnerRefPatches")
+
+	// Quiesced parent must be marked unquiesceBlocked
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked, "Parent cluster must be marked UnquiesceBlocked")
+
+	// CanUnquiesce must return false for this parent
+	assert.False(t, CanUnquiesce(quiesced[0], pending))
+}
+
+func TestApplyOwnerRefRemapping_RetriableErrorEnqueues(t *testing.T) {
+	scheme := runtime.NewScheme()
+	childObj := &unstructured.Unstructured{}
+	childObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "Machine",
+	})
+	childObj.SetName("worker-1")
+	childObj.SetNamespace("default")
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(childObj).Build()
+	// Return a retriable 409 Conflict error on Patch
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewConflict(
+			schema.GroupResource{Group: "cluster.x-k8s.io", Resource: "machines"},
+			"worker-1",
+			fmt.Errorf("operation cannot be fulfilled"),
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("cluster-old", "cluster-new")
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObject(rec)
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-1",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "Cluster",
+				Name:       "cluster-1",
+				UID:        "cluster-old",
+			},
+		},
+		OwnerRefSourceNS: []string{"default"},
+	}
+	state.EnqueueOwnerPatch(req)
+
+	restore := &velerov1api.Restore{}
+	warnings, pending := ApplyOwnerRefRemapping(context.Background(), logrus.StandardLogger(), mockClient, restore, state)
+
+	// Warnings recorded and pendingPatches contains the retriable patch request
+	assert.False(t, warnings.IsEmpty())
+	require.Len(t, pending, 1)
+	assert.Equal(t, "worker-1", pending[0].Name)
+
+	// Quiesced parent must NOT be permanently unquiesceBlocked
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.False(t, quiesced[0].UnquiesceBlocked, "Parent cluster must not be permanently blocked on transient error")
+
+	// But CanUnquiesce returns false because pending patch names it as owner
+	assert.False(t, CanUnquiesce(quiesced[0], pending))
 }

@@ -1493,15 +1493,20 @@ func TestLoadOwnerRefScope(t *testing.T) {
 	features.NewFeatureFlagSet(velerov1api.OwnerRefRemapFeatureFlag)
 	defer features.NewFeatureFlagSet()
 
-	// Case 1: Built-in defaults when feature flag enabled
+	// Case 1: Baseline conventional velero-ownerref-config loaded when feature flag enabled
+	cmBaseline, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
+	require.NoError(t, err)
+	require.NoError(t, fakeClient.Create(ctx, cmBaseline))
+
 	restore := &velerov1api.Restore{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-1"},
 	}
 	scope := r.loadOwnerRefScope(ctx, restore)
 	require.NotNil(t, scope)
 	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}))
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"}))
 
-	// Case 2: Per-restore OwnerRefConfigMap (works even if feature flag was disabled!)
+	// Case 2: 2-Tier Union: Baseline ConfigMap (CAPI + PVC) + Per-restore OwnerRefConfigMap (custom.io)
 	cmExplicit := &corev1api.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "custom-scope-cm"},
 		Data: map[string]string{
@@ -1513,40 +1518,40 @@ func TestLoadOwnerRefScope(t *testing.T) {
 	restore.Spec.OwnerRefConfigMap = &corev1api.TypedLocalObjectReference{Name: "custom-scope-cm"}
 	scope = r.loadOwnerRefScope(ctx, restore)
 	require.NotNil(t, scope)
-	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "CustomKind"}))
+	// Both baseline CAPI and per-restore custom.io must be in scope!
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}), "Baseline CAPI should remain in scope")
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "CustomKind"}), "Per-restore custom.io should be unioned into scope")
 
-	// Case 3: Server default flag
+	// Case 3: Server default flag overriding conventional baseline name
 	restore.Spec.OwnerRefConfigMap = nil
-	r.ownerRefConfigMap = "custom-scope-cm"
-	scope = r.loadOwnerRefScope(ctx, restore)
-	require.NotNil(t, scope)
-	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "custom.io", Version: "v1", Kind: "CustomKind"}))
-
-	// Case 4: Conventional default velero-ownerref-config
-	r.ownerRefConfigMap = ""
-	cmConventional := &corev1api.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: defaultOwnerRefConfigMap},
+	cmServer := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "server-baseline-cm"},
 		Data: map[string]string{
-			"inScope": "- group: conventional.io\n",
+			"inScope": "- group: server.io\n  kind: ServerKind\n",
 		},
 	}
-	require.NoError(t, fakeClient.Create(ctx, cmConventional))
+	require.NoError(t, fakeClient.Create(ctx, cmServer))
+	r.ownerRefConfigMap = "server-baseline-cm"
 	scope = r.loadOwnerRefScope(ctx, restore)
 	require.NotNil(t, scope)
-	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "conventional.io", Version: "v1", Kind: "Foo"}))
+	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "server.io", Version: "v1", Kind: "ServerKind"}))
 
-	// Case 5: Per-restore non-existent ConfigMap records validation error
+	// Reset server flag
+	r.ownerRefConfigMap = ""
+
+	// Case 4: Per-restore non-existent ConfigMap records validation error and returns nil
 	restoreErrNotFound := &velerov1api.Restore{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-not-found"},
 		Spec: velerov1api.RestoreSpec{
 			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "non-existent-cm"},
 		},
 	}
-	_ = r.loadOwnerRefScope(ctx, restoreErrNotFound)
+	resScope := r.loadOwnerRefScope(ctx, restoreErrNotFound)
+	assert.Nil(t, resScope)
 	require.NotEmpty(t, restoreErrNotFound.Status.ValidationErrors)
 	assert.Contains(t, restoreErrNotFound.Status.ValidationErrors[0], "failed to get owner-ref configmap")
 
-	// Case 6: Per-restore invalid YAML records validation error
+	// Case 5: Per-restore invalid YAML records validation error and returns nil
 	cmInvalidYAML := &corev1api.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "invalid-yaml-cm"},
 		Data: map[string]string{
@@ -1560,11 +1565,12 @@ func TestLoadOwnerRefScope(t *testing.T) {
 			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "invalid-yaml-cm"},
 		},
 	}
-	_ = r.loadOwnerRefScope(ctx, restoreErrInvalidYAML)
+	resScope = r.loadOwnerRefScope(ctx, restoreErrInvalidYAML)
+	assert.Nil(t, resScope)
 	require.NotEmpty(t, restoreErrInvalidYAML.Status.ValidationErrors)
 	assert.Contains(t, restoreErrInvalidYAML.Status.ValidationErrors[0], "error parsing owner-ref configmap")
 
-	// Case 7: Conventional ConfigMap with invalid YAML falls back to built-in defaults
+	// Case 6: Conventional ConfigMap with invalid YAML falls back to empty baseline without fatal error
 	cmConventionalInvalid := &corev1api.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero-bad", Name: defaultOwnerRefConfigMap},
 		Data: map[string]string{
@@ -1577,7 +1583,8 @@ func TestLoadOwnerRefScope(t *testing.T) {
 	}
 	scope = r.loadOwnerRefScope(ctx, restoreConventionalBad)
 	require.NotNil(t, scope)
-	assert.True(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}))
+	// Invalid YAML was skipped, scope contains only deny list
+	assert.False(t, scope.IsInScope(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"}))
 }
 
 func TestOwnerRefStatusPersistence(t *testing.T) {

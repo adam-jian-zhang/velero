@@ -224,6 +224,38 @@ func (s *OwnerRefRemapState) GetQuiescedObjects() []QuiescedObjectRecord {
 	return append([]QuiescedObjectRecord(nil), s.quiescedObjects...)
 }
 
+// BlockUnquiesceForTarget marks any quiesced object matching the target as unquiesceBlocked.
+func (s *OwnerRefRemapState) BlockUnquiesceForTarget(group, kind, namespace, name string) {
+	if s == nil {
+		return
+	}
+	s.queueLock.Lock()
+	defer s.queueLock.Unlock()
+	for i := range s.quiescedObjects {
+		q := &s.quiescedObjects[i]
+		if q.Group == group && q.Kind == kind && q.Name == name {
+			if q.Namespace == "" || namespace == "" || q.Namespace == namespace {
+				q.UnquiesceBlocked = true
+			}
+		}
+	}
+}
+
+// BlockUnquiesceForNamespace marks all quiesced objects in the given namespace as unquiesceBlocked.
+func (s *OwnerRefRemapState) BlockUnquiesceForNamespace(namespace string) {
+	if s == nil {
+		return
+	}
+	s.queueLock.Lock()
+	defer s.queueLock.Unlock()
+	for i := range s.quiescedObjects {
+		q := &s.quiescedObjects[i]
+		if namespace == "" || q.Namespace == namespace {
+			q.UnquiesceBlocked = true
+		}
+	}
+}
+
 // GetSpecRefPaths returns a copy of the specRefPaths in a thread-safe manner.
 func (s *OwnerRefRemapState) GetSpecRefPaths() []SpecRefPathEntry {
 	if s == nil {

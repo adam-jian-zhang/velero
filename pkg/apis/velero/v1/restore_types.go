@@ -447,12 +447,13 @@ type RestoreStatus struct {
 
 // QuiescedObjectRef records metadata about an object Velero paused during restore.
 type QuiescedObjectRef struct {
-	Group         string `json:"group"`
-	Version       string `json:"version"`
-	Kind          string `json:"kind"`
-	Namespace     string `json:"namespace"`
-	Name          string `json:"name"`
-	AnnotationKey string `json:"annotationKey,omitempty"`
+	Group            string `json:"group"`
+	Version          string `json:"version"`
+	Kind             string `json:"kind"`
+	Namespace        string `json:"namespace"`
+	Name             string `json:"name"`
+	AnnotationKey    string `json:"annotationKey,omitempty"`
+	UnquiesceBlocked bool   `json:"unquiesceBlocked,omitempty"`
 }
 
 // TargetRef records an owner or spec reference target for dependency matching.
@@ -471,10 +472,8 @@ type PendingPatchRef struct {
 	Name            string                  `json:"name"`
 	PatchType       string                  `json:"patchType,omitempty"` // "ownerRef" or "specRef"
 	OwnerReferences []metav1.OwnerReference `json:"ownerReferences,omitempty"`
-	SpecRefPaths    []string                `json:"specRefPaths,omitempty"`
 	SpecPatchJSON   string                  `json:"specPatchJSON,omitempty"`
 	Targets         []TargetRef             `json:"targets,omitempty"`
-	Error           string                  `json:"error,omitempty"`
 }
 
 // RestoreProgress stores information about the restore's execution progress

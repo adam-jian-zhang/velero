@@ -83,7 +83,7 @@ func processSpecReferences(
 		var targets []velerov1api.TargetRef
 		patched := false
 
-		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		err := retry.OnError(retry.DefaultBackoff, isRetriablePatchError, func() error {
 			obj := &unstructured.Unstructured{}
 			obj.SetGroupVersionKind(gvk)
 			if err := crClient.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: req.Name}, obj); err != nil {
@@ -111,19 +111,31 @@ func processSpecReferences(
 		if err != nil {
 			log.WithError(err).Warnf("Failed to patch spec refs on %s/%s", req.Namespace, req.Name)
 			warnings.Add(req.Namespace, err)
-			remainingQueue = append(remainingQueue, req)
-			pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
-				Group:         gvk.Group,
-				Version:       gvk.Version,
-				Kind:          gvk.Kind,
-				Namespace:     req.Namespace,
-				Name:          req.Name,
-				PatchType:     "specRef",
-				SpecRefPaths:  paths,
-				SpecPatchJSON: string(lastPatchBytes),
-				Targets:       targets,
-				Error:         err.Error(),
-			})
+			if isRetriablePatchError(err) && len(lastPatchBytes) > 0 {
+				remainingQueue = append(remainingQueue, req)
+				pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
+					Group:         gvk.Group,
+					Version:       gvk.Version,
+					Kind:          gvk.Kind,
+					Namespace:     req.Namespace,
+					Name:          req.Name,
+					PatchType:     "specRef",
+					SpecPatchJSON: string(lastPatchBytes),
+					Targets:       targets,
+				})
+			} else {
+				// Non-retriable error or Get failed without patch payload:
+				// do NOT enqueue to pendingPatches with empty SpecPatchJSON (prevents etcd bloat and Pass 2 permanent failure).
+				// Instead, mark targets as unquiesceBlocked so parents remain safely paused.
+				for _, target := range targets {
+					state.BlockUnquiesceForTarget(target.Group, target.Kind, req.Namespace, target.Name)
+				}
+				if len(targets) == 0 {
+					// If Get failed before targets could be parsed, block unquiescing for any quiesced object
+					// in this child's namespace to prevent unquiescing a parent that might have been referenced.
+					state.BlockUnquiesceForNamespace(req.Namespace)
+				}
+			}
 		} else if patched {
 			specRefsRemapped++
 		}

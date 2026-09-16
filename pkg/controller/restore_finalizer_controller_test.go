@@ -43,6 +43,8 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
@@ -166,6 +168,7 @@ func TestRestoreFinalizerReconcile(t *testing.T) {
 				hook.NewMultiHookTracker(),
 				10*time.Minute,
 				nil,
+				"",
 			)
 			r.clock = testclocks.NewFakeClock(now)
 
@@ -237,6 +240,7 @@ func TestUpdateResult(t *testing.T) {
 		hook.NewMultiHookTracker(),
 		10*time.Minute,
 		nil,
+		"",
 	)
 	restore := builder.ForRestore(velerov1api.DefaultNamespace, "restore-1").Result()
 	res := map[string]results.Result{"warnings": {}, "errors": {}}
@@ -1753,5 +1757,72 @@ func TestOwnerRefRemappingPass2_CrashRecoveryFromStatus(t *testing.T) {
 
 	// Both Status queues must be drained -> restore can reach Completed.
 	assert.Empty(t, restoreObj.Status.PendingOwnerRefPatches)
+	assert.Empty(t, restoreObj.Status.QuiescedObjects)
+}
+
+func TestOwnerRefRemappingPass2_ServerConfigMapCatchUp(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	serverCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "custom-server-ownerref-cm",
+		},
+		Data: map[string]string{
+			ownerref.ConfigMapKeyQuiesceOnRestore: `
+- group: custom.x-k8s.io
+  kind: CustomCluster
+  annotationKey: custom.x-k8s.io/paused
+`,
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), serverCM))
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "custom.x-k8s.io/v1beta1",
+			"kind":       "CustomCluster",
+			"metadata": map[string]any{
+				"name":      "cluster-custom-server",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"custom.x-k8s.io/paused": "",
+					"velero.io/quiesced-key": "custom.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-server-cm",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRemapFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreObj := builder.ForRestore("default", "restore-server-cm").Result()
+	// QuiescedObjects is initially empty to simulate Layer 1 catch-up
+	restoreObj.Status.QuiescedObjects = nil
+
+	finalizerCtx := &finalizerContext{
+		logger:            logger,
+		restore:           restoreObj,
+		crClient:          fakeClient,
+		multiHookTracker:  hook.NewMultiHookTracker(),
+		resourceTimeout:   10 * time.Second,
+		ownerRefConfigMap: "custom-server-ownerref-cm",
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs := finalizerCtx.execute()
+	assert.True(t, warnings.IsEmpty())
+	assert.True(t, errs.IsEmpty())
+
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "custom.x-k8s.io", Version: "v1beta1", Kind: "CustomCluster"})
+	require.NoError(t, fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-custom-server"}, liveCluster))
+	assert.NotContains(t, liveCluster.GetAnnotations(), "custom.x-k8s.io/paused")
+	assert.NotContains(t, liveCluster.GetLabels(), "velero.io/quiesced-by-restore")
 	assert.Empty(t, restoreObj.Status.QuiescedObjects)
 }

@@ -19,11 +19,13 @@ package restore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -298,4 +300,232 @@ func TestRemapSpecRefFields_MultiPass_AlreadyRemapped(t *testing.T) {
 	// patchObj should only update ref2
 	assert.NotContains(t, patchObj["spec"].(map[string]any), "ref1")
 	assert.Equal(t, "new-uid-2", patchObj["spec"].(map[string]any)["ref2"].(map[string]any)["uid"])
+}
+
+func TestProcessSpecReferences_NonRetriableErrorBlocksTarget(t *testing.T) {
+	scheme := runtime.NewScheme()
+	vm := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "kubevirt.io/v1",
+			"kind":       "VirtualMachine",
+			"metadata": map[string]any{
+				"name":      "my-vm",
+				"namespace": "prod",
+			},
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"volumes": []any{
+							map[string]any{
+								"name": "vol-1",
+								"dataVolume": map[string]any{
+									"apiVersion": "cdi.kubevirt.io/v1beta1",
+									"kind":       "DataVolume",
+									"name":       "dv-1",
+									"uid":        "old-dv-uid",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm).Build()
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewInvalid(
+			schema.GroupKind{Group: "kubevirt.io", Kind: "VirtualMachine"},
+			"my-vm",
+			nil,
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
+	scope := ownerref.NewScope()
+	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
+		Group:     "kubevirt.io",
+		Kind:      "VirtualMachine",
+		JSONPaths: []string{"spec.template.spec.volumes[*].dataVolume"},
+	})
+	state.SetScope(scope)
+
+	// Target DataVolume is quiesced in the same namespace
+	dvObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cdi.kubevirt.io/v1beta1",
+			"kind":       "DataVolume",
+			"metadata": map[string]any{
+				"name":      "dv-1",
+				"namespace": "prod",
+			},
+		},
+	}
+	dvRule := ownerref.QuiesceRule{
+		Group:         "cdi.kubevirt.io",
+		Kind:          "DataVolume",
+		AnnotationKey: "cdi.kubevirt.io/storage-paused",
+	}
+	rec, _ := InjectQuiesceMetadata(dvObj, dvRule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObject(rec)
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "kubevirt.io",
+		Version:   "v1",
+		Kind:      "VirtualMachine",
+		Resource:  "virtualmachines",
+		Namespace: "prod",
+		Name:      "my-vm",
+	}
+	state.EnqueueSpecPatch(req)
+
+	warnings, pending, remapped := processSpecReferences(context.Background(), logrus.StandardLogger(), mockClient, state, nil)
+	assert.False(t, warnings.IsEmpty())
+	assert.Empty(t, pending, "Non-retriable specRef failure must not be queued into pendingPatches")
+	assert.Equal(t, 0, remapped)
+
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked, "Target DataVolume must be marked UnquiesceBlocked")
+}
+
+type mockErrorGetClient struct {
+	client.Client
+	getErr error
+}
+
+func (m *mockErrorGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if m.getErr != nil {
+		return m.getErr
+	}
+	return m.Client.Get(ctx, key, obj, opts...)
+}
+
+func TestProcessSpecReferences_RetriablePatchErrorEnqueuesNonEmptyPatch(t *testing.T) {
+	scheme := runtime.NewScheme()
+	vm := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "kubevirt.io/v1",
+			"kind":       "VirtualMachine",
+			"metadata": map[string]any{
+				"name":      "my-vm",
+				"namespace": "prod",
+			},
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"volumes": []any{
+							map[string]any{
+								"name": "vol-1",
+								"dataVolume": map[string]any{
+									"apiVersion": "cdi.kubevirt.io/v1beta1",
+									"kind":       "DataVolume",
+									"name":       "dv-1",
+									"uid":        "old-dv-uid",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm).Build()
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewConflict(
+			schema.GroupResource{Group: "kubevirt.io", Resource: "virtualmachines"},
+			"my-vm",
+			fmt.Errorf("conflict"),
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
+	scope := ownerref.NewScope()
+	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
+		Group:     "kubevirt.io",
+		Kind:      "VirtualMachine",
+		JSONPaths: []string{"spec.template.spec.volumes[*].dataVolume"},
+	})
+	state.SetScope(scope)
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "kubevirt.io",
+		Version:   "v1",
+		Kind:      "VirtualMachine",
+		Resource:  "virtualmachines",
+		Namespace: "prod",
+		Name:      "my-vm",
+	}
+	state.EnqueueSpecPatch(req)
+
+	warnings, pending, remapped := processSpecReferences(context.Background(), logrus.StandardLogger(), mockClient, state, nil)
+	assert.False(t, warnings.IsEmpty())
+	assert.Equal(t, 0, remapped)
+	require.Len(t, pending, 1, "Retriable patch error with valid patch bytes must be queued for Pass 2")
+	assert.NotEmpty(t, pending[0].SpecPatchJSON, "SpecPatchJSON must not be empty")
+	require.Len(t, pending[0].Targets, 1, "Targets must be populated")
+	assert.Equal(t, "DataVolume", pending[0].Targets[0].Kind)
+	assert.Equal(t, "dv-1", pending[0].Targets[0].Name)
+}
+
+func TestProcessSpecReferences_GetFailureBlocksNamespaceAndOmitsEmptyPatch(t *testing.T) {
+	scheme := runtime.NewScheme()
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	mockClient := &mockErrorGetClient{
+		Client: baseClient,
+		getErr: apierrors.NewInternalError(fmt.Errorf("transient etcd error")),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
+	scope := ownerref.NewScope()
+	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
+		Group:     "kubevirt.io",
+		Kind:      "VirtualMachine",
+		JSONPaths: []string{"spec.template.spec.volumes[*].dataVolume"},
+	})
+	state.SetScope(scope)
+
+	dvObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cdi.kubevirt.io/v1beta1",
+			"kind":       "DataVolume",
+			"metadata": map[string]any{
+				"name":      "dv-1",
+				"namespace": "prod",
+			},
+		},
+	}
+	dvRule := ownerref.QuiesceRule{
+		Group:         "cdi.kubevirt.io",
+		Kind:          "DataVolume",
+		AnnotationKey: "cdi.kubevirt.io/storage-paused",
+	}
+	rec, _ := InjectQuiesceMetadata(dvObj, dvRule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObject(rec)
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "kubevirt.io",
+		Version:   "v1",
+		Kind:      "VirtualMachine",
+		Resource:  "virtualmachines",
+		Namespace: "prod",
+		Name:      "my-vm",
+	}
+	state.EnqueueSpecPatch(req)
+
+	warnings, pending, remapped := processSpecReferences(context.Background(), logrus.StandardLogger(), mockClient, state, nil)
+	assert.False(t, warnings.IsEmpty())
+	assert.Empty(t, pending, "Get failure without patch bytes must NOT enqueue into pendingPatches")
+	assert.Equal(t, 0, remapped)
+
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked, "Namespace fallback must mark DataVolume as UnquiesceBlocked")
 }

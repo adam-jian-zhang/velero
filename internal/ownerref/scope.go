@@ -28,29 +28,16 @@ import (
 // Deny list: leaf & intermediate workloads that must NEVER receive ownerRef patching (preserving controller adoption).
 // Top-level workloads (Deployment, StatefulSet, DaemonSet, CronJob) are excluded so that operator-managed
 // workloads can have ownerReferences remapped via ConfigMap inScope opt-in.
-var DenyListGroupKinds = []schema.GroupKind{
+var defaultDenyListGroupKinds = []schema.GroupKind{
 	{Group: "", Kind: "Pod"},
 	{Group: "", Kind: "ReplicationController"},
 	{Group: "apps", Kind: "ReplicaSet"},
 	{Group: "batch", Kind: "Job"},
 }
 
-// Built-in seed groups for CAPI.
-var BuiltInSeedGroups = []string{
-	"cluster.x-k8s.io",
-	"controlplane.cluster.x-k8s.io",
-	"bootstrap.cluster.x-k8s.io",
-	"infrastructure.cluster.x-k8s.io",
-	"ipam.cluster.x-k8s.io",
-	"addons.cluster.x-k8s.io",
-}
-
-// Built-in seed GroupKinds (specifically allowlisting core/PersistentVolumeClaim).
-// Storage controllers and volume operators own core/v1 PersistentVolumeClaim.
-// Because "" (core) is not an API group, seeding core/PersistentVolumeClaim ensures
-// operator-managed PVC ownerReferences are automatically remapped.
-var BuiltInSeedGroupKinds = []schema.GroupKind{
-	{Group: "", Kind: "PersistentVolumeClaim"},
+// DenyListGroupKinds returns a defensive copy of the built-in deny list group kinds.
+func DenyListGroupKinds() []schema.GroupKind {
+	return append([]schema.GroupKind(nil), defaultDenyListGroupKinds...)
 }
 
 // ConfigMap keys and defaults for owner-ref configuration.
@@ -68,67 +55,24 @@ const (
 	ConfigMapKeyQuiesceOnRestore = "quiesceOnRestore"
 )
 
-// BuiltInSpecRefPaths returns default curated ObjectReference-like JSONPaths.
-func BuiltInSpecRefPaths() []SpecRefPathEntry {
-	return []SpecRefPathEntry{
-		{
-			Group: "cluster.x-k8s.io",
-			Kind:  "Cluster",
-			JSONPaths: []string{
-				"spec.infrastructureRef",
-				"spec.controlPlaneRef",
-			},
-		},
-		{
-			Group: "cluster.x-k8s.io",
-			Kind:  "Machine",
-			JSONPaths: []string{
-				"spec.infrastructureRef",
-				"spec.bootstrap.configRef",
-			},
-		},
-	}
-}
-
-// BuiltInQuiesceRules returns default auto-quiesce rules on restore create.
-func BuiltInQuiesceRules() []QuiesceRule {
-	return []QuiesceRule{
-		{
-			Group:           "cluster.x-k8s.io",
-			Kind:            "Cluster",
-			AnnotationKey:   "cluster.x-k8s.io/paused",
-			AnnotationValue: "",
-		},
-	}
-}
-
 // Scope determines which resources are eligible for ownerReference remapping,
 // spec.*Ref rewriting, and automated controller quiescing.
 type Scope struct {
-	seedGroups   map[string]struct{}
-	seedGKs      map[schema.GroupKind]struct{}
 	denyGKs      map[schema.GroupKind]struct{}
 	userEntries  []ScopeEntry
 	SpecRefPaths []SpecRefPathEntry
 	QuiesceRules []QuiesceRule
 }
 
-// NewScope returns a Scope populated with built-in seeds and deny list.
+// NewScope returns a clean Scope populated only with the built-in deny list.
 func NewScope() *Scope {
 	s := &Scope{
-		seedGroups:   make(map[string]struct{}),
-		seedGKs:      make(map[schema.GroupKind]struct{}),
 		denyGKs:      make(map[schema.GroupKind]struct{}),
-		SpecRefPaths: BuiltInSpecRefPaths(),
-		QuiesceRules: BuiltInQuiesceRules(),
+		userEntries:  []ScopeEntry{},
+		SpecRefPaths: []SpecRefPathEntry{},
+		QuiesceRules: []QuiesceRule{},
 	}
-	for _, g := range BuiltInSeedGroups {
-		s.seedGroups[g] = struct{}{}
-	}
-	for _, gk := range BuiltInSeedGroupKinds {
-		s.seedGKs[gk] = struct{}{}
-	}
-	for _, gk := range DenyListGroupKinds {
+	for _, gk := range defaultDenyListGroupKinds {
 		s.denyGKs[gk] = struct{}{}
 	}
 	return s
@@ -136,9 +80,7 @@ func NewScope() *Scope {
 
 // IsInScope checks whether a GVK is eligible for ownerReference remapping.
 // 1. Deny list always wins (GroupKind check for workloads).
-// 2. Built-in seed GroupKinds (e.g. core/PersistentVolumeClaim) match.
-// 3. Built-in seed groups match.
-// 4. User entries from ConfigMap match.
+// 2. Entries from ConfigMap (userEntries) match.
 func (s *Scope) IsInScope(gvk schema.GroupVersionKind) bool {
 	if s == nil {
 		return false
@@ -147,15 +89,7 @@ func (s *Scope) IsInScope(gvk schema.GroupVersionKind) bool {
 	if _, denied := s.denyGKs[gvk.GroupKind()]; denied {
 		return false
 	}
-	// 2. Built-in seed GroupKinds (e.g. core/PersistentVolumeClaim)
-	if _, ok := s.seedGKs[gvk.GroupKind()]; ok {
-		return true
-	}
-	// 3. Built-in seed groups
-	if _, ok := s.seedGroups[gvk.Group]; ok {
-		return true
-	}
-	// 4. User entries from ConfigMap
+	// 2. User entries from ConfigMap
 	for _, e := range s.userEntries {
 		if strings.TrimSpace(e.Group) == "" && strings.TrimSpace(e.Kind) == "" {
 			continue
@@ -231,46 +165,56 @@ func (s *Scope) MatchesQuiesceRule(gvk schema.GroupVersionKind) (QuiesceRule, bo
 	return QuiesceRule{}, false
 }
 
-// LoadScopeFromConfigMap loads custom user entries additively from a ConfigMap.
-func LoadScopeFromConfigMap(cm *corev1api.ConfigMap) (*Scope, error) {
-	s := NewScope()
-	if cm == nil || len(cm.Data) == 0 {
-		return s, nil
+// MergeConfigMap parses user entries additively from a ConfigMap into the receiver Scope.
+// - inScope: entries are unioned, rejecting any entry forbidden by the deny list.
+// - specRefPaths: entries are appended, validating dotted paths.
+// - quiesceOnRestore: entries are merged; if a rule for the same (Group, Kind) already exists, it is replaced.
+func (s *Scope) MergeConfigMap(cm *corev1api.ConfigMap) error {
+	if s == nil || cm == nil || len(cm.Data) == 0 {
+		return nil
 	}
 
 	if inScopeRaw, ok := cm.Data[ConfigMapKeyInScope]; ok && strings.TrimSpace(inScopeRaw) != "" {
 		var userEntries []ScopeEntry
 		if err := yaml.Unmarshal([]byte(inScopeRaw), &userEntries); err != nil {
-			return nil, fmt.Errorf("unmarshaling %s: %w", ConfigMapKeyInScope, err)
+			return fmt.Errorf("unmarshaling %s: %w", ConfigMapKeyInScope, err)
 		}
 		for _, e := range userEntries {
-			if strings.TrimSpace(e.Group) == "" && strings.TrimSpace(e.Kind) == "" {
-				return nil, fmt.Errorf("%s entry has empty group and kind", ConfigMapKeyInScope)
+			group := strings.TrimSpace(e.Group)
+			kind := strings.TrimSpace(e.Kind)
+			if group == "" && kind == "" {
+				return fmt.Errorf("%s entry has empty group and kind", ConfigMapKeyInScope)
 			}
-			gk := schema.GroupKind{Group: strings.TrimSpace(e.Group), Kind: strings.TrimSpace(e.Kind)}
+			gk := schema.GroupKind{Group: group, Kind: kind}
 			if _, denied := s.denyGKs[gk]; denied {
-				return nil, fmt.Errorf("inScope entry %s/%s is a core leaf workload and is forbidden by the built-in deny list", e.Group, e.Kind)
+				return fmt.Errorf("inScope entry %s/%s is a core leaf workload and is forbidden by the built-in deny list", e.Group, e.Kind)
 			}
-			s.userEntries = append(s.userEntries, e)
+			s.addScopeEntry(ScopeEntry{Group: group, Kind: kind})
 		}
 	}
 
 	if specRefRaw, ok := cm.Data[ConfigMapKeySpecRefPaths]; ok && strings.TrimSpace(specRefRaw) != "" {
 		var userSpecPaths []SpecRefPathEntry
 		if err := yaml.Unmarshal([]byte(specRefRaw), &userSpecPaths); err != nil {
-			return nil, fmt.Errorf("unmarshaling %s: %w", ConfigMapKeySpecRefPaths, err)
+			return fmt.Errorf("unmarshaling %s: %w", ConfigMapKeySpecRefPaths, err)
 		}
-		for _, e := range userSpecPaths {
-			if strings.TrimSpace(e.Kind) == "" {
-				return nil, fmt.Errorf("%s entry requires kind", ConfigMapKeySpecRefPaths)
+		for i := range userSpecPaths {
+			e := &userSpecPaths[i]
+			e.Group = strings.TrimSpace(e.Group)
+			e.Version = strings.TrimSpace(e.Version)
+			e.Kind = strings.TrimSpace(e.Kind)
+			if e.Kind == "" {
+				return fmt.Errorf("%s entry requires kind", ConfigMapKeySpecRefPaths)
 			}
 			if len(e.JSONPaths) == 0 {
-				return nil, fmt.Errorf("%s entry %s/%s requires at least one jsonPath", ConfigMapKeySpecRefPaths, e.Group, e.Kind)
+				return fmt.Errorf("%s entry %s/%s requires at least one jsonPath", ConfigMapKeySpecRefPaths, e.Group, e.Kind)
 			}
-			for _, p := range e.JSONPaths {
-				if err := validateDottedSpecPath(p); err != nil {
-					return nil, fmt.Errorf("%s path %q: %w", ConfigMapKeySpecRefPaths, p, err)
+			for j, p := range e.JSONPaths {
+				trimmedPath := strings.TrimSpace(p)
+				if err := validateDottedSpecPath(trimmedPath); err != nil {
+					return fmt.Errorf("%s path %q: %w", ConfigMapKeySpecRefPaths, p, err)
 				}
+				e.JSONPaths[j] = trimmedPath
 			}
 		}
 		s.SpecRefPaths = append(s.SpecRefPaths, userSpecPaths...)
@@ -279,25 +223,57 @@ func LoadScopeFromConfigMap(cm *corev1api.ConfigMap) (*Scope, error) {
 	if quiesceRaw, ok := cm.Data[ConfigMapKeyQuiesceOnRestore]; ok && strings.TrimSpace(quiesceRaw) != "" {
 		var userQuiesceRules []QuiesceRule
 		if err := yaml.Unmarshal([]byte(quiesceRaw), &userQuiesceRules); err != nil {
-			return nil, fmt.Errorf("unmarshaling %s: %w", ConfigMapKeyQuiesceOnRestore, err)
+			return fmt.Errorf("unmarshaling %s: %w", ConfigMapKeyQuiesceOnRestore, err)
 		}
 		for _, r := range userQuiesceRules {
+			r.Group = strings.TrimSpace(r.Group)
+			r.Kind = strings.TrimSpace(r.Kind)
+			r.AnnotationKey = strings.TrimSpace(r.AnnotationKey)
+			r.AnnotationValue = strings.TrimSpace(r.AnnotationValue)
 			if strings.TrimSpace(r.SpecFieldPath) != "" {
-				return nil, fmt.Errorf("%s specFieldPath is not supported; v1 quiesce is annotation-only", ConfigMapKeyQuiesceOnRestore)
+				return fmt.Errorf("%s specFieldPath is not supported; v1 quiesce is annotation-only", ConfigMapKeyQuiesceOnRestore)
 			}
-			if strings.TrimSpace(r.Kind) == "" {
-				return nil, fmt.Errorf("%s entry requires kind", ConfigMapKeyQuiesceOnRestore)
+			if r.Kind == "" {
+				return fmt.Errorf("%s entry requires kind", ConfigMapKeyQuiesceOnRestore)
 			}
-			if strings.TrimSpace(r.AnnotationKey) == "" {
-				return nil, fmt.Errorf("%s entry %s/%s requires annotationKey", ConfigMapKeyQuiesceOnRestore, r.Group, r.Kind)
+			if r.AnnotationKey == "" {
+				return fmt.Errorf("%s entry %s/%s requires annotationKey", ConfigMapKeyQuiesceOnRestore, r.Group, r.Kind)
 			}
 			if strings.ContainsAny(r.AnnotationKey, " \t") {
-				return nil, fmt.Errorf("%s annotationKey %q is not a valid Kubernetes annotation key", ConfigMapKeyQuiesceOnRestore, r.AnnotationKey)
+				return fmt.Errorf("%s annotationKey %q is not a valid Kubernetes annotation key", ConfigMapKeyQuiesceOnRestore, r.AnnotationKey)
 			}
+			s.addOrReplaceQuiesceRule(r)
 		}
-		s.QuiesceRules = append(s.QuiesceRules, userQuiesceRules...)
 	}
 
+	return nil
+}
+
+func (s *Scope) addScopeEntry(e ScopeEntry) {
+	for _, existing := range s.userEntries {
+		if existing.Group == e.Group && existing.Kind == e.Kind {
+			return
+		}
+	}
+	s.userEntries = append(s.userEntries, e)
+}
+
+func (s *Scope) addOrReplaceQuiesceRule(newRule QuiesceRule) {
+	for i, existing := range s.QuiesceRules {
+		if existing.Group == newRule.Group && existing.Kind == newRule.Kind {
+			s.QuiesceRules[i] = newRule
+			return
+		}
+	}
+	s.QuiesceRules = append(s.QuiesceRules, newRule)
+}
+
+// LoadScopeFromConfigMap loads custom user entries from a ConfigMap into a new Scope.
+func LoadScopeFromConfigMap(cm *corev1api.ConfigMap) (*Scope, error) {
+	s := NewScope()
+	if err := s.MergeConfigMap(cm); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -310,7 +286,7 @@ func validateDottedSpecPath(path string) error {
 		return fmt.Errorf("JSONPath syntax is not supported; use dotted spec.* paths with optional [*]")
 	}
 	if path != "spec" && !strings.HasPrefix(path, "spec.") {
-		return fmt.Errorf("must start with spec.")
+		return fmt.Errorf("must start with spec")
 	}
 	normalized := strings.ReplaceAll(path, "[*]", ".[*].")
 	for _, seg := range strings.Split(normalized, ".") {
@@ -318,7 +294,7 @@ func validateDottedSpecPath(path string) error {
 		if seg == "" {
 			continue
 		}
-		if strings.HasPrefix(seg, "[") && seg != "[*]" {
+		if (strings.Contains(seg, "[") || strings.Contains(seg, "]")) && seg != "[*]" {
 			return fmt.Errorf("wildcard array segments must be exactly [*]")
 		}
 	}

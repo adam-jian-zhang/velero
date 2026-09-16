@@ -303,6 +303,9 @@ func describeOwnerRefRemapping(d *Describer, restore *velerov1api.Restore) {
 			if q.AnnotationKey != "" {
 				paused = fmt.Sprintf(" (paused via %s)", q.AnnotationKey)
 			}
+			if q.UnquiesceBlocked {
+				paused += " [unquiesce blocked]"
+			}
 			d.Printf("    - %s/%s/%s %s%s\n", q.Group, q.Version, q.Kind, nsName, paused)
 		}
 	}
@@ -311,16 +314,19 @@ func describeOwnerRefRemapping(d *Describer, restore *velerov1api.Restore) {
 		d.Printf("  Pending Patches:\tnone\n")
 	} else {
 		d.Printf("  Pending Patches:\n")
+		isTerminal := restore.Status.Phase == velerov1api.RestorePhaseCompleted ||
+			restore.Status.Phase == velerov1api.RestorePhasePartiallyFailed ||
+			restore.Status.Phase == velerov1api.RestorePhaseFailed
 		for _, p := range restore.Status.PendingOwnerRefPatches {
 			nsName := p.Name
 			if p.Namespace != "" {
 				nsName = p.Namespace + "/" + p.Name
 			}
-			errMsg := p.Error
-			if errMsg == "" {
-				errMsg = "pending"
+			statusText := "retrying in Pass 2"
+			if isTerminal {
+				statusText = "failed in Pass 2"
 			}
-			d.Printf("    - %s/%s/%s %s (%s: %s)\n", p.Group, p.Version, p.Kind, nsName, p.PatchType, errMsg)
+			d.Printf("    - %s/%s/%s %s (%s: %s)\n", p.Group, p.Version, p.Kind, nsName, p.PatchType, statusText)
 		}
 	}
 

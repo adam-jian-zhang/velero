@@ -23,6 +23,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/vmware-tanzu/velero/internal/ownerref"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
 func TestInjectQuiesceMetadata(t *testing.T) {
@@ -79,7 +81,7 @@ func TestInjectQuiesceMetadata(t *testing.T) {
 	}
 	recPre, quiescedPre := InjectQuiesceMetadata(objPrePaused, rule, "restore-test-1", logrus.StandardLogger())
 	assert.False(t, quiescedPre)
-	assert.Equal(t, "", recPre.AnnotationKey)
+	assert.Empty(t, recPre.AnnotationKey)
 
 	// 3. Rule with empty annotation key -> should NOT inject anything
 	emptyRule := ownerref.QuiesceRule{
@@ -191,6 +193,12 @@ func TestCanUnquiesce(t *testing.T) {
 		},
 	}
 	assert.True(t, CanUnquiesce(clusterQ, patchesDifferentGroup))
+
+	// Case 7: QuiescedObject is marked UnquiesceBlocked -> not eligible even if pendingPatches is nil or empty
+	blockedQ := clusterQ
+	blockedQ.UnquiesceBlocked = true
+	assert.False(t, CanUnquiesce(blockedQ, nil))
+	assert.False(t, CanUnquiesce(blockedQ, []velerov1api.PendingPatchRef{}))
 }
 
 func TestUnquiesceEligibleObjects(t *testing.T) {
@@ -543,10 +551,116 @@ func TestCatchLeftoverPausedObjects(t *testing.T) {
 		},
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(paused, unrelated).Build()
-	rules := ownerref.BuiltInQuiesceRules()
+	rules := []ownerref.QuiesceRule{
+		{
+			Group:         "cluster.x-k8s.io",
+			Kind:          "Cluster",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
 
 	leftover := CatchLeftoverPausedObjects(context.Background(), logrus.StandardLogger(), fakeClient, nil, "rst-leftover", rules)
 	require.Len(t, leftover, 1)
 	assert.Equal(t, "cluster-leftover", leftover[0].Name)
 	assert.Equal(t, "cluster.x-k8s.io/paused", leftover[0].AnnotationKey)
+}
+
+func TestCatchLeftoverPausedObjects_ContextCancelled(t *testing.T) {
+	scheme := runtime.NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	rules := []ownerref.QuiesceRule{
+		{
+			Group:         "cluster.x-k8s.io",
+			Kind:          "Cluster",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before calling
+
+	leftover := CatchLeftoverPausedObjects(ctx, logrus.StandardLogger(), fakeClient, nil, "rst-test", rules)
+	assert.Empty(t, leftover)
+}
+
+func TestLoadQuiesceRulesForCatchUp(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1api.AddToScheme(scheme))
+
+	// 1. Baseline ConfigMap present in cluster
+	baselineCM, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
+	require.NoError(t, err)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(baselineCM).Build()
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "velero",
+			Name:      "test-restore",
+		},
+	}
+
+	rules := LoadQuiesceRulesForCatchUp(context.Background(), fakeClient, restore, "")
+	require.Len(t, rules, 1)
+	assert.Equal(t, "cluster.x-k8s.io", rules[0].Group)
+	assert.Equal(t, "Cluster", rules[0].Kind)
+	assert.Equal(t, "cluster.x-k8s.io/paused", rules[0].AnnotationKey)
+
+	// 2. Server-configured custom baseline ConfigMap
+	serverCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "velero",
+			Name:      "server-custom-baseline-cm",
+		},
+		Data: map[string]string{
+			ownerref.ConfigMapKeyQuiesceOnRestore: `
+- group: server.io
+  kind: ServerApp
+  annotationKey: server.io/paused
+`,
+		},
+	}
+	require.NoError(t, fakeClient.Create(context.Background(), serverCM))
+
+	serverRules := LoadQuiesceRulesForCatchUp(context.Background(), fakeClient, restore, "server-custom-baseline-cm")
+	require.Len(t, serverRules, 1)
+	assert.Equal(t, "server.io", serverRules[0].Group)
+	assert.Equal(t, "ServerApp", serverRules[0].Kind)
+	assert.Equal(t, "server.io/paused", serverRules[0].AnnotationKey)
+
+	// 3. Per-restore ConfigMap override
+	customCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "velero",
+			Name:      "restore-custom-cm",
+		},
+		Data: map[string]string{
+			ownerref.ConfigMapKeyQuiesceOnRestore: `
+- group: cluster.x-k8s.io
+  kind: Cluster
+  annotationKey: custom-cluster.io/paused
+  annotationValue: "custom"
+- group: custom.io
+  kind: CustomApp
+  annotationKey: custom.io/paused
+`,
+		},
+	}
+	require.NoError(t, fakeClient.Create(context.Background(), customCM))
+
+	restoreWithCustom := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "velero",
+			Name:      "test-restore-custom",
+		},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Name: "restore-custom-cm",
+			},
+		},
+	}
+
+	overrideRules := LoadQuiesceRulesForCatchUp(context.Background(), fakeClient, restoreWithCustom, "")
+	require.Len(t, overrideRules, 2)
+	assert.Equal(t, "custom-cluster.io/paused", overrideRules[0].AnnotationKey, "Restore CM must override baseline quiesce rule for Cluster")
+	assert.Equal(t, "custom.io/paused", overrideRules[1].AnnotationKey)
 }

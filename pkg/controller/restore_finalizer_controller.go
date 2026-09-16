@@ -70,6 +70,7 @@ type restoreFinalizerReconciler struct {
 	multiHookTracker  *hook.MultiHookTracker
 	resourceTimeout   time.Duration
 	restMapper        meta.RESTMapper
+	ownerRefConfigMap string
 }
 
 func NewRestoreFinalizerReconciler(
@@ -83,6 +84,7 @@ func NewRestoreFinalizerReconciler(
 	multiHookTracker *hook.MultiHookTracker,
 	resourceTimeout time.Duration,
 	restMapper meta.RESTMapper,
+	ownerRefConfigMap string,
 ) *restoreFinalizerReconciler {
 	return &restoreFinalizerReconciler{
 		Client:            client,
@@ -96,6 +98,7 @@ func NewRestoreFinalizerReconciler(
 		multiHookTracker:  multiHookTracker,
 		resourceTimeout:   resourceTimeout,
 		restMapper:        restMapper,
+		ownerRefConfigMap: ownerRefConfigMap,
 	}
 }
 
@@ -196,6 +199,7 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		multiHookTracker:   r.multiHookTracker,
 		resourceTimeout:    r.resourceTimeout,
 		restMapper:         r.restMapper,
+		ownerRefConfigMap:  r.ownerRefConfigMap,
 		restoreItemOperationList: restoreItemOperationList{
 			items: restoreItemOperations,
 		},
@@ -317,6 +321,7 @@ type finalizerContext struct {
 	multiHookTracker         *hook.MultiHookTracker
 	resourceTimeout          time.Duration
 	restMapper               meta.RESTMapper
+	ownerRefConfigMap        string
 }
 
 func (ctx *finalizerContext) execute() (results.Result, results.Result) {
@@ -352,7 +357,7 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 
 		// Layer 1 leftover-pause catch-up: Status persist may have raced; labels cannot rebuild patches or uidMap.
 		if len(ctx.restore.Status.QuiescedObjects) == 0 {
-			rules := pkgrestore.LoadQuiesceRulesForCatchUp(remapCtx, ctx.crClient, ctx.restore)
+			rules := pkgrestore.LoadQuiesceRulesForCatchUp(remapCtx, ctx.crClient, ctx.restore, ctx.ownerRefConfigMap)
 			if leftovers := pkgrestore.CatchLeftoverPausedObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restMapper, ctx.restore.Name, rules); len(leftovers) > 0 {
 				ctx.restore.Status.QuiescedObjects = leftovers
 			}

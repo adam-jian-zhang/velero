@@ -588,8 +588,6 @@ spec:
                   description: PendingPatchRef records an item that requires ownerReference
                     or specRef patching retry in Pass 2.
                   properties:
-                    error:
-                      type: string
                     group:
                       type: string
                     kind:
@@ -650,10 +648,6 @@ spec:
                       type: string
                     specPatchJSON:
                       type: string
-                    specRefPaths:
-                      items:
-                        type: string
-                      type: array
                     targets:
                       items:
                         description: TargetRef records an owner or spec reference
@@ -736,6 +730,8 @@ spec:
                       type: string
                     namespace:
                       type: string
+                    unquiesceBlocked:
+                      type: boolean
                     version:
                       type: string
                   required:

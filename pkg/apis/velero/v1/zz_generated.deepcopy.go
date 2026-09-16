@@ -949,11 +949,6 @@ func (in *PendingPatchRef) DeepCopyInto(out *PendingPatchRef) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
-	if in.SpecRefPaths != nil {
-		in, out := &in.SpecRefPaths, &out.SpecRefPaths
-		*out = make([]string, len(*in))
-		copy(*out, *in)
-	}
 	if in.Targets != nil {
 		in, out := &in.Targets, &out.Targets
 		*out = make([]TargetRef, len(*in))

@@ -19,7 +19,9 @@ package restore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"reflect"
 
 	"github.com/sirupsen/logrus"
@@ -44,6 +46,31 @@ const (
 	uidKey             = "uid"
 	namespaceKey       = "namespace"
 )
+
+// isRetriablePatchError determines whether an API patch failure is transient and eligible
+// for Pass 2 retry in RestoreFinalizerController. Non-retriable errors (HTTP 400, 404, 422,
+// webhook schema/immutability rejections) are filtered out to prevent etcd status bloat.
+func isRetriablePatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apierrors.IsConflict(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsInternalError(err) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return false
+}
 
 // ApplyOwnerRefRemapping runs Phase 1B ownerRef patches then spec-ref remapping.
 // Permanently missing parents are logged as warnings and omitted from patches without blocking restore.
@@ -77,17 +104,25 @@ func ApplyOwnerRefRemapping(
 		if err != nil {
 			log.WithError(err).Warnf("Failed to patch ownerReferences for %s/%s", req.Namespace, req.Name)
 			warnings.Add(req.Namespace, err)
-			remainingQueue = append(remainingQueue, req)
-			pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
-				Group:           req.Group,
-				Version:         req.Version,
-				Kind:            req.Kind,
-				Namespace:       req.Namespace,
-				Name:            req.Name,
-				PatchType:       "ownerRef",
-				OwnerReferences: remapped,
-				Error:           err.Error(),
-			})
+			if isRetriablePatchError(err) {
+				remainingQueue = append(remainingQueue, req)
+				pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
+					Group:           req.Group,
+					Version:         req.Version,
+					Kind:            req.Kind,
+					Namespace:       req.Namespace,
+					Name:            req.Name,
+					PatchType:       "ownerRef",
+					OwnerReferences: remapped,
+				})
+			} else {
+				// Non-retriable error: do NOT enqueue to pendingPatches or remainingQueue (prevents etcd bloat).
+				// Instead, mark the owner parents as unquiesceBlocked so they remain safely paused in etcd.
+				for _, ref := range remapped {
+					ownerGroup := ownerRefGroup(ref.APIVersion)
+					state.BlockUnquiesceForTarget(ownerGroup, ref.Kind, req.Namespace, ref.Name)
+				}
+			}
 			continue
 		}
 		if len(remapped) > 0 {
@@ -177,7 +212,7 @@ func patchObjectOwnerRefs(
 		return fmt.Errorf("nil client")
 	}
 
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+	return retry.OnError(retry.DefaultBackoff, isRetriablePatchError, func() error {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   req.Group,
@@ -359,31 +394,29 @@ func RetryPendingPatches(
 			if err := patchObjectOwnerRefs(ctx, crClient, req, p.OwnerReferences, log); err != nil {
 				log.WithError(err).Warnf("Pass 2 retry failed for ownerRef patch on %s/%s", p.Namespace, p.Name)
 				warnings.Add(p.Namespace, err)
-				p.Error = err.Error()
 				remainingPending = append(remainingPending, p)
-		} else {
-			log.Infof("Pass 2 retry succeeded: patched ownerReferences on %s/%s", p.Namespace, p.Name)
-			if restore != nil {
-				// Increment only on Pass 2 success. Safe from double-counting because
-				// PendingOwnerRefPatches only holds items that FAILED Pass 1 (so they were not counted
-				// in restore.Status.OwnerRefsRemapped during Pass 1). A successful retry removes the
-				// item from the pending list, so it cannot be counted again on a later reconcile.
-				// If this invariant ever changes (e.g. re-queueing successful items), this counter
-				// would double-count and must be revisited.
-				restore.Status.OwnerRefsRemapped++
+			} else {
+				log.Infof("Pass 2 retry succeeded: patched ownerReferences on %s/%s", p.Namespace, p.Name)
+				if restore != nil {
+					// Increment only on Pass 2 success. Safe from double-counting because
+					// PendingOwnerRefPatches only holds items that FAILED Pass 1 (so they were not counted
+					// in restore.Status.OwnerRefsRemapped during Pass 1). A successful retry removes the
+					// item from the pending list, so it cannot be counted again on a later reconcile.
+					// If this invariant ever changes (e.g. re-queueing successful items), this counter
+					// would double-count and must be revisited.
+					restore.Status.OwnerRefsRemapped++
+				}
 			}
-		}
 
-	case "specRef":
+		case "specRef":
 			if p.SpecPatchJSON == "" {
 				err := fmt.Errorf("empty SpecPatchJSON for specRef retry on %s/%s", p.Namespace, p.Name)
 				log.WithError(err).Warnf("Pass 2 retry failed for specRef patch on %s/%s", p.Namespace, p.Name)
 				warnings.Add(p.Namespace, err)
-				p.Error = err.Error()
 				remainingPending = append(remainingPending, p)
 				continue
 			}
-			err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			err := retry.OnError(retry.DefaultBackoff, isRetriablePatchError, func() error {
 				liveObj := &unstructured.Unstructured{}
 				liveObj.SetGroupVersionKind(gvk)
 				if err := crClient.Get(ctx, key, liveObj); err != nil {
@@ -411,16 +444,15 @@ func RetryPendingPatches(
 			if err != nil {
 				log.WithError(err).Warnf("Pass 2 retry failed for specRef patch on %s/%s", p.Namespace, p.Name)
 				warnings.Add(p.Namespace, err)
-				p.Error = err.Error()
 				remainingPending = append(remainingPending, p)
-		} else {
-			log.Infof("Pass 2 retry succeeded: patched spec references on %s/%s", p.Namespace, p.Name)
-			if restore != nil {
-				// Same double-counting invariant as the ownerRef branch above: only failed Pass 1
-				// items are retried, and a successful retry removes the item from the pending list.
-				restore.Status.SpecRefsRemapped++
+			} else {
+				log.Infof("Pass 2 retry succeeded: patched spec references on %s/%s", p.Namespace, p.Name)
+				if restore != nil {
+					// Same double-counting invariant as the ownerRef branch above: only failed Pass 1
+					// items are retried, and a successful retry removes the item from the pending list.
+					restore.Status.SpecRefsRemapped++
+				}
 			}
-		}
 		}
 	}
 

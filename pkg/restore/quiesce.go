@@ -97,11 +97,16 @@ func InjectQuiesceMetadata(
 }
 
 // CanUnquiesce evaluates whether a quiesced object Q is eligible to be unquiesced.
-// An object Q can be unquiesced if and only if NO remaining patch request in pendingPatches:
-// 1. targets Q directly, AND
-// 2. names Q as an owner reference, AND
-// 3. names Q as a spec reference target.
+// An object Q can be unquiesced if and only if:
+//  1. Q.UnquiesceBlocked is false (not blocked by a non-retriable child patch failure), AND
+//  2. NO remaining patch request in pendingPatches:
+//     a. targets Q directly, AND
+//     b. names Q as an owner reference, AND
+//     c. names Q as a spec reference target.
 func CanUnquiesce(q velerov1api.QuiescedObjectRef, pendingPatches []velerov1api.PendingPatchRef) bool {
+	if q.UnquiesceBlocked {
+		return false
+	}
 	for _, p := range pendingPatches {
 		// 1. Is Q itself still pending a patch?
 		if p.Group == q.Group && p.Kind == q.Kind && p.Namespace == q.Namespace && p.Name == q.Name {
@@ -272,10 +277,16 @@ func CatchLeftoverPausedObjects(
 		}
 		versions := resolvedVersionsFor(restMapper, rule.Group, rule.Kind, log)
 		for _, version := range versions {
+			if ctx.Err() != nil {
+				return leftover
+			}
 			list := &unstructured.UnstructuredList{}
 			gvk := schema.GroupVersionKind{Group: rule.Group, Version: version, Kind: rule.Kind}
 			list.SetGroupVersionKind(schema.GroupVersionKind{Group: gvk.Group, Version: gvk.Version, Kind: gvk.Kind + "List"})
 			if err := crClient.List(ctx, list, client.MatchingLabels{LabelQuiescedByRestore: restoreName}); err != nil {
+				if ctx.Err() != nil {
+					return leftover
+				}
 				continue
 			}
 			for i := range list.Items {
@@ -287,7 +298,7 @@ func CatchLeftoverPausedObjects(
 				if objGVK.Group != rule.Group || objGVK.Kind != rule.Kind {
 					continue
 				}
-				key := fmt.Sprintf("%s/%s/%s/%s/%s", objGVK.Group, objGVK.Version, objGVK.Kind, obj.GetNamespace(), obj.GetName())
+				key := fmt.Sprintf("%s/%s/%s/%s", objGVK.Group, objGVK.Kind, obj.GetNamespace(), obj.GetName())
 				if _, ok := seen[key]; ok {
 					continue
 				}
@@ -300,8 +311,8 @@ func CatchLeftoverPausedObjects(
 				}
 				leftover = append(leftover, velerov1api.QuiescedObjectRef{
 					Group:         objGVK.Group,
-					Version:        objGVK.Version,
-					Kind:           objGVK.Kind,
+					Version:       objGVK.Version,
+					Kind:          objGVK.Kind,
 					Namespace:     obj.GetNamespace(),
 					Name:          obj.GetName(),
 					AnnotationKey: annKey,
@@ -333,25 +344,36 @@ func resolvedVersionsFor(restMapper meta.RESTMapper, group, kind string, log log
 	return leftoverFallbackVersions
 }
 
-// LoadQuiesceRulesForCatchUp returns built-in ∪ ConfigMap quiesce rules for leftover-pause catch-up.
-func LoadQuiesceRulesForCatchUp(ctx context.Context, crClient client.Client, restore *velerov1api.Restore) []ownerref.QuiesceRule {
+// LoadQuiesceRulesForCatchUp returns baseline ∪ per-restore ConfigMap quiesce rules for leftover-pause catch-up.
+func LoadQuiesceRulesForCatchUp(ctx context.Context, crClient client.Client, restore *velerov1api.Restore, serverConfigMap string) []ownerref.QuiesceRule {
 	scope := ownerref.NewScope()
 	if crClient == nil || restore == nil {
 		return scope.QuiesceRules
 	}
 
-	cmName := ownerref.DefaultConfigMapName
-	if restore.Spec.OwnerRefConfigMap != nil && strings.TrimSpace(restore.Spec.OwnerRefConfigMap.Name) != "" {
-		cmName = restore.Spec.OwnerRefConfigMap.Name
+	// 1. Load baseline ConfigMap (serverConfigMap or fallback to velero-ownerref-config) if present
+	baselineCMName := strings.TrimSpace(serverConfigMap)
+	if baselineCMName == "" {
+		baselineCMName = ownerref.DefaultConfigMapName
 	}
 
-	cm := &corev1api.ConfigMap{}
-	if err := crClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: cmName}, cm); err != nil {
-		return scope.QuiesceRules
+	baselineCM := &corev1api.ConfigMap{}
+	if err := crClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: baselineCMName}, baselineCM); err == nil {
+		// Catch-up pause cleanup is best-effort; ignore parse error here.
+		_ = scope.MergeConfigMap(baselineCM)
 	}
-	loaded, err := ownerref.LoadScopeFromConfigMap(cm)
-	if err != nil || loaded == nil {
-		return scope.QuiesceRules
+
+	// 2. Merge per-restore ConfigMap if specified and different from baseline
+	if restore.Spec.OwnerRefConfigMap != nil && strings.TrimSpace(restore.Spec.OwnerRefConfigMap.Name) != "" {
+		restoreCMName := strings.TrimSpace(restore.Spec.OwnerRefConfigMap.Name)
+		if restoreCMName != baselineCMName {
+			restoreCM := &corev1api.ConfigMap{}
+			if err := crClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: restoreCMName}, restoreCM); err == nil {
+				// Catch-up pause cleanup is best-effort; ignore parse error here.
+				_ = scope.MergeConfigMap(restoreCM)
+			}
+		}
 	}
-	return loaded.QuiesceRules
+
+	return scope.QuiesceRules
 }

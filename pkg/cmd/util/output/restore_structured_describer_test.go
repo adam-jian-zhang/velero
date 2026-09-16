@@ -1006,4 +1006,35 @@ func TestDescribeRestoreInSF(t *testing.T) {
 		out := DescribeRestoreInSF(ctx, kbClient, r, nil, false, false, "", "json")
 		require.Contains(t, out, `"phase": "New"`)
 	})
+
+	t.Run("ownerReferenceRemapping includes unquiesceBlocked", func(t *testing.T) {
+		r := builder.ForRestore("velero", "restore-ownerref").Result()
+		r.Spec.OwnerRefConfigMap = &corev1api.TypedLocalObjectReference{Name: "my-cm"}
+		r.Status.OwnerRefsRemapped = 5
+		r.Status.SpecRefsRemapped = 3
+		r.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+			{
+				Group:            "cluster.x-k8s.io",
+				Version:          "v1beta1",
+				Kind:             "Cluster",
+				Namespace:        "default",
+				Name:             "c1",
+				AnnotationKey:    "cluster.x-k8s.io/paused",
+				UnquiesceBlocked: true,
+			},
+		}
+		out := DescribeRestoreInSF(ctx, kbClient, r, nil, false, false, "", "json")
+		var p map[string]any
+		require.NoError(t, json.Unmarshal([]byte(out), &p))
+		remap, ok := p["ownerReferenceRemapping"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, float64(5), remap["remappedOwnerRefs"])
+		assert.Equal(t, float64(3), remap["remappedSpecRefs"])
+		assert.Equal(t, "my-cm", remap["configMap"])
+		quiesced, ok := remap["quiescedObjects"].([]any)
+		require.True(t, ok)
+		require.Len(t, quiesced, 1)
+		q0 := quiesced[0].(map[string]any)
+		assert.Equal(t, true, q0["unquiesceBlocked"])
+	})
 }

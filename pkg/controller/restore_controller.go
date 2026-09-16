@@ -527,62 +527,56 @@ func (r *restoreReconciler) loadOwnerRefScope(ctx context.Context, restore *api.
 		return nil
 	}
 
-	cmName := ""
-	isPerRestore := false
+	scope := ownerref.NewScope()
 
+	// Tier 1 (Baseline): Load from server-configured flag or conventional velero-ownerref-config
+	baselineCMName := r.ownerRefConfigMap
+	isServerFlag := true
+	if baselineCMName == "" {
+		baselineCMName = defaultOwnerRefConfigMap
+		isServerFlag = false
+	}
+
+	baselineCM := &corev1api.ConfigMap{}
+	if err := r.kbClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: baselineCMName}, baselineCM); err == nil {
+		if err := scope.MergeConfigMap(baselineCM); err != nil {
+			r.logger.WithError(err).Warnf("Error parsing baseline owner-ref configmap %s/%s, proceeding with empty baseline", restore.Namespace, baselineCMName)
+		} else {
+			r.logger.Infof("Loaded baseline owner-ref configmap %s/%s", restore.Namespace, baselineCMName)
+		}
+	} else if isServerFlag {
+		r.logger.WithError(err).Warnf("Failed to retrieve server-configured baseline owner-ref configmap %s/%s", restore.Namespace, baselineCMName)
+	}
+
+	// Tier 2 (Restore Delta): Merge per-restore ConfigMap, if specified
 	if restore.Spec.OwnerRefConfigMap != nil {
 		if restore.Spec.OwnerRefConfigMap.Kind != "" && !strings.EqualFold(restore.Spec.OwnerRefConfigMap.Kind, "ConfigMap") {
 			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
 				fmt.Sprintf("invalid ownerRefConfigMap: kind must be ConfigMap, got %q", restore.Spec.OwnerRefConfigMap.Kind))
 			// Per-restore validation failure: return nil so a caller that forgets to check
-			// ValidationErrors cannot accidentally activate the engine with bare built-in seeds.
+			// ValidationErrors cannot accidentally activate the engine with bare built-in scope.
 			return nil
 		}
 		if restore.Spec.OwnerRefConfigMap.Name == "" {
 			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "ownerRefConfigMap name cannot be empty")
 			return nil
 		}
-		cmName = restore.Spec.OwnerRefConfigMap.Name
-		isPerRestore = true
-	} else if r.ownerRefConfigMap != "" {
-		cmName = r.ownerRefConfigMap
+		restoreCMName := restore.Spec.OwnerRefConfigMap.Name
+		restoreCM := &corev1api.ConfigMap{}
+		if err := r.kbClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: restoreCMName}, restoreCM); err != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("failed to get owner-ref configmap %s/%s: %v", restore.Namespace, restoreCMName, err))
+			return nil
+		}
+		if err := scope.MergeConfigMap(restoreCM); err != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("error parsing owner-ref configmap %s/%s: %v", restore.Namespace, restoreCMName, err))
+			return nil
+		}
+		r.logger.Infof("Merged per-restore owner-ref configmap %s/%s onto baseline", restore.Namespace, restoreCMName)
 	}
 
-	if cmName != "" {
-		cm := &corev1api.ConfigMap{}
-		if err := r.kbClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: cmName}, cm); err != nil {
-			if isPerRestore {
-				restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
-					fmt.Sprintf("failed to get owner-ref configmap %s/%s: %v", restore.Namespace, cmName, err))
-				return nil
-			}
-			r.logger.WithError(err).Warnf("Failed to retrieve default owner-ref configmap %s/%s, falling back to built-in defaults", restore.Namespace, cmName)
-			return ownerref.NewScope()
-		}
-		scope, err := ownerref.LoadScopeFromConfigMap(cm)
-		if err != nil {
-			if isPerRestore {
-				restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
-					fmt.Sprintf("error parsing owner-ref configmap %s/%s: %v", restore.Namespace, cmName, err))
-				return nil
-			}
-			r.logger.WithError(err).Warnf("Error parsing default owner-ref configmap %s/%s, falling back to built-in defaults", restore.Namespace, cmName)
-			return ownerref.NewScope()
-		}
-		return scope
-	}
-
-	// Try conventional default name if present
-	conventionalCM := &corev1api.ConfigMap{}
-	if err := r.kbClient.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: defaultOwnerRefConfigMap}, conventionalCM); err == nil {
-		scope, err := ownerref.LoadScopeFromConfigMap(conventionalCM)
-		if err == nil {
-			return scope
-		}
-		r.logger.WithError(err).Warnf("Error parsing conventional owner-ref configmap %s/%s, falling back to built-in defaults", restore.Namespace, defaultOwnerRefConfigMap)
-	}
-
-	return ownerref.NewScope()
+	return scope
 }
 
 // backupXorScheduleProvided returns true if exactly one of BackupName and
