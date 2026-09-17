@@ -17,6 +17,7 @@ limitations under the License.
 package ownerref
 
 import (
+	"fmt"
 	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,12 +33,12 @@ type ScopeEntry struct {
 	Kind  string `yaml:"kind,omitempty" json:"kind,omitempty"`
 }
 
-// SpecRefPathEntry configures object-reference-like spec JSONPaths to remap for a GVK.
+// SpecRefPathEntry configures object-reference-like spec field paths to remap for a GVK.
 type SpecRefPathEntry struct {
-	Group     string   `yaml:"group" json:"group"`
-	Version   string   `yaml:"version,omitempty" json:"version,omitempty"`
-	Kind      string   `yaml:"kind" json:"kind"`
-	JSONPaths []string `yaml:"jsonPaths" json:"jsonPaths"`
+	Group   string   `yaml:"group" json:"group"`
+	Version string   `yaml:"version,omitempty" json:"version,omitempty"`
+	Kind    string   `yaml:"kind" json:"kind"`
+	Paths   []string `yaml:"paths" json:"paths"`
 }
 
 // QuiesceRule configures automatic controller quiescing for a GVK on restore create.
@@ -55,6 +56,7 @@ type QuiescedObjectRecord = velerov1api.QuiescedObjectRef
 
 // OwnerPatchRequest holds deferred Phase 1B ownerReference patch work for one child object.
 type OwnerPatchRequest struct {
+	OldUID            types.UID               `json:"oldUID,omitempty"`
 	Group             string                  `json:"group"`
 	Version           string                  `json:"version"`
 	Kind              string                  `json:"kind"`
@@ -79,11 +81,13 @@ func (r OwnerPatchRequest) GroupVersionKind() schema.GroupVersionKind {
 type OwnerRefRemapState struct {
 	Enabled bool `json:"enabled"`
 
-	uidMap          map[types.UID]types.UID
-	ownerPatchQueue []OwnerPatchRequest
-	specPatchQueue  []OwnerPatchRequest
-	specRefPaths    []SpecRefPathEntry
-	quiescedObjects []QuiescedObjectRecord
+	uidMap           map[types.UID]types.UID
+	parentMap        map[types.UID][]types.UID
+	quiescedByOldUID map[types.UID]QuiescedObjectRecord
+	ownerPatchQueue  []OwnerPatchRequest
+	specPatchQueue   []OwnerPatchRequest
+	specRefPaths     []SpecRefPathEntry
+	quiescedObjects  []QuiescedObjectRecord
 
 	uidMapLock sync.RWMutex
 	queueLock  sync.Mutex
@@ -94,8 +98,10 @@ type OwnerRefRemapState struct {
 // NewOwnerRefRemapState creates a new initialized OwnerRefRemapState.
 func NewOwnerRefRemapState() *OwnerRefRemapState {
 	return &OwnerRefRemapState{
-		uidMap:  make(map[types.UID]types.UID),
-		newUIDs: make(map[types.UID]struct{}),
+		uidMap:           make(map[types.UID]types.UID),
+		parentMap:        make(map[types.UID][]types.UID),
+		quiescedByOldUID: make(map[types.UID]QuiescedObjectRecord),
+		newUIDs:          make(map[types.UID]struct{}),
 	}
 }
 
@@ -174,6 +180,107 @@ func (s *OwnerRefRemapState) RecordQuiescedObject(rec QuiescedObjectRecord) {
 	s.quiescedObjects = append(s.quiescedObjects, rec)
 }
 
+// RecordQuiescedObjectWithUID records a quiesced object and associates it with its backup oldUID.
+func (s *OwnerRefRemapState) RecordQuiescedObjectWithUID(oldUID types.UID, rec QuiescedObjectRecord) {
+	if s == nil {
+		return
+	}
+	s.RecordQuiescedObject(rec)
+	if oldUID != "" {
+		s.uidMapLock.Lock()
+		defer s.uidMapLock.Unlock()
+		if s.quiescedByOldUID == nil {
+			s.quiescedByOldUID = make(map[types.UID]QuiescedObjectRecord)
+		}
+		s.quiescedByOldUID[oldUID] = rec
+	}
+}
+
+// RegisterParentUID records a childOldUID -> parentOldUID relationship for transitive dependency tracking.
+func (s *OwnerRefRemapState) RegisterParentUID(childOldUID, parentOldUID types.UID) {
+	if s == nil || childOldUID == "" || parentOldUID == "" {
+		return
+	}
+	s.uidMapLock.Lock()
+	defer s.uidMapLock.Unlock()
+	if s.parentMap == nil {
+		s.parentMap = make(map[types.UID][]types.UID)
+	}
+	for _, existing := range s.parentMap[childOldUID] {
+		if existing == parentOldUID {
+			return
+		}
+	}
+	s.parentMap[childOldUID] = append(s.parentMap[childOldUID], parentOldUID)
+}
+
+// ResolveQuiescedRoots traverses parent relationships starting from req up to any quiesced root objects.
+// It uses BFS with cycle detection to trace ancestors through parentMap and returns deduplicated TargetRefs.
+func (s *OwnerRefRemapState) ResolveQuiescedRoots(req OwnerPatchRequest) []velerov1api.TargetRef {
+	if s == nil {
+		return nil
+	}
+	s.uidMapLock.RLock()
+	defer s.uidMapLock.RUnlock()
+
+	if len(s.quiescedByOldUID) == 0 {
+		return nil
+	}
+
+	var queue []types.UID
+	visited := make(map[types.UID]struct{})
+
+	// Seed queue with immediate parent UIDs from OriginalOwnerRefs, as well as the object's own oldUID.
+	for _, ref := range req.OriginalOwnerRefs {
+		if ref.UID != "" {
+			queue = append(queue, ref.UID)
+		}
+	}
+	if req.OldUID != "" {
+		queue = append(queue, s.parentMap[req.OldUID]...)
+	}
+
+	var targets []velerov1api.TargetRef
+	seenTargets := make(map[string]struct{})
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		if _, ok := visited[curr]; ok {
+			continue
+		}
+		visited[curr] = struct{}{}
+
+		// Check if this ancestor UID corresponds to a quiesced object
+		if rec, ok := s.quiescedByOldUID[curr]; ok {
+			targetNS := rec.Namespace
+			if targetNS == "" {
+				targetNS = req.Namespace
+			}
+			key := fmt.Sprintf("%s/%s/%s/%s", rec.Group, rec.Kind, targetNS, rec.Name)
+			if _, exists := seenTargets[key]; !exists {
+				seenTargets[key] = struct{}{}
+				targets = append(targets, velerov1api.TargetRef{
+					Group:     rec.Group,
+					Kind:      rec.Kind,
+					Namespace: targetNS,
+					Name:      rec.Name,
+				})
+			}
+		}
+
+		// Continue traversing upwards to parents of curr
+		for _, parentUID := range s.parentMap[curr] {
+			if _, ok := visited[parentUID]; !ok {
+				queue = append(queue, parentUID)
+			}
+		}
+	}
+
+	return targets
+}
+
 // GetOwnerPatchQueue returns a copy of the owner patch queue in a thread-safe manner.
 func (s *OwnerRefRemapState) GetOwnerPatchQueue() []OwnerPatchRequest {
 	if s == nil {
@@ -233,7 +340,7 @@ func (s *OwnerRefRemapState) BlockUnquiesceForTarget(group, kind, namespace, nam
 	defer s.queueLock.Unlock()
 	for i := range s.quiescedObjects {
 		q := &s.quiescedObjects[i]
-		if q.Group == group && q.Kind == kind && q.Name == name {
+		if (group == "" || q.Group == group) && q.Kind == kind && q.Name == name {
 			if q.Namespace == "" || namespace == "" || q.Namespace == namespace {
 				q.UnquiesceBlocked = true
 			}

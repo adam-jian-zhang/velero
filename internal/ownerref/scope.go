@@ -117,7 +117,7 @@ func (s *Scope) IsDeniedOwner(apiVersion, kind string) bool {
 	return denied
 }
 
-// HasSpecRefPaths returns true if there are spec JSONPaths defined for the GVK.
+// HasSpecRefPaths returns true if there are spec field paths defined for the GVK.
 func (s *Scope) HasSpecRefPaths(gvk schema.GroupVersionKind) bool {
 	if s == nil {
 		return false
@@ -125,7 +125,7 @@ func (s *Scope) HasSpecRefPaths(gvk schema.GroupVersionKind) bool {
 	return len(s.SpecRefPathsFor(gvk)) > 0
 }
 
-// SpecRefPathsFor returns all unique spec JSONPaths matching the given GVK.
+// SpecRefPathsFor returns all unique spec field paths matching the given GVK.
 func (s *Scope) SpecRefPathsFor(gvk schema.GroupVersionKind) []string {
 	if s == nil {
 		return nil
@@ -142,7 +142,7 @@ func (s *Scope) SpecRefPathsFor(gvk schema.GroupVersionKind) []string {
 		if e.Kind != gvk.Kind {
 			continue
 		}
-		for _, p := range e.JSONPaths {
+		for _, p := range e.Paths {
 			if _, ok := seen[p]; !ok {
 				seen[p] = struct{}{}
 				paths = append(paths, p)
@@ -206,15 +206,15 @@ func (s *Scope) MergeConfigMap(cm *corev1api.ConfigMap) error {
 			if e.Kind == "" {
 				return fmt.Errorf("%s entry requires kind", ConfigMapKeySpecRefPaths)
 			}
-			if len(e.JSONPaths) == 0 {
-				return fmt.Errorf("%s entry %s/%s requires at least one jsonPath", ConfigMapKeySpecRefPaths, e.Group, e.Kind)
+			if len(e.Paths) == 0 {
+				return fmt.Errorf("%s entry %s/%s requires at least one path", ConfigMapKeySpecRefPaths, e.Group, e.Kind)
 			}
-			for j, p := range e.JSONPaths {
+			for j, p := range e.Paths {
 				trimmedPath := strings.TrimSpace(p)
 				if err := validateDottedSpecPath(trimmedPath); err != nil {
 					return fmt.Errorf("%s path %q: %w", ConfigMapKeySpecRefPaths, p, err)
 				}
-				e.JSONPaths[j] = trimmedPath
+				e.Paths[j] = trimmedPath
 			}
 		}
 		s.SpecRefPaths = append(s.SpecRefPaths, userSpecPaths...)
@@ -285,8 +285,8 @@ func validateDottedSpecPath(path string) error {
 	if strings.HasPrefix(path, "$") || strings.Contains(path, "..") {
 		return fmt.Errorf("JSONPath syntax is not supported; use dotted spec.* paths with optional [*]")
 	}
-	if path != "spec" && !strings.HasPrefix(path, "spec.") {
-		return fmt.Errorf("must start with spec")
+	if !strings.HasPrefix(path, "spec.") {
+		return fmt.Errorf("must start with 'spec.' (e.g. 'spec.infrastructureRef')")
 	}
 	normalized := strings.ReplaceAll(path, "[*]", ".[*].")
 	for _, seg := range strings.Split(normalized, ".") {

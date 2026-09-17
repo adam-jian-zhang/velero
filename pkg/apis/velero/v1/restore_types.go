@@ -458,9 +458,10 @@ type QuiescedObjectRef struct {
 
 // TargetRef records an owner or spec reference target for dependency matching.
 type TargetRef struct {
-	Group string `json:"group,omitempty"`
-	Kind  string `json:"kind,omitempty"`
-	Name  string `json:"name,omitempty"`
+	Group     string `json:"group,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
 }
 
 // PendingPatchRef records an item that requires ownerReference or specRef patching retry in Pass 2.

@@ -22,12 +22,12 @@ data:
   specRefPaths: |
     - group: cluster.x-k8s.io
       kind: Cluster
-      jsonPaths:
+      paths:
         - spec.infrastructureRef
         - spec.controlPlaneRef
     - group: cluster.x-k8s.io
       kind: Machine
-      jsonPaths:
+      paths:
         - spec.infrastructureRef
         - spec.bootstrap.configRef
 

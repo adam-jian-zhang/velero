@@ -171,7 +171,7 @@ func TestLoadScopeFromConfigMap(t *testing.T) {
 			ConfigMapKeySpecRefPaths: `
 - group: custom.io
   kind: App
-  jsonPaths:
+  paths:
     - spec.targetRef
 `,
 			ConfigMapKeyQuiesceOnRestore: `
@@ -232,12 +232,12 @@ func TestMergeConfigMap_2TierUnionAndQuiesceOverride(t *testing.T) {
 			ConfigMapKeySpecRefPaths: `
 - group: cluster.x-k8s.io
   kind: Cluster
-  jsonPaths:
+  paths:
     - spec.infrastructureRef
     - spec.customExtensionRef
 - group: custom.io
   kind: App
-  jsonPaths:
+  paths:
     - spec.dbRef
 `,
 			ConfigMapKeyQuiesceOnRestore: `
@@ -292,7 +292,7 @@ func TestSpecRefPathsFor_Deduplication(t *testing.T) {
 	scope.SpecRefPaths = append(scope.SpecRefPaths, SpecRefPathEntry{
 		Group: "cluster.x-k8s.io",
 		Kind:  "Cluster",
-		JSONPaths: []string{
+		Paths: []string{
 			"spec.infrastructureRef", // duplicate of baseline
 			"spec.customRef",
 			"spec.customRef", // duplicate within entry
@@ -377,7 +377,7 @@ func TestLoadScopeFromConfigMapRejectsJSONPath(t *testing.T) {
 			ConfigMapKeySpecRefPaths: `
 - group: custom.io
   kind: App
-  jsonPaths:
+  paths:
     - $.spec.targetRef
 `,
 		},
@@ -439,7 +439,7 @@ func TestMergeConfigMap_WhitespaceTrimmed(t *testing.T) {
 			ConfigMapKeySpecRefPaths: `
 - group: "  custom.io  "
   kind: "  App  "
-  jsonPaths:
+  paths:
     - "  spec.targetRef  "
 `,
 			ConfigMapKeyQuiesceOnRestore: `
@@ -468,7 +468,8 @@ func TestValidateDottedSpecPath(t *testing.T) {
 		path    string
 		wantErr bool
 	}{
-		{name: "valid simple spec", path: "spec", wantErr: false},
+		{name: "invalid bare spec", path: "spec", wantErr: true},
+		{name: "valid simple spec path", path: "spec.ref", wantErr: false},
 		{name: "valid nested spec path", path: "spec.infrastructureRef", wantErr: false},
 		{name: "valid wildcard path", path: "spec.template.spec.volumes[*].dataVolume", wantErr: false},
 		{name: "empty path", path: "", wantErr: true},

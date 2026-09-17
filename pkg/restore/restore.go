@@ -1477,6 +1477,12 @@ func (ctx *restoreContext) registerAndMaybeEnqueue(
 	newUID := liveObj.GetUID()
 	ctx.ownerRefRemap.RegisterUIDMapping(oldUID, newUID)
 
+	for _, ref := range originalOwnerRefs {
+		if ref.UID != "" {
+			ctx.ownerRefRemap.RegisterParentUID(oldUID, ref.UID)
+		}
+	}
+
 	// Prefer the live object's GVK as served on the target cluster;
 	// fall back to backup manifest GVK only if liveObj GVK is empty.
 	gvk := liveObj.GroupVersionKind()
@@ -1488,6 +1494,7 @@ func (ctx *restoreContext) registerAndMaybeEnqueue(
 			filteredRefs, filteredNS := filterDeniedPVCOwnerRefs(gvk, originalOwnerRefs, ownerRefSourceNS, ctx.ownerRefScope)
 			if len(filteredRefs) > 0 {
 				req := ownerref.OwnerPatchRequest{
+					OldUID:            oldUID,
 					Group:             gvk.Group,
 					Version:           gvk.Version,
 					Kind:              gvk.Kind,
@@ -1502,12 +1509,14 @@ func (ctx *restoreContext) registerAndMaybeEnqueue(
 		}
 		if ctx.ownerRefScope.HasSpecRefPaths(gvk) {
 			req := ownerref.OwnerPatchRequest{
-				Group:     gvk.Group,
-				Version:   gvk.Version,
-				Kind:      gvk.Kind,
-				Resource:  groupResource.Resource,
-				Namespace: liveObj.GetNamespace(),
-				Name:      liveObj.GetName(),
+				OldUID:            oldUID,
+				Group:             gvk.Group,
+				Version:           gvk.Version,
+				Kind:              gvk.Kind,
+				Resource:          groupResource.Resource,
+				Namespace:         liveObj.GetNamespace(),
+				Name:              liveObj.GetName(),
+				OriginalOwnerRefs: originalOwnerRefs,
 			}
 			ctx.ownerRefRemap.EnqueueSpecPatch(req)
 		}
@@ -2043,7 +2052,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 					if createdNS := createdObj.GetNamespace(); createdNS != "" {
 						quiescedRecord.Namespace = createdNS
 					}
-					ctx.ownerRefRemap.RecordQuiescedObject(*quiescedRecord)
+					ctx.ownerRefRemap.RecordQuiescedObjectWithUID(itemFromBackup.GetUID(), *quiescedRecord)
 				}
 				ctx.registerAndMaybeEnqueue(itemFromBackup, createdObj, groupResource, originalOwnerRefs, ownerRefSourceNS)
 			}

@@ -43,11 +43,10 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
-
-	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/ownerref"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
@@ -1589,6 +1588,48 @@ func TestOwnerRefRemappingPass2_StrictTerminalCompletionInvariant(t *testing.T) 
 	// Status entries must be retained for inspection
 	assert.NotEmpty(t, restoreObj.Status.PendingOwnerRefPatches)
 	assert.NotEmpty(t, restoreObj.Status.QuiescedObjects)
+	assert.NotEmpty(t, warnings)
+}
+
+func TestOwnerRefRemappingPass2_EmptySpecPatchJSONForcesPartiallyFailed(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRemapFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreName := "restore-empty-specpatch"
+	restoreObj := builder.ForRestore("default", restoreName).Result()
+	// Pending specRef patch has empty SpecPatchJSON
+	restoreObj.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{
+		{
+			Group:         "kubevirt.io",
+			Version:       "v1",
+			Kind:          "VirtualMachine",
+			Namespace:     "default",
+			Name:          "my-vm",
+			PatchType:     "specRef",
+			SpecPatchJSON: "",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs := finalizerCtx.execute()
+	// Must emit error in errs.Velero (strict terminal completion invariant forces PartiallyFailed)
+	require.NotEmpty(t, errs.Velero)
+	assert.Contains(t, errs.Velero[0], "Restore finalization encountered 1 unresolvable patches")
+
+	// Empty SpecPatchJSON patch must remain in PendingOwnerRefPatches to prevent false completion
+	require.Len(t, restoreObj.Status.PendingOwnerRefPatches, 1)
+	assert.Equal(t, "my-vm", restoreObj.Status.PendingOwnerRefPatches[0].Name)
 	assert.NotEmpty(t, warnings)
 }
 

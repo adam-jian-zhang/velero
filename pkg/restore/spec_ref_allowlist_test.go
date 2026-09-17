@@ -35,7 +35,7 @@ import (
 	"github.com/vmware-tanzu/velero/internal/ownerref"
 )
 
-func TestSplitJSONPath(t *testing.T) {
+func TestSplitDottedPath(t *testing.T) {
 	cases := []struct {
 		input    string
 		expected []string
@@ -56,7 +56,7 @@ func TestSplitJSONPath(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
-			got := splitJSONPath(tc.input)
+			got := splitDottedPath(tc.input)
 			assert.Equal(t, tc.expected, got)
 		})
 	}
@@ -90,7 +90,7 @@ func TestRemapSpecRefFields_CAPICluster(t *testing.T) {
 		},
 	}
 
-	jsonPaths := []string{
+	paths := []string{
 		"spec.infrastructureRef",
 		"spec.controlPlaneRef",
 	}
@@ -99,7 +99,7 @@ func TestRemapSpecRefFields_CAPICluster(t *testing.T) {
 		"src-ns": "target-ns",
 	}
 
-	changed, patchObj, allResolved, err := remapSpecRefFields(obj, jsonPaths, state, namespaceMapping, logrus.StandardLogger())
+	changed, patchObj, allResolved, err := remapSpecRefFields(obj, paths, state, namespaceMapping, logrus.StandardLogger())
 	require.NoError(t, err)
 	assert.True(t, changed)
 	assert.True(t, allResolved)
@@ -165,7 +165,7 @@ func TestRemapSpecRefFields_KubeVirtArrayWildcard(t *testing.T) {
 		},
 	}
 
-	jsonPaths := []string{
+	paths := []string{
 		"spec.template.spec.volumes[*].dataVolume",
 		"spec.template.spec.volumes[*].persistentVolumeClaim",
 	}
@@ -174,7 +174,7 @@ func TestRemapSpecRefFields_KubeVirtArrayWildcard(t *testing.T) {
 		"src-ns": "target-ns",
 	}
 
-	changed, patchObj, allResolved, err := remapSpecRefFields(obj, jsonPaths, state, namespaceMapping, logrus.StandardLogger())
+	changed, patchObj, allResolved, err := remapSpecRefFields(obj, paths, state, namespaceMapping, logrus.StandardLogger())
 	require.NoError(t, err)
 	assert.True(t, changed)
 	assert.True(t, allResolved)
@@ -234,9 +234,9 @@ func TestProcessSpecReferences_Integration(t *testing.T) {
 	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
 	scope := ownerref.NewScope()
 	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
-		Group:     "kubevirt.io",
-		Kind:      "VirtualMachine",
-		JSONPaths: []string{"spec.template.spec.volumes[*].dataVolume"},
+		Group: "kubevirt.io",
+		Kind:  "VirtualMachine",
+		Paths: []string{"spec.template.spec.volumes[*].dataVolume"},
 	})
 	state.SetScope(scope)
 
@@ -346,9 +346,9 @@ func TestProcessSpecReferences_NonRetriableErrorBlocksTarget(t *testing.T) {
 	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
 	scope := ownerref.NewScope()
 	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
-		Group:     "kubevirt.io",
-		Kind:      "VirtualMachine",
-		JSONPaths: []string{"spec.template.spec.volumes[*].dataVolume"},
+		Group: "kubevirt.io",
+		Kind:  "VirtualMachine",
+		Paths: []string{"spec.template.spec.volumes[*].dataVolume"},
 	})
 	state.SetScope(scope)
 
@@ -447,9 +447,9 @@ func TestProcessSpecReferences_RetriablePatchErrorEnqueuesNonEmptyPatch(t *testi
 	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
 	scope := ownerref.NewScope()
 	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
-		Group:     "kubevirt.io",
-		Kind:      "VirtualMachine",
-		JSONPaths: []string{"spec.template.spec.volumes[*].dataVolume"},
+		Group: "kubevirt.io",
+		Kind:  "VirtualMachine",
+		Paths: []string{"spec.template.spec.volumes[*].dataVolume"},
 	})
 	state.SetScope(scope)
 
@@ -486,9 +486,9 @@ func TestProcessSpecReferences_GetFailureBlocksNamespaceAndOmitsEmptyPatch(t *te
 	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
 	scope := ownerref.NewScope()
 	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
-		Group:     "kubevirt.io",
-		Kind:      "VirtualMachine",
-		JSONPaths: []string{"spec.template.spec.volumes[*].dataVolume"},
+		Group: "kubevirt.io",
+		Kind:  "VirtualMachine",
+		Paths: []string{"spec.template.spec.volumes[*].dataVolume"},
 	})
 	state.SetScope(scope)
 
@@ -528,4 +528,80 @@ func TestProcessSpecReferences_GetFailureBlocksNamespaceAndOmitsEmptyPatch(t *te
 	quiesced := state.GetQuiescedObjects()
 	require.Len(t, quiesced, 1)
 	assert.True(t, quiesced[0].UnquiesceBlocked, "Namespace fallback must mark DataVolume as UnquiesceBlocked")
+}
+
+func TestProcessSpecReferences_CrossNamespaceTargetRefRemapped(t *testing.T) {
+	scheme := runtime.NewScheme()
+	vm := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "kubevirt.io/v1",
+			"kind":       "VirtualMachine",
+			"metadata": map[string]any{
+				"name":      "my-vm",
+				"namespace": "tenant-prod",
+			},
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"volumes": []any{
+							map[string]any{
+								"name": "vol-1",
+								"dataVolume": map[string]any{
+									"apiVersion": "cdi.kubevirt.io/v1beta1",
+									"kind":       "DataVolume",
+									"name":       "dv-shared",
+									"namespace":  "infra-src",
+									"uid":        "old-dv-uid",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm).Build()
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewConflict(
+			schema.GroupResource{Group: "kubevirt.io", Resource: "virtualmachines"},
+			"my-vm",
+			fmt.Errorf("conflict"),
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-dv-uid", "new-dv-uid")
+	scope := ownerref.NewScope()
+	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
+		Group: "kubevirt.io",
+		Kind:  "VirtualMachine",
+		Paths: []string{"spec.template.spec.volumes[*].dataVolume"},
+	})
+	state.SetScope(scope)
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "kubevirt.io",
+		Version:   "v1",
+		Kind:      "VirtualMachine",
+		Resource:  "virtualmachines",
+		Namespace: "tenant-prod",
+		Name:      "my-vm",
+	}
+	state.EnqueueSpecPatch(req)
+
+	nsMapping := map[string]string{
+		"infra-src": "infra-dest",
+	}
+
+	warnings, pending, remapped := processSpecReferences(context.Background(), logrus.StandardLogger(), mockClient, state, nsMapping)
+	assert.False(t, warnings.IsEmpty())
+	assert.Equal(t, 0, remapped)
+	require.Len(t, pending, 1)
+	require.Len(t, pending[0].Targets, 1)
+	assert.Equal(t, "cdi.kubevirt.io", pending[0].Targets[0].Group)
+	assert.Equal(t, "DataVolume", pending[0].Targets[0].Kind)
+	assert.Equal(t, "infra-dest", pending[0].Targets[0].Namespace)
+	assert.Equal(t, "dv-shared", pending[0].Targets[0].Name)
 }

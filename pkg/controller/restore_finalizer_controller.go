@@ -385,17 +385,23 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 		// If both queues are empty -> restore proceeds to Completed.
 		// If any remain -> add fatal error to errs.Velero (forcing PartiallyFailed), log kubectl unpause commands, and retain status entries in etcd.
 		if len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || len(ctx.restore.Status.QuiescedObjects) > 0 {
-			msg := fmt.Sprintf("Restore finalization encountered %d unresolvable patches and left %d objects paused to prevent cascading controller failures. Check restore.status.pendingOwnerRefPatches and restore.status.quiescedObjects for details.",
-				len(ctx.restore.Status.PendingOwnerRefPatches), len(ctx.restore.Status.QuiescedObjects))
+			var msg string
+			if len(ctx.restore.Status.QuiescedObjects) > 0 {
+				msg = fmt.Sprintf("Restore finalization encountered %d unresolvable patches and left %d objects paused to prevent cascading controller failures. Check restore.status.pendingOwnerRefPatches and restore.status.quiescedObjects for details.",
+					len(ctx.restore.Status.PendingOwnerRefPatches), len(ctx.restore.Status.QuiescedObjects))
+			} else {
+				msg = fmt.Sprintf("Restore finalization encountered %d unresolvable patches. Check restore.status.pendingOwnerRefPatches for details.",
+					len(ctx.restore.Status.PendingOwnerRefPatches))
+			}
 			ctx.logger.Error(msg)
 			for _, q := range ctx.restore.Status.QuiescedObjects {
 				if q.AnnotationKey != "" {
 					if q.Namespace != "" {
-						ctx.logger.Errorf("To manually unpause %s/%s: kubectl annotate %s %s %s- -n %s",
-							q.Kind, q.Name, q.Kind, q.Name, q.AnnotationKey, q.Namespace)
+						ctx.logger.Errorf("To manually unpause %s %s/%s: kubectl annotate %s %s %s- -n %s && kubectl label %s %s %s- -n %s",
+							q.Kind, q.Namespace, q.Name, q.Kind, q.Name, q.AnnotationKey, q.Namespace, q.Kind, q.Name, pkgrestore.LabelQuiescedByRestore, q.Namespace)
 					} else {
-						ctx.logger.Errorf("To manually unpause %s: kubectl annotate %s %s %s-",
-							q.Name, q.Kind, q.Name, q.AnnotationKey)
+						ctx.logger.Errorf("To manually unpause %s %s: kubectl annotate %s %s %s- && kubectl label %s %s %s-",
+							q.Kind, q.Name, q.Kind, q.Name, q.AnnotationKey, q.Kind, q.Name, pkgrestore.LabelQuiescedByRestore)
 					}
 				}
 			}

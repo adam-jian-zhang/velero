@@ -104,13 +104,29 @@ func processSpecReferences(
 				return fmt.Errorf("marshal spec-ref patch for %s/%s: %w", req.Namespace, req.Name, err)
 			}
 			lastPatchBytes = patchBytes
-			patched = true
-			return crClient.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchBytes))
+			err = crClient.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchBytes))
+			if err == nil {
+				patched = true
+			}
+			return err
 		})
 
 		if err != nil {
 			log.WithError(err).Warnf("Failed to patch spec refs on %s/%s", req.Namespace, req.Name)
 			warnings.Add(req.Namespace, err)
+			allTargets := append([]velerov1api.TargetRef(nil), targets...)
+			for _, root := range state.ResolveQuiescedRoots(req) {
+				found := false
+				for _, existing := range allTargets {
+					if existing.Group == root.Group && existing.Kind == root.Kind && existing.Namespace == root.Namespace && existing.Name == root.Name {
+						found = true
+						break
+					}
+				}
+				if !found {
+					allTargets = append(allTargets, root)
+				}
+			}
 			if isRetriablePatchError(err) && len(lastPatchBytes) > 0 {
 				remainingQueue = append(remainingQueue, req)
 				pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
@@ -121,16 +137,20 @@ func processSpecReferences(
 					Name:          req.Name,
 					PatchType:     "specRef",
 					SpecPatchJSON: string(lastPatchBytes),
-					Targets:       targets,
+					Targets:       allTargets,
 				})
 			} else {
 				// Non-retriable error or Get failed without patch payload:
 				// do NOT enqueue to pendingPatches with empty SpecPatchJSON (prevents etcd bloat and Pass 2 permanent failure).
 				// Instead, mark targets as unquiesceBlocked so parents remain safely paused.
-				for _, target := range targets {
-					state.BlockUnquiesceForTarget(target.Group, target.Kind, req.Namespace, target.Name)
+				for _, target := range allTargets {
+					targetNS := target.Namespace
+					if targetNS == "" {
+						targetNS = req.Namespace
+					}
+					state.BlockUnquiesceForTarget(target.Group, target.Kind, targetNS, target.Name)
 				}
-				if len(targets) == 0 {
+				if len(allTargets) == 0 {
 					// If Get failed before targets could be parsed, block unquiescing for any quiesced object
 					// in this child's namespace to prevent unquiescing a parent that might have been referenced.
 					state.BlockUnquiesceForNamespace(req.Namespace)
@@ -158,7 +178,7 @@ func specRefPathsForGVK(entries []ownerref.SpecRefPathEntry, gvk schema.GroupVer
 		if e.Kind != gvk.Kind {
 			continue
 		}
-		for _, p := range e.JSONPaths {
+		for _, p := range e.Paths {
 			if _, ok := seen[p]; !ok {
 				seen[p] = struct{}{}
 				paths = append(paths, p)
@@ -172,18 +192,18 @@ func specRefPathsForGVK(entries []ownerref.SpecRefPathEntry, gvk schema.GroupVer
 // document containing only those rewritten paths, and whether all encountered spec ref UIDs were resolved.
 func remapSpecRefFields(
 	obj *unstructured.Unstructured,
-	jsonPaths []string,
+	paths []string,
 	state *ownerref.OwnerRefRemapState,
 	namespaceMapping map[string]string,
 	log logrus.FieldLogger,
 ) (bool, map[string]any, bool, error) {
-	changed, patchObj, _, allResolved, err := remapSpecRefFieldsWithTargets(obj, jsonPaths, state, namespaceMapping, log)
+	changed, patchObj, _, allResolved, err := remapSpecRefFieldsWithTargets(obj, paths, state, namespaceMapping, log)
 	return changed, patchObj, allResolved, err
 }
 
 func remapSpecRefFieldsWithTargets(
 	obj *unstructured.Unstructured,
-	jsonPaths []string,
+	paths []string,
 	state *ownerref.OwnerRefRemapState,
 	namespaceMapping map[string]string,
 	log logrus.FieldLogger,
@@ -193,8 +213,8 @@ func remapSpecRefFieldsWithTargets(
 	patchObj := map[string]any{}
 	var targets []velerov1api.TargetRef
 
-	for _, path := range jsonPaths {
-		segments := splitJSONPath(path)
+	for _, path := range paths {
+		segments := splitDottedPath(path)
 		if len(segments) == 0 {
 			continue
 		}
@@ -305,11 +325,16 @@ func remapSpecRefFieldRecursiveWithTargets(
 		targetKind, _ := refMap["kind"].(string)
 		targetName, _ := refMap["name"].(string)
 		targetAPIVersion, _ := refMap["apiVersion"].(string)
+		targetNS, _ := refMap[namespaceKey].(string)
+		if targetNS != "" {
+			targetNS = mapNamespace(targetNS, namespaceMapping)
+		}
 		if targetKind != "" && targetName != "" {
 			targets = append(targets, velerov1api.TargetRef{
-				Group: ownerRefGroup(targetAPIVersion),
-				Kind:  targetKind,
-				Name:  targetName,
+				Group:     ownerRefGroup(targetAPIVersion),
+				Kind:      targetKind,
+				Namespace: targetNS,
+				Name:      targetName,
 			})
 		}
 
@@ -379,7 +404,7 @@ func setNestedValue(root map[string]any, fields []string, value any) error {
 	return nil
 }
 
-func splitJSONPath(path string) []string {
+func splitDottedPath(path string) []string {
 	path = strings.TrimPrefix(path, ".")
 	if path == "" {
 		return nil

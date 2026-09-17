@@ -104,6 +104,7 @@ func ApplyOwnerRefRemapping(
 		if err != nil {
 			log.WithError(err).Warnf("Failed to patch ownerReferences for %s/%s", req.Namespace, req.Name)
 			warnings.Add(req.Namespace, err)
+			quiescedRoots := state.ResolveQuiescedRoots(req)
 			if isRetriablePatchError(err) {
 				remainingQueue = append(remainingQueue, req)
 				pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
@@ -114,13 +115,17 @@ func ApplyOwnerRefRemapping(
 					Name:            req.Name,
 					PatchType:       "ownerRef",
 					OwnerReferences: remapped,
+					Targets:         quiescedRoots,
 				})
 			} else {
 				// Non-retriable error: do NOT enqueue to pendingPatches or remainingQueue (prevents etcd bloat).
-				// Instead, mark the owner parents as unquiesceBlocked so they remain safely paused in etcd.
+				// Instead, mark immediate owner parents and transitive quiesced root(s) as unquiesceBlocked so they remain safely paused in etcd.
 				for _, ref := range remapped {
 					ownerGroup := ownerRefGroup(ref.APIVersion)
 					state.BlockUnquiesceForTarget(ownerGroup, ref.Kind, req.Namespace, ref.Name)
+				}
+				for _, root := range quiescedRoots {
+					state.BlockUnquiesceForTarget(root.Group, root.Kind, root.Namespace, root.Name)
 				}
 			}
 			continue

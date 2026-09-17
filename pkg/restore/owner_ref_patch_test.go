@@ -772,3 +772,239 @@ func TestApplyOwnerRefRemapping_RetriableErrorEnqueues(t *testing.T) {
 	// But CanUnquiesce returns false because pending patch names it as owner
 	assert.False(t, CanUnquiesce(quiesced[0], pending))
 }
+
+func TestApplyOwnerRefRemapping_MultiHopRetriableFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	childObj := &unstructured.Unstructured{}
+	childObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "Machine",
+	})
+	childObj.SetName("worker-1")
+	childObj.SetNamespace("default")
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(childObj).Build()
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewConflict(
+			schema.GroupResource{Group: "cluster.x-k8s.io", Resource: "machines"},
+			"worker-1",
+			fmt.Errorf("operation cannot be fulfilled"),
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+
+	// Register UID mappings:
+	// Cluster: cluster-old -> cluster-new
+	// MachineDeployment: md-old -> md-new
+	// MachineSet: ms-old -> ms-new
+	// Machine: machine-old -> machine-new
+	state.RegisterUIDMapping("cluster-old", "cluster-new")
+	state.RegisterUIDMapping("md-old", "md-new")
+	state.RegisterUIDMapping("ms-old", "ms-new")
+	state.RegisterUIDMapping("machine-old", "machine-new")
+
+	// Record Quiesced Cluster (oldUID: cluster-old)
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObjectWithUID("cluster-old", rec)
+
+	// Register parent relationships:
+	// MachineDeployment -> Cluster
+	// MachineSet -> MachineDeployment
+	// Machine -> MachineSet
+	state.RegisterParentUID("md-old", "cluster-old")
+	state.RegisterParentUID("ms-old", "md-old")
+	state.RegisterParentUID("machine-old", "ms-old")
+
+	// Worker Machine points to MachineSet (NOT Cluster directly!)
+	req := ownerref.OwnerPatchRequest{
+		OldUID:    "machine-old",
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-1",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "MachineSet",
+				Name:       "ms-1",
+				UID:        "ms-old",
+			},
+		},
+		OwnerRefSourceNS: []string{"default"},
+	}
+	state.EnqueueOwnerPatch(req)
+
+	restore := &velerov1api.Restore{}
+	warnings, pending := ApplyOwnerRefRemapping(context.Background(), logrus.StandardLogger(), mockClient, restore, state)
+
+	assert.False(t, warnings.IsEmpty())
+	require.Len(t, pending, 1)
+	assert.Equal(t, "worker-1", pending[0].Name)
+
+	// OwnerReference points to MachineSet
+	require.Len(t, pending[0].OwnerReferences, 1)
+	assert.Equal(t, "MachineSet", pending[0].OwnerReferences[0].Kind)
+
+	// Targets MUST contain transitive quiesced root Cluster
+	require.Len(t, pending[0].Targets, 1, "Must propagate quiesced root Cluster into Targets")
+	assert.Equal(t, "cluster.x-k8s.io", pending[0].Targets[0].Group)
+	assert.Equal(t, "Cluster", pending[0].Targets[0].Kind)
+	assert.Equal(t, "default", pending[0].Targets[0].Namespace)
+	assert.Equal(t, "cluster-1", pending[0].Targets[0].Name)
+
+	// Quiesced Cluster must NOT unquiesce
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.False(t, CanUnquiesce(quiesced[0], pending), "CanUnquiesce must return false due to transitive root in Targets")
+}
+
+func TestApplyOwnerRefRemapping_MultiHopNonRetriableFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	childObj := &unstructured.Unstructured{}
+	childObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "Machine",
+	})
+	childObj.SetName("worker-1")
+	childObj.SetNamespace("default")
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(childObj).Build()
+	// Return a non-retriable 422 Invalid error
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewInvalid(
+			schema.GroupKind{Group: "cluster.x-k8s.io", Kind: "Machine"},
+			"worker-1",
+			nil,
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+
+	state.RegisterUIDMapping("cluster-old", "cluster-new")
+	state.RegisterUIDMapping("ms-old", "ms-new")
+	state.RegisterUIDMapping("machine-old", "machine-new")
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObjectWithUID("cluster-old", rec)
+
+	state.RegisterParentUID("ms-old", "cluster-old")
+	state.RegisterParentUID("machine-old", "ms-old")
+
+	req := ownerref.OwnerPatchRequest{
+		OldUID:    "machine-old",
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-1",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "MachineSet",
+				Name:       "ms-1",
+				UID:        "ms-old",
+			},
+		},
+		OwnerRefSourceNS: []string{"default"},
+	}
+	state.EnqueueOwnerPatch(req)
+
+	restore := &velerov1api.Restore{}
+	warnings, pending := ApplyOwnerRefRemapping(context.Background(), logrus.StandardLogger(), mockClient, restore, state)
+
+	assert.False(t, warnings.IsEmpty())
+	assert.Empty(t, pending, "Non-retriable patch failure must not enter PendingOwnerRefPatches")
+
+	// Transitive quiesced root Cluster must be marked UnquiesceBlocked
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked, "Transitive root Cluster must be marked UnquiesceBlocked on child non-retriable failure")
+	assert.False(t, CanUnquiesce(quiesced[0], pending))
+}
+
+func TestApplyOwnerRefRemapping_MultiClusterSameNamespaceIsolation(t *testing.T) {
+	cluster1 := velerov1api.QuiescedObjectRef{
+		Group:     "cluster.x-k8s.io",
+		Kind:      "Cluster",
+		Namespace: "default",
+		Name:      "cluster-1",
+	}
+	cluster2 := velerov1api.QuiescedObjectRef{
+		Group:     "cluster.x-k8s.io",
+		Kind:      "Cluster",
+		Namespace: "default",
+		Name:      "cluster-2",
+	}
+
+	// Pending patch is for a Machine in cluster-1, with Targets containing cluster-1
+	pendingPatches := []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "cluster1-worker-1",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "cluster1-ms-1",
+				},
+			},
+			Targets: []velerov1api.TargetRef{
+				{
+					Group:     "cluster.x-k8s.io",
+					Kind:      "Cluster",
+					Namespace: "default",
+					Name:      "cluster-1",
+				},
+			},
+		},
+	}
+
+	// cluster-1 has pending patch targeting it -> cannot unquiesce
+	assert.False(t, CanUnquiesce(cluster1, pendingPatches), "Cluster-1 must remain paused because child patch names it in Targets")
+
+	// cluster-2 has NO pending patch targeting it -> CAN unquiesce independently even in the same namespace!
+	assert.True(t, CanUnquiesce(cluster2, pendingPatches), "Cluster-2 must be allowed to unquiesce; unrelated cluster must not block it")
+}

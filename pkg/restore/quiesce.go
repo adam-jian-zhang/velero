@@ -102,7 +102,7 @@ func InjectQuiesceMetadata(
 //  2. NO remaining patch request in pendingPatches:
 //     a. targets Q directly, AND
 //     b. names Q as an owner reference, AND
-//     c. names Q as a spec reference target.
+//     c. names Q as a spec reference target or transitive quiesced root (in p.Targets).
 func CanUnquiesce(q velerov1api.QuiescedObjectRef, pendingPatches []velerov1api.PendingPatchRef) bool {
 	if q.UnquiesceBlocked {
 		return false
@@ -124,8 +124,12 @@ func CanUnquiesce(q velerov1api.QuiescedObjectRef, pendingPatches []velerov1api.
 		// 3. Does this pending patch name Q as a spec reference target?
 		for _, target := range p.Targets {
 			if target.Kind == q.Kind && target.Name == q.Name {
-				if target.Group == q.Group {
-					if q.Namespace == "" || p.Namespace == q.Namespace {
+				if target.Group == "" || target.Group == q.Group {
+					targetNS := target.Namespace
+					if targetNS == "" {
+						targetNS = p.Namespace
+					}
+					if q.Namespace == "" || targetNS == q.Namespace {
 						return false
 					}
 				}
@@ -182,6 +186,10 @@ func UnquiesceObjects(
 
 	for _, rec := range records {
 		if strings.TrimSpace(rec.AnnotationKey) == "" {
+			if log != nil {
+				log.Warnf("Cannot unquiesce %s/%s: empty annotationKey in record", rec.Namespace, rec.Name)
+			}
+			warnings.Add(rec.Namespace, fmt.Errorf("cannot unquiesce %s/%s: missing pause annotation key", rec.Namespace, rec.Name))
 			failed = append(failed, rec)
 			continue
 		}

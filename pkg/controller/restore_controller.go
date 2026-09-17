@@ -764,10 +764,12 @@ func (r *restoreReconciler) runValidatedRestore(
 	}
 	if ownerRefEnabled && restoreReq.OwnerRefRemap != nil && restoreReq.OwnerRefRemap.Enabled && patchClient != nil {
 		remapCtx := r.ctx
+		if remapCtx == nil {
+			remapCtx = context.Background()
+		}
+		var cancel context.CancelFunc
 		if r.resourceTimeout > 0 {
-			var cancel context.CancelFunc
 			remapCtx, cancel = context.WithTimeout(remapCtx, r.resourceTimeout)
-			defer cancel()
 		}
 
 		remapWarnings, pendingPatches := pkgrestore.ApplyOwnerRefRemapping(remapCtx, restoreLog, patchClient, restore, restoreReq.OwnerRefRemap)
@@ -777,6 +779,9 @@ func (r *restoreReconciler) runValidatedRestore(
 		quiescedRecords := restoreReq.OwnerRefRemap.GetQuiescedObjects()
 		stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, restoreLog, patchClient, quiescedRecords, pendingPatches)
 		restoreWarnings.Merge(&unquiesceWarnings)
+		if cancel != nil {
+			cancel()
+		}
 
 		// Persist state directly into Restore.Status for crash-proof recovery:
 		restore.Status.PendingOwnerRefPatches = pendingPatches

@@ -137,6 +137,45 @@ func TestCanUnquiesce(t *testing.T) {
 	}
 	assert.False(t, CanUnquiesce(clusterQ, patchesOwnerQ))
 
+	// Case 3b: Multi-hop child (Machine -> MachineSet -> Cluster) names MachineSet in OwnerReferences,
+	// but carries Cluster in Targets (via Option 4 transitive quiesce root propagation) -> not eligible
+	patchesMultiHopTarget := []velerov1api.PendingPatchRef{
+		{
+			Group:     "cluster.x-k8s.io",
+			Version:   "v1beta1",
+			Kind:      "Machine",
+			Namespace: "default",
+			Name:      "machine-1",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "cluster.x-k8s.io/v1beta1",
+					Kind:       "MachineSet",
+					Name:       "machineset-1",
+				},
+			},
+			Targets: []velerov1api.TargetRef{
+				{
+					Group:     "cluster.x-k8s.io",
+					Kind:      "Cluster",
+					Namespace: "default",
+					Name:      "cluster-1",
+				},
+			},
+		},
+	}
+	assert.False(t, CanUnquiesce(clusterQ, patchesMultiHopTarget))
+
+	// Case 3c: Sibling cluster in the same namespace is NOT in Targets -> eligible (Option 4 preserves isolation)
+	cluster2Q := velerov1api.QuiescedObjectRef{
+		Group:         "cluster.x-k8s.io",
+		Version:       "v1beta1",
+		Kind:          "Cluster",
+		Namespace:     "default",
+		Name:          "cluster-2",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	assert.True(t, CanUnquiesce(cluster2Q, patchesMultiHopTarget), "Sibling cluster in same namespace must not be blocked by unrelated cluster's child patch")
+
 	// Case 4: Pending patch names Q as a spec reference target -> not eligible
 	patchesTargetRefQ := []velerov1api.PendingPatchRef{
 		{
@@ -199,6 +238,66 @@ func TestCanUnquiesce(t *testing.T) {
 	blockedQ.UnquiesceBlocked = true
 	assert.False(t, CanUnquiesce(blockedQ, nil))
 	assert.False(t, CanUnquiesce(blockedQ, []velerov1api.PendingPatchRef{}))
+
+	// Case 8: Pending patch in tenant-ns targets Q in default via TargetRef.Namespace -> not eligible
+	patchesCrossNSTarget := []velerov1api.PendingPatchRef{
+		{
+			Group:     "apps.example.io",
+			Version:   "v1",
+			Kind:      "Service",
+			Namespace: "tenant-ns",
+			Name:      "svc-1",
+			Targets: []velerov1api.TargetRef{
+				{
+					Group:     "cluster.x-k8s.io",
+					Kind:      "Cluster",
+					Namespace: "default",
+					Name:      "cluster-1",
+				},
+			},
+		},
+	}
+	assert.False(t, CanUnquiesce(clusterQ, patchesCrossNSTarget))
+
+	// Case 9: Pending patch in tenant-ns targets same name in tenant-ns, while Q is in default -> eligible (no cross-namespace collision)
+	patchesSameNameOtherNS := []velerov1api.PendingPatchRef{
+		{
+			Group:     "apps.example.io",
+			Version:   "v1",
+			Kind:      "Service",
+			Namespace: "tenant-ns",
+			Name:      "svc-2",
+			Targets: []velerov1api.TargetRef{
+				{
+					Group:     "cluster.x-k8s.io",
+					Kind:      "Cluster",
+					Namespace: "tenant-ns",
+					Name:      "cluster-1",
+				},
+			},
+		},
+	}
+	assert.True(t, CanUnquiesce(clusterQ, patchesSameNameOtherNS))
+
+	// Case 10: Pending patch has empty Group in TargetRef (omitted apiVersion in spec reference) -> matches Q -> not eligible
+	patchesEmptyGroupTarget := []velerov1api.PendingPatchRef{
+		{
+			Group:     "apps.example.io",
+			Version:   "v1",
+			Kind:      "Service",
+			Namespace: "default",
+			Name:      "svc-3",
+			Targets: []velerov1api.TargetRef{
+				{
+					Group:     "", // empty group in spec reference
+					Kind:      "Cluster",
+					Namespace: "default",
+					Name:      "cluster-1",
+				},
+			},
+		},
+	}
+	assert.False(t, CanUnquiesce(clusterQ, patchesEmptyGroupTarget), "Empty group in TargetRef must match quiesced parent of the same Kind and Name")
 }
 
 func TestUnquiesceEligibleObjects(t *testing.T) {
@@ -379,6 +478,22 @@ func TestUnquiesceObjects(t *testing.T) {
 	err = fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "cluster-pre"}, livePre)
 	require.NoError(t, err)
 	assert.Equal(t, "intentional-pause", livePre.GetAnnotations()["cluster.x-k8s.io/paused"])
+
+	// Empty AnnotationKey record should be returned as failed and generate a warning
+	emptyKeyRecord := []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-empty-key",
+			AnnotationKey: "",
+		},
+	}
+	failedEmpty, warningsEmpty := UnquiesceObjects(context.Background(), logrus.StandardLogger(), fakeClient, emptyKeyRecord)
+	assert.Len(t, failedEmpty, 1)
+	assert.False(t, warningsEmpty.IsEmpty())
+	assert.Contains(t, warningsEmpty.Namespaces["default"][0], "missing pause annotation key")
 }
 
 func TestModeCLegacy_NonInterference(t *testing.T) {
