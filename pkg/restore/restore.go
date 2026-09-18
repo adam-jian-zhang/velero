@@ -1463,12 +1463,10 @@ func filterDeniedPVCOwnerRefs(
 	return filtered, filteredNS
 }
 
-func (ctx *restoreContext) registerAndMaybeEnqueue(
+func (ctx *restoreContext) registerExistingObjectUID(
 	itemFromBackup *unstructured.Unstructured,
 	liveObj *unstructured.Unstructured,
-	groupResource schema.GroupResource,
 	originalOwnerRefs []metav1.OwnerReference,
-	ownerRefSourceNS []string,
 ) {
 	if ctx.ownerRefRemap == nil || !ctx.ownerRefRemap.Enabled || itemFromBackup == nil || liveObj == nil {
 		return
@@ -1482,6 +1480,21 @@ func (ctx *restoreContext) registerAndMaybeEnqueue(
 			ctx.ownerRefRemap.RegisterParentUID(oldUID, ref.UID)
 		}
 	}
+}
+
+func (ctx *restoreContext) registerAndMaybeEnqueue(
+	itemFromBackup *unstructured.Unstructured,
+	liveObj *unstructured.Unstructured,
+	groupResource schema.GroupResource,
+	originalOwnerRefs []metav1.OwnerReference,
+	ownerRefSourceNS []string,
+) {
+	if ctx.ownerRefRemap == nil || !ctx.ownerRefRemap.Enabled || itemFromBackup == nil || liveObj == nil {
+		return
+	}
+	ctx.registerExistingObjectUID(itemFromBackup, liveObj, originalOwnerRefs)
+
+	oldUID := itemFromBackup.GetUID()
 
 	// Prefer the live object's GVK as served on the target cluster;
 	// fall back to backup manifest GVK only if liveObj GVK is empty.
@@ -2123,7 +2136,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 					// In-cluster and desired state are the same, so move on to
 					// the next item.
 					if ctx.ownerRefRemap != nil {
-						ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+						ctx.registerExistingObjectUID(itemFromBackup, liveObjForUID, originalOwnerRefs)
 					}
 					return warnings, errs, itemExists
 				}
@@ -2140,7 +2153,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 						warnings.Merge(&warningsFromUpdate)
 						errs.Merge(&errsFromUpdate)
 						if errsFromUpdate.IsEmpty() && ctx.ownerRefRemap != nil {
-							ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+							ctx.registerExistingObjectUID(itemFromBackup, liveObjForUID, originalOwnerRefs)
 						}
 					}
 				} else {
@@ -2148,7 +2161,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 					ctx.restoredItems[itemKey] = itemStatus
 					restoreLogger.Infof("ServiceAccount %s successfully updated", kube.NamespaceAndName(obj))
 					if ctx.ownerRefRemap != nil {
-						ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+						ctx.registerExistingObjectUID(itemFromBackup, liveObjForUID, originalOwnerRefs)
 					}
 				}
 			default:
@@ -2172,7 +2185,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 							itemStatus.action = ItemRestoreResultUpdated
 							ctx.restoredItems[itemKey] = itemStatus
 							if ctx.ownerRefRemap != nil {
-								ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+								ctx.registerExistingObjectUID(itemFromBackup, liveObjForUID, originalOwnerRefs)
 							}
 						}
 						warnings.Merge(&warningsFromUpdateRP)
@@ -2204,7 +2217,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 
 		restoreLogger.Infof("Restore of %s skipped: it already exists in the cluster and is the same as the backed up version", obj.GetName())
 		if ctx.ownerRefRemap != nil {
-			ctx.registerAndMaybeEnqueue(itemFromBackup, liveObjForUID, groupResource, originalOwnerRefs, ownerRefSourceNS)
+			ctx.registerExistingObjectUID(itemFromBackup, liveObjForUID, originalOwnerRefs)
 		}
 		return warnings, errs, itemExists
 	}

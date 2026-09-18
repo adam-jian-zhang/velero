@@ -66,7 +66,7 @@ func isRetriablePatchError(err error) bool {
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
 	return false
@@ -100,6 +100,27 @@ func ApplyOwnerRefRemapping(
 	ownerRefsRemapped := 0
 
 	for _, req := range state.GetOwnerPatchQueue() {
+		if ctx.Err() != nil {
+			// Context expired (e.g. Pass 1 hit resourceTimeout): fast-fail remaining items without network calls
+			remapped := remapOwnerReferencesInMemory(state, req, namespaceMapping, log)
+			quiescedRoots := state.ResolveQuiescedRoots(req)
+			if len(remapped) > 0 {
+				remainingQueue = append(remainingQueue, req)
+				pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
+					Group:           req.Group,
+					Version:         req.Version,
+					Kind:            req.Kind,
+					Namespace:       req.Namespace,
+					Name:            req.Name,
+					PatchType:       "ownerRef",
+					OwnerReferences: remapped,
+					Targets:         quiescedRoots,
+				})
+			}
+			warnings.Add(req.Namespace, ctx.Err())
+			continue
+		}
+
 		remapped, err := patchOwnerReferences(ctx, log, crClient, state, req, namespaceMapping)
 		if err != nil {
 			log.WithError(err).Warnf("Failed to patch ownerReferences for %s/%s", req.Namespace, req.Name)
@@ -154,14 +175,34 @@ func patchOwnerReferences(
 	req ownerref.OwnerPatchRequest,
 	namespaceMapping map[string]string,
 ) ([]metav1.OwnerReference, error) {
+	remapped := remapOwnerReferencesInMemory(state, req, namespaceMapping, log)
+	if len(remapped) == 0 {
+		return nil, nil
+	}
+
+	if err := patchObjectOwnerRefs(ctx, crClient, req, remapped, log); err != nil {
+		return remapped, err
+	}
+
+	return remapped, nil
+}
+
+func remapOwnerReferencesInMemory(
+	state *ownerref.OwnerRefRemapState,
+	req ownerref.OwnerPatchRequest,
+	namespaceMapping map[string]string,
+	log logrus.FieldLogger,
+) []metav1.OwnerReference {
 	var remapped []metav1.OwnerReference
 	childTargetNS := req.Namespace
 
 	for i, ref := range req.OriginalOwnerRefs {
 		newUID, ok := state.GetNewUID(ref.UID)
 		if !ok {
-			log.Warnf("Parent with old UID %s not found in restore for %s/%s; parent may have been excluded",
-				ref.UID, req.Namespace, req.Name)
+			if log != nil {
+				log.Warnf("Parent with old UID %s not found in restore for %s/%s; parent may have been excluded",
+					ref.UID, req.Namespace, req.Name)
+			}
 			// Permanent omission: do not re-enqueue for missing parent
 			continue
 		}
@@ -173,8 +214,10 @@ func patchOwnerReferences(
 		if ownerSrcNS != "" {
 			ownerTargetNS := mapNamespace(ownerSrcNS, namespaceMapping)
 			if ownerTargetNS != childTargetNS {
-				log.Warnf("Skipping ownerRef %s/%s for %s/%s: namespace mapping splits owner/owned (%s != %s)",
-					ref.Kind, ref.Name, req.Namespace, req.Name, ownerTargetNS, childTargetNS)
+				if log != nil {
+					log.Warnf("Skipping ownerRef %s/%s for %s/%s: namespace mapping splits owner/owned (%s != %s)",
+						ref.Kind, ref.Name, req.Namespace, req.Name, ownerTargetNS, childTargetNS)
+				}
 				continue
 			}
 		}
@@ -183,15 +226,7 @@ func patchOwnerReferences(
 		remapped = append(remapped, ref)
 	}
 
-	if len(remapped) == 0 {
-		return nil, nil
-	}
-
-	if err := patchObjectOwnerRefs(ctx, crClient, req, remapped, log); err != nil {
-		return remapped, err
-	}
-
-	return remapped, nil
+	return remapped
 }
 
 func mapNamespace(ns string, mapping map[string]string) string {
@@ -216,8 +251,14 @@ func patchObjectOwnerRefs(
 	if crClient == nil {
 		return fmt.Errorf("nil client")
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	return retry.OnError(retry.DefaultBackoff, isRetriablePatchError, func() error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   req.Group,
@@ -280,8 +321,15 @@ func ownerRefGroup(apiVersion string) string {
 
 // mergeOwnerReferences performs an additive merge: matching refs (Group, Kind, Name)
 // have UID, Controller, and BlockOwnerDeletion updated; unmanaged live refs are preserved;
-// new backup refs are appended. Enforces Kubernetes invariant that at most one ownerReference
+// new backup refs are appended. Enforces the Kubernetes invariant that at most one ownerReference
 // can have Controller: true using Live Precedence.
+//
+// Pre-existing live objects (existingResourcePolicy: update, skip, SA merge) are never enqueued
+// for remapping. Live Precedence specifically resolves controller claim races where an active
+// in-cluster controller claims a newly created child (setting controller: true) between Phase 1A
+// create and Phase 1B patch, or during in-place PVC volume restore where the PVC was already
+// adopted. The live controller: true is preserved, and incoming restored references are demoted
+// to controller: nil to prevent HTTP 422 validation rejections.
 func mergeOwnerReferences(
 	live, remapped []metav1.OwnerReference,
 	log logrus.FieldLogger,
@@ -384,6 +432,13 @@ func RetryPendingPatches(
 	var remainingPending []velerov1api.PendingPatchRef
 
 	for _, p := range pending {
+		if ctx.Err() != nil {
+			log.WithError(ctx.Err()).Warnf("Pass 2 retry timed out/canceled for %s/%s", p.Namespace, p.Name)
+			warnings.Add(p.Namespace, ctx.Err())
+			remainingPending = append(remainingPending, p)
+			continue
+		}
+
 		gvk := schema.GroupVersionKind{Group: p.Group, Version: p.Version, Kind: p.Kind}
 		key := client.ObjectKey{Namespace: p.Namespace, Name: p.Name}
 
@@ -422,6 +477,9 @@ func RetryPendingPatches(
 				continue
 			}
 			err := retry.OnError(retry.DefaultBackoff, isRetriablePatchError, func() error {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				liveObj := &unstructured.Unstructured{}
 				liveObj.SetGroupVersionKind(gvk)
 				if err := crClient.Get(ctx, key, liveObj); err != nil {

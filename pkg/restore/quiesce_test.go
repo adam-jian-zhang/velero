@@ -34,6 +34,7 @@ import (
 
 	"github.com/vmware-tanzu/velero/internal/ownerref"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/label"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
@@ -91,6 +92,24 @@ func TestInjectQuiesceMetadata(t *testing.T) {
 	}
 	_, quiescedEmpty := InjectQuiesceMetadata(objUnpaused, emptyRule, "restore-test-1", logrus.StandardLogger())
 	assert.False(t, quiescedEmpty)
+
+	// 4. Long restore name (>63 chars) -> label must be formatted via label.GetValidName
+	longRestoreName := "a-very-long-restore-name-that-definitely-exceeds-the-kubernetes-maximum-limit-of-63-characters"
+	objLong := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-long-name",
+				"namespace": "default",
+			},
+		},
+	}
+	_, quiescedLong := InjectQuiesceMetadata(objLong, rule, longRestoreName, logrus.StandardLogger())
+	assert.True(t, quiescedLong)
+	longLabels := objLong.GetLabels()
+	assert.LessOrEqual(t, len(longLabels[LabelQuiescedByRestore]), 63)
+	assert.Equal(t, label.GetValidName(longRestoreName), longLabels[LabelQuiescedByRestore])
 }
 
 func TestCanUnquiesce(t *testing.T) {
@@ -609,13 +628,11 @@ func TestExistingResource_QuiesceNonInterference(t *testing.T) {
 	}
 
 	// When an object already exists in the cluster and is skipped,
-	// restoreItem only calls registerAndMaybeEnqueue (to map backupUID -> liveUID for child relinking),
-	// and NEVER invokes InjectQuiesceMetadata or RecordQuiescedObject.
-	ctx.registerAndMaybeEnqueue(
+	// restoreItem only calls registerExistingObjectUID (to map backupUID -> liveUID for child relinking),
+	// and NEVER invokes InjectQuiesceMetadata or RecordQuiescedObject, and never enqueues patches.
+	ctx.registerExistingObjectUID(
 		backupCluster,
 		liveCluster,
-		schema.GroupResource{Group: "cluster.x-k8s.io", Resource: "clusters"},
-		nil,
 		nil,
 	)
 
@@ -626,6 +643,10 @@ func TestExistingResource_QuiesceNonInterference(t *testing.T) {
 	// QuiescedObjects queue must be completely empty!
 	quiescedRecords := state.GetQuiescedObjects()
 	assert.Empty(t, quiescedRecords, "No quiesced object records should be generated for pre-existing skipped objects")
+
+	// Patch queues must be completely empty!
+	assert.Empty(t, state.GetOwnerPatchQueue(), "No owner patches should be enqueued for pre-existing objects")
+	assert.Empty(t, state.GetSpecPatchQueue(), "No spec patches should be enqueued for pre-existing objects")
 
 	// But UID mapping was recorded so that child resources in the backup can re-link to the live cluster UID
 	newUID, found := state.GetNewUID("backup-cluster-uid-5678")
@@ -677,6 +698,43 @@ func TestCatchLeftoverPausedObjects(t *testing.T) {
 	leftover := CatchLeftoverPausedObjects(context.Background(), logrus.StandardLogger(), fakeClient, nil, "rst-leftover", rules)
 	require.Len(t, leftover, 1)
 	assert.Equal(t, "cluster-leftover", leftover[0].Name)
+	assert.Equal(t, "cluster.x-k8s.io/paused", leftover[0].AnnotationKey)
+}
+
+func TestCatchLeftoverPausedObjects_LongRestoreName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	longRestoreName := "a-very-long-restore-name-that-definitely-exceeds-the-kubernetes-maximum-limit-of-63-characters"
+	validLabelVal := label.GetValidName(longRestoreName)
+
+	paused := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-leftover-long",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					AnnotationQuiescedKey:     "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					LabelQuiescedByRestore: validLabelVal,
+				},
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(paused).Build()
+	rules := []ownerref.QuiesceRule{
+		{
+			Group:         "cluster.x-k8s.io",
+			Kind:          "Cluster",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	leftover := CatchLeftoverPausedObjects(context.Background(), logrus.StandardLogger(), fakeClient, nil, longRestoreName, rules)
+	require.Len(t, leftover, 1)
+	assert.Equal(t, "cluster-leftover-long", leftover[0].Name)
 	assert.Equal(t, "cluster.x-k8s.io/paused", leftover[0].AnnotationKey)
 }
 

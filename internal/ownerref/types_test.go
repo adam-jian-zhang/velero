@@ -211,6 +211,43 @@ func TestResolveQuiescedRoots_MultipleQuiescedRoots(t *testing.T) {
 	require.Len(t, roots, 2, "Must return both quiesced roots")
 }
 
+func TestResolveQuiescedRoots_ClusterScopedQuiescedRoot(t *testing.T) {
+	state := NewOwnerRefRemapState()
+	clusterScopedRec := velerov1api.QuiescedObjectRef{
+		Group:         "topology.x-k8s.io",
+		Version:       "v1alpha1",
+		Kind:          "ClusterTopology",
+		Namespace:     "",
+		Name:          "topology-global",
+		AnnotationKey: "topology.x-k8s.io/paused",
+	}
+	state.RecordQuiescedObjectWithUID("uid-topo", clusterScopedRec)
+
+	req := OwnerPatchRequest{
+		OldUID:    "uid-child",
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Cluster",
+		Namespace: "tenant-ns",
+		Name:      "cluster-1",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "topology.x-k8s.io/v1alpha1",
+				Kind:       "ClusterTopology",
+				Name:       "topology-global",
+				UID:        "uid-topo",
+			},
+		},
+	}
+
+	roots := state.ResolveQuiescedRoots(req)
+	require.Len(t, roots, 1)
+	assert.Equal(t, "topology.x-k8s.io", roots[0].Group)
+	assert.Equal(t, "ClusterTopology", roots[0].Kind)
+	assert.Empty(t, roots[0].Namespace, "Cluster-scoped root must keep empty namespace, not be overwritten with child's namespace")
+	assert.Equal(t, "topology-global", roots[0].Name)
+}
+
 func TestBlockUnquiesceForTarget_EmptyGroup(t *testing.T) {
 	state := NewOwnerRefRemapState()
 	c1 := velerov1api.QuiescedObjectRef{

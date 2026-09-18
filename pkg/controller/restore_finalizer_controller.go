@@ -343,7 +343,7 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 	errs.Merge(&rehErrs)
 
 	// Phase 1B (Pass 2 - Safety Net / Catch-up):
-	ownerRefEnabled := features.IsEnabled(velerov1api.OwnerRefRemapFeatureFlag) || ctx.restore.Spec.OwnerRefConfigMap != nil
+	ownerRefEnabled := features.IsEnabled(velerov1api.OwnerRefRemapFeatureFlag) || len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || ctx.restore.Status.PendingPatchesConfigMap != "" || len(ctx.restore.Status.QuiescedObjects) > 0
 	if ownerRefEnabled && ctx.crClient != nil {
 		remapCtx := ctx.ctx
 		if remapCtx == nil {
@@ -355,53 +355,71 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 			defer cancel()
 		}
 
-		// Layer 1 leftover-pause catch-up: Status persist may have raced; labels cannot rebuild patches or uidMap.
-		if len(ctx.restore.Status.QuiescedObjects) == 0 {
-			rules := pkgrestore.LoadQuiesceRulesForCatchUp(remapCtx, ctx.crClient, ctx.restore, ctx.ownerRefConfigMap)
-			if leftovers := pkgrestore.CatchLeftoverPausedObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restMapper, ctx.restore.Name, rules); len(leftovers) > 0 {
-				ctx.restore.Status.QuiescedObjects = leftovers
-			}
-		}
+		// 1. Load pending patches from Layer 2 Status & overflow ConfigMap:
+		allPending, loadWarnings := pkgrestore.LoadPendingPatchesHybrid(remapCtx, ctx.crClient, ctx.restore)
+		warnings.Merge(&loadWarnings)
 
-		if len(ctx.restore.Status.PendingOwnerRefPatches) == 0 && len(ctx.restore.Status.QuiescedObjects) == 0 {
-			return warnings, errs
-		}
-
-		// 1. Retry transiently failed patches:
-		if len(ctx.restore.Status.PendingOwnerRefPatches) > 0 {
-			retryWarnings, remainingPending := pkgrestore.RetryPendingPatches(remapCtx, ctx.logger, ctx.crClient, ctx.restore, ctx.restore.Status.PendingOwnerRefPatches)
+		// 2. Retry transiently failed patches:
+		var remainingPending []velerov1api.PendingPatchRef
+		if len(allPending) > 0 {
+			retryWarnings, remaining := pkgrestore.RetryPendingPatches(remapCtx, ctx.logger, ctx.crClient, ctx.restore, allPending)
 			warnings.Merge(&retryWarnings)
-			ctx.restore.Status.PendingOwnerRefPatches = remainingPending
+			remainingPending = remaining
 		}
 
-		// 2. Unquiesce eligible objects via graph-free check against remaining pending patches:
+		// 3. Unquiesce eligible objects via graph-free check against remaining pending patches:
 		if len(ctx.restore.Status.QuiescedObjects) > 0 {
-			stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restore.Status.QuiescedObjects, ctx.restore.Status.PendingOwnerRefPatches)
+			stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restore.Status.QuiescedObjects, remainingPending)
 			warnings.Merge(&unquiesceWarnings)
 			ctx.restore.Status.QuiescedObjects = stillQuiesced
 		}
 
-		// 3. Strict Terminal Completion Invariant:
-		// If both queues are empty -> restore proceeds to Completed.
+		// 4. Drain & Reconcile overflow ConfigMap:
+		reconcileWarnings := pkgrestore.ReconcilePendingPatchesConfigMap(remapCtx, ctx.crClient, ctx.restore, remainingPending)
+		warnings.Merge(&reconcileWarnings)
+
+		// 5. Layer 1 leftover-pause catch-up (Finalizing-only leftover unpause):
+		// Catch-up is Finalizing + empty QuiescedObjects + empty PendingOwnerRefPatches + empty PendingPatchesConfigMap only.
+		// Never unpause a leftover object unless all pending patches are resolved (labels cannot rebuild uidMap).
+		// InProgress death never reaches Finalizing; InProgress leftovers stay a kubectl path.
+		if len(ctx.restore.Status.PendingOwnerRefPatches) == 0 && ctx.restore.Status.PendingPatchesConfigMap == "" && len(ctx.restore.Status.QuiescedObjects) == 0 {
+			rules := pkgrestore.LoadQuiesceRulesForCatchUp(remapCtx, ctx.crClient, ctx.restore, ctx.ownerRefConfigMap)
+			if leftovers := pkgrestore.CatchLeftoverPausedObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restMapper, ctx.restore.Name, rules); len(leftovers) > 0 {
+				stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, leftovers, nil)
+				warnings.Merge(&unquiesceWarnings)
+				ctx.restore.Status.QuiescedObjects = stillQuiesced
+			}
+		}
+
+		// 6. Strict Terminal Completion Invariant:
+		// If both queues and overflow reference are empty -> restore proceeds to Completed.
 		// If any remain -> add fatal error to errs.Velero (forcing PartiallyFailed), log kubectl unpause commands, and retain status entries in etcd.
-		if len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || len(ctx.restore.Status.QuiescedObjects) > 0 {
+		if len(ctx.restore.Status.PendingOwnerRefPatches) > 0 || ctx.restore.Status.PendingPatchesConfigMap != "" || len(ctx.restore.Status.QuiescedObjects) > 0 {
 			var msg string
+			totalPending := len(ctx.restore.Status.PendingOwnerRefPatches)
+			if ctx.restore.Status.PendingPatchesConfigMap != "" {
+				totalPending = len(remainingPending)
+			}
 			if len(ctx.restore.Status.QuiescedObjects) > 0 {
 				msg = fmt.Sprintf("Restore finalization encountered %d unresolvable patches and left %d objects paused to prevent cascading controller failures. Check restore.status.pendingOwnerRefPatches and restore.status.quiescedObjects for details.",
-					len(ctx.restore.Status.PendingOwnerRefPatches), len(ctx.restore.Status.QuiescedObjects))
+					totalPending, len(ctx.restore.Status.QuiescedObjects))
 			} else {
 				msg = fmt.Sprintf("Restore finalization encountered %d unresolvable patches. Check restore.status.pendingOwnerRefPatches for details.",
-					len(ctx.restore.Status.PendingOwnerRefPatches))
+					totalPending)
 			}
 			ctx.logger.Error(msg)
 			for _, q := range ctx.restore.Status.QuiescedObjects {
 				if q.AnnotationKey != "" {
+					targetResource := q.Kind
+					if q.Group != "" {
+						targetResource = fmt.Sprintf("%s.%s", q.Kind, q.Group)
+					}
 					if q.Namespace != "" {
-						ctx.logger.Errorf("To manually unpause %s %s/%s: kubectl annotate %s %s %s- -n %s && kubectl label %s %s %s- -n %s",
-							q.Kind, q.Namespace, q.Name, q.Kind, q.Name, q.AnnotationKey, q.Namespace, q.Kind, q.Name, pkgrestore.LabelQuiescedByRestore, q.Namespace)
+						ctx.logger.Errorf("To manually unpause %s %s/%s: kubectl annotate %s %s %s- velero.io/quiesced-key- -n %s && kubectl label %s %s %s- -n %s",
+							q.Kind, q.Namespace, q.Name, targetResource, q.Name, q.AnnotationKey, q.Namespace, targetResource, q.Name, pkgrestore.LabelQuiescedByRestore, q.Namespace)
 					} else {
-						ctx.logger.Errorf("To manually unpause %s %s: kubectl annotate %s %s %s- && kubectl label %s %s %s-",
-							q.Kind, q.Name, q.Kind, q.Name, q.AnnotationKey, q.Kind, q.Name, pkgrestore.LabelQuiescedByRestore)
+						ctx.logger.Errorf("To manually unpause %s %s: kubectl annotate %s %s %s- velero.io/quiesced-key- && kubectl label %s %s %s-",
+							q.Kind, q.Name, targetResource, q.Name, q.AnnotationKey, targetResource, q.Name, pkgrestore.LabelQuiescedByRestore)
 					}
 				}
 			}

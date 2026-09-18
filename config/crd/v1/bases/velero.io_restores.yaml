@@ -672,6 +672,11 @@ spec:
                   type: object
                 nullable: true
                 type: array
+              pendingPatchesConfigMap:
+                description: PendingPatchesConfigMap names an ephemeral ConfigMap
+                  storing overflow pending patches (gzipped binaryData) when total
+                  pending patches exceed MaxPendingPatches.
+                type: string
               phase:
                 description: Phase is the current state of the Restore
                 enum:

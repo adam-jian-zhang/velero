@@ -248,7 +248,8 @@ func describeOwnerRefRemappingInSF(d *StructuredDescriber, restore *velerov1api.
 	hasStatus := restore.Status.OwnerRefsRemapped > 0 ||
 		restore.Status.SpecRefsRemapped > 0 ||
 		len(restore.Status.QuiescedObjects) > 0 ||
-		len(restore.Status.PendingOwnerRefPatches) > 0
+		len(restore.Status.PendingOwnerRefPatches) > 0 ||
+		restore.Status.PendingPatchesConfigMap != ""
 	if !hasConfig && !hasStatus {
 		return
 	}
@@ -288,6 +289,9 @@ func describeOwnerRefRemappingInSF(d *StructuredDescriber, restore *velerov1api.
 			})
 		}
 		info["pendingPatches"] = pending
+	}
+	if restore.Status.PendingPatchesConfigMap != "" {
+		info["pendingPatchesConfigMap"] = restore.Status.PendingPatchesConfigMap
 	}
 	d.Describe("ownerReferenceRemapping", info)
 }

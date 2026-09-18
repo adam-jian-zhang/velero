@@ -359,6 +359,12 @@ const (
 	VolumeDataPolicyTypeIncremental VolumeDataPolicyType = "incremental"
 )
 
+const (
+	// MaxPendingPatches defines the maximum number of pending patches kept inline in Restore.Status
+	// to prevent etcd 1.5MB request limit issues. Excess patches spill over to an ephemeral ConfigMap.
+	MaxPendingPatches = 500
+)
+
 // RestoreStatus captures the current status of a Velero restore
 type RestoreStatus struct {
 	// Phase is the current state of the Restore
@@ -432,9 +438,15 @@ type RestoreStatus struct {
 	QuiescedObjects []QuiescedObjectRef `json:"quiescedObjects,omitempty"`
 
 	// PendingOwnerRefPatches records items that encountered transient API errors during Pass 1 and require Pass 2 retry.
+	// Up to MaxPendingPatches (500) items are kept inline.
 	// +optional
 	// +nullable
 	PendingOwnerRefPatches []PendingPatchRef `json:"pendingOwnerRefPatches,omitempty"`
+
+	// PendingPatchesConfigMap names an ephemeral ConfigMap in the Velero namespace containing overflow
+	// pending patches (gzipped binaryData) when total pending patches exceed MaxPendingPatches.
+	// +optional
+	PendingPatchesConfigMap string `json:"pendingPatchesConfigMap,omitempty"`
 
 	// OwnerRefsRemapped is the count of objects whose ownerReferences were successfully patched.
 	// +optional

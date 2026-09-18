@@ -174,7 +174,7 @@ func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
 
 	flags.StringVar(&o.ResourcePoliciesConfigMap, "resource-policies-configmap", "", "Reference to the ConfigMap containing restore resource filter policies")
 
-	flags.StringVar(&o.OwnerRefConfigMap, "owner-ref-configmap", "", "Reference to a ConfigMap containing custom inScope GVKs, specRefPaths, and quiesce rules for ownerReference remapping")
+	flags.StringVar(&o.OwnerRefConfigMap, "owner-ref-configmap", "", "Reference to a ConfigMap containing custom inScope GVKs, specRefPaths, and quiesce rules for ownerReference remapping (requires --features=OwnerRefRemap on the server)")
 
 	flags.BoolVar(&o.SkipDefaultResourceModifier, "skip-default-resource-modifier", false, "Skip applying the server-configured default resource modifier for this restore")
 

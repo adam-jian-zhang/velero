@@ -275,7 +275,8 @@ func describeOwnerRefRemapping(d *Describer, restore *velerov1api.Restore) {
 	hasStatus := restore.Status.OwnerRefsRemapped > 0 ||
 		restore.Status.SpecRefsRemapped > 0 ||
 		len(restore.Status.QuiescedObjects) > 0 ||
-		len(restore.Status.PendingOwnerRefPatches) > 0
+		len(restore.Status.PendingOwnerRefPatches) > 0 ||
+		restore.Status.PendingPatchesConfigMap != ""
 	if !hasConfig && !hasStatus {
 		return
 	}
@@ -310,10 +311,13 @@ func describeOwnerRefRemapping(d *Describer, restore *velerov1api.Restore) {
 		}
 	}
 
-	if len(restore.Status.PendingOwnerRefPatches) == 0 {
+	if len(restore.Status.PendingOwnerRefPatches) == 0 && restore.Status.PendingPatchesConfigMap == "" {
 		d.Printf("  Pending Patches:\tnone\n")
 	} else {
 		d.Printf("  Pending Patches:\n")
+		if restore.Status.PendingPatchesConfigMap != "" {
+			d.Printf("    Overflow ConfigMap:\t%s\n", restore.Status.PendingPatchesConfigMap)
+		}
 		isTerminal := restore.Status.Phase == velerov1api.RestorePhaseCompleted ||
 			restore.Status.Phase == velerov1api.RestorePhasePartiallyFailed ||
 			restore.Status.Phase == velerov1api.RestorePhaseFailed
@@ -337,17 +341,18 @@ func describeOwnerRefRemapping(d *Describer, restore *velerov1api.Restore) {
 			if q.AnnotationKey == "" {
 				continue
 			}
-			// Use the bare Kind name; kubectl resolves it to the correct resource via API discovery.
-			// This avoids the fragile pluralization heuristic (e.g. "Ingress" -> "ingresss" was wrong)
-			// and the <resource>.<group> form, which requires the plural resource name we do not have
-			// without a discovery lookup. If multiple groups share a Kind, kubectl will error and prompt
-			// the user to qualify with the plural resource name.
+			// Format resource as <kind>.<group> when Group is non-empty, or bare <kind> for core resources.
+			// kubectl resolves <kind>.<group> directly via discovery, avoiding pluralization issues (e.g. Ingress)
+			// and eliminating ambiguity when multiple API groups share the same Kind.
 			resource := q.Kind
+			if q.Group != "" {
+				resource = fmt.Sprintf("%s.%s", q.Kind, q.Group)
+			}
 			if q.Namespace != "" {
-				d.Printf("      kubectl annotate %s -n %s %s %s-\n", resource, q.Namespace, q.Name, q.AnnotationKey)
+				d.Printf("      kubectl annotate %s -n %s %s %s- velero.io/quiesced-key-\n", resource, q.Namespace, q.Name, q.AnnotationKey)
 				d.Printf("      kubectl label %s -n %s %s velero.io/quiesced-by-restore-\n", resource, q.Namespace, q.Name)
 			} else {
-				d.Printf("      kubectl annotate %s %s %s-\n", resource, q.Name, q.AnnotationKey)
+				d.Printf("      kubectl annotate %s %s %s- velero.io/quiesced-key-\n", resource, q.Name, q.AnnotationKey)
 				d.Printf("      kubectl label %s %s velero.io/quiesced-by-restore-\n", resource, q.Name)
 			}
 		}

@@ -1488,6 +1488,18 @@ func TestLoadOwnerRefScope(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-legacy"},
 	}
 	assert.Nil(t, r.loadOwnerRefScope(ctx, restoreLegacy))
+	assert.Empty(t, restoreLegacy.Status.ValidationErrors)
+
+	// Case 0b: Feature flag disabled and OwnerRefConfigMap specified -> returns nil and appends validation error
+	restoreFlagDisabledWithCM := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-disabled-with-cm"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "some-cm"},
+		},
+	}
+	assert.Nil(t, r.loadOwnerRefScope(ctx, restoreFlagDisabledWithCM))
+	require.NotEmpty(t, restoreFlagDisabledWithCM.Status.ValidationErrors)
+	assert.Contains(t, restoreFlagDisabledWithCM.Status.ValidationErrors[0], "ownerRefConfigMap cannot be specified because feature flag OwnerRefRemap is not enabled")
 
 	// Enable feature flag for subsequent test cases
 	features.NewFeatureFlagSet(velerov1api.OwnerRefRemapFeatureFlag)
@@ -1539,14 +1551,61 @@ func TestLoadOwnerRefScope(t *testing.T) {
 	// Reset server flag
 	r.ownerRefConfigMap = ""
 
-	// Case 4: Per-restore non-existent ConfigMap records validation error and returns nil
+	// Case 4a: Per-restore OwnerRefConfigMap with non-empty APIGroup fails validation
+	invalidGroup := "custom.group"
+	restoreErrAPIGroup := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-apigroup"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				APIGroup: &invalidGroup,
+				Kind:     "ConfigMap",
+				Name:     "some-cm",
+			},
+		},
+	}
+	resScope := r.loadOwnerRefScope(ctx, restoreErrAPIGroup)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrAPIGroup.Status.ValidationErrors)
+	assert.Contains(t, restoreErrAPIGroup.Status.ValidationErrors[0], "invalid ownerRefConfigMap: apiGroup must be empty")
+
+	// Case 4b: Per-restore OwnerRefConfigMap with invalid Kind fails validation
+	restoreErrKind := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-kind"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: "Secret",
+				Name: "some-cm",
+			},
+		},
+	}
+	resScope = r.loadOwnerRefScope(ctx, restoreErrKind)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrKind.Status.ValidationErrors)
+	assert.Contains(t, restoreErrKind.Status.ValidationErrors[0], "invalid ownerRefConfigMap: kind must be ConfigMap")
+
+	// Case 4c: Per-restore OwnerRefConfigMap with empty Name fails validation
+	restoreErrName := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-name"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: "ConfigMap",
+				Name: "",
+			},
+		},
+	}
+	resScope = r.loadOwnerRefScope(ctx, restoreErrName)
+	assert.Nil(t, resScope)
+	require.NotEmpty(t, restoreErrName.Status.ValidationErrors)
+	assert.Contains(t, restoreErrName.Status.ValidationErrors[0], "ownerRefConfigMap name cannot be empty")
+
+	// Case 4d: Per-restore non-existent ConfigMap records validation error and returns nil
 	restoreErrNotFound := &velerov1api.Restore{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-err-not-found"},
 		Spec: velerov1api.RestoreSpec{
 			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "non-existent-cm"},
 		},
 	}
-	resScope := r.loadOwnerRefScope(ctx, restoreErrNotFound)
+	resScope = r.loadOwnerRefScope(ctx, restoreErrNotFound)
 	assert.Nil(t, resScope)
 	require.NotEmpty(t, restoreErrNotFound.Status.ValidationErrors)
 	assert.Contains(t, restoreErrNotFound.Status.ValidationErrors[0], "failed to get owner-ref configmap")
