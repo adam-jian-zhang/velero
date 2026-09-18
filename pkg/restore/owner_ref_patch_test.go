@@ -529,6 +529,65 @@ func TestRegisterAndMaybeEnqueue_Durability(t *testing.T) {
 	assert.Equal(t, "Cluster", specQueue[0].Kind)
 }
 
+func TestRegisterExistingObjectUID_NoPatchesEnqueued(t *testing.T) {
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	scope := ownerref.NewScope()
+	baselineCM, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
+	require.NoError(t, err)
+	require.NoError(t, scope.MergeConfigMap(baselineCM))
+
+	ctx := &restoreContext{
+		ownerRefRemap: state,
+		ownerRefScope: scope,
+	}
+
+	backupObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-existing",
+				"namespace": "default",
+				"uid":       "backup-cluster-uid-existing",
+			},
+		},
+	}
+
+	liveObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-existing",
+				"namespace": "default",
+				"uid":       "live-cluster-uid-existing",
+			},
+		},
+	}
+
+	origOwnerRefs := []metav1.OwnerReference{
+		{
+			APIVersion: "tanzu.vmware.com/v1",
+			Kind:       "ManagementCluster",
+			Name:       "mgmt-1",
+			UID:        "mgmt-uid-1",
+		},
+	}
+
+	// For pre-existing live objects, only registerExistingObjectUID is called.
+	ctx.registerExistingObjectUID(backupObj, liveObj, origOwnerRefs)
+
+	// 1. UID mapping must be registered so newly restored children can resolve the live parent
+	newUID, found := state.GetNewUID("backup-cluster-uid-existing")
+	assert.True(t, found)
+	assert.Equal(t, types.UID("live-cluster-uid-existing"), newUID)
+
+	// 2. But patch queues MUST remain completely empty!
+	assert.Empty(t, state.GetOwnerPatchQueue(), "Pre-existing live objects must never enqueue ownerRef patches")
+	assert.Empty(t, state.GetSpecPatchQueue(), "Pre-existing live objects must never enqueue specRef patches")
+}
+
 func TestFilterDeniedPVCOwnerRefs(t *testing.T) {
 	scope := ownerref.NewScope()
 	baselineCM, err := velerotest.LoadBaselineOwnerRefConfigMapFromExample("velero")
@@ -690,6 +749,173 @@ func TestApplyOwnerRefRemapping_NonRetriableErrorDoesNotBloatStatus(t *testing.T
 	assert.True(t, quiesced[0].UnquiesceBlocked, "Parent cluster must be marked UnquiesceBlocked")
 
 	// CanUnquiesce must return false for this parent
+	assert.False(t, CanUnquiesce(quiesced[0], pending))
+}
+
+type countingForbiddenPatchClient struct {
+	client.Client
+	patchCount int
+}
+
+func (c *countingForbiddenPatchClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	c.patchCount++
+	return apierrors.NewForbidden(
+		schema.GroupResource{Group: "cluster.x-k8s.io", Resource: "machines"},
+		obj.GetName(),
+		fmt.Errorf("user does not have permission"),
+	)
+}
+
+func TestApplyOwnerRefRemapping_SecondForbiddenIsNonRetriable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	childObj := &unstructured.Unstructured{}
+	childObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "Machine",
+	})
+	childObj.SetName("worker-403")
+	childObj.SetNamespace("default")
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(childObj).Build()
+	mockClient := &countingForbiddenPatchClient{Client: baseClient}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("cluster-old", "cluster-new")
+
+	// Parent cluster is quiesced
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObject(rec)
+
+	blockOwnerDeletionTrue := true
+	req := ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-403",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion:         "cluster.x-k8s.io/v1beta1",
+				Kind:               "Cluster",
+				Name:               "cluster-1",
+				UID:                "cluster-old",
+				BlockOwnerDeletion: &blockOwnerDeletionTrue,
+			},
+		},
+		OwnerRefSourceNS: []string{"default"},
+	}
+	state.EnqueueOwnerPatch(req)
+
+	restore := &velerov1api.Restore{}
+	warnings, pending := ApplyOwnerRefRemapping(context.Background(), logrus.StandardLogger(), mockClient, restore, state)
+
+	// Both initial patch (with blockOwnerDeletion: true) and fallback patch (without it) were attempted:
+	assert.Equal(t, 2, mockClient.patchCount, "Fallback patch must be attempted after stripping blockOwnerDeletion upon initial 403")
+
+	// Warnings recorded, but pendingPatches is EMPTY because persistent 403 is non-retriable (protects etcd from bloat)
+	assert.False(t, warnings.IsEmpty())
+	assert.Empty(t, pending, "Second 403 Forbidden must be classified as non-retriable and not enter PendingOwnerRefPatches")
+
+	// Quiesced parent must be marked unquiesceBlocked
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked, "Parent cluster must be marked UnquiesceBlocked on persistent 403")
+
+	// CanUnquiesce must return false for this parent
+	assert.False(t, CanUnquiesce(quiesced[0], pending))
+}
+
+func TestApplyOwnerRefRemapping_InitialForbiddenWithoutBlockOwnerDeletionIsNonRetriable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	childObj := &unstructured.Unstructured{}
+	childObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "Machine",
+	})
+	childObj.SetName("worker-403-noblock")
+	childObj.SetNamespace("default")
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(childObj).Build()
+	mockClient := &countingForbiddenPatchClient{Client: baseClient}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("cluster-old", "cluster-new")
+
+	// Parent cluster is quiesced
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObject(rec)
+
+	req := ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-403-noblock",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "Cluster",
+				Name:       "cluster-1",
+				UID:        "cluster-old",
+				// BlockOwnerDeletion is nil
+			},
+		},
+		OwnerRefSourceNS: []string{"default"},
+	}
+	state.EnqueueOwnerPatch(req)
+
+	restore := &velerov1api.Restore{}
+	warnings, pending := ApplyOwnerRefRemapping(context.Background(), logrus.StandardLogger(), mockClient, restore, state)
+
+	// Only 1 patch attempted (no fallback because blockOwnerDeletion was not set)
+	assert.Equal(t, 1, mockClient.patchCount, "No fallback retry should occur when blockOwnerDeletion was not set")
+
+	// Warnings recorded, but pending is EMPTY
+	assert.False(t, warnings.IsEmpty())
+	assert.Empty(t, pending, "Initial 403 without blockOwnerDeletion must be non-retriable and not enter PendingOwnerRefPatches")
+
+	// Quiesced parent must be marked unquiesceBlocked
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked, "Parent cluster must be marked UnquiesceBlocked on 403 Forbidden")
+
+	// CanUnquiesce must return false
 	assert.False(t, CanUnquiesce(quiesced[0], pending))
 }
 
@@ -1007,4 +1233,63 @@ func TestApplyOwnerRefRemapping_MultiClusterSameNamespaceIsolation(t *testing.T)
 
 	// cluster-2 has NO pending patch targeting it -> CAN unquiesce independently even in the same namespace!
 	assert.True(t, CanUnquiesce(cluster2, pendingPatches), "Cluster-2 must be allowed to unquiesce; unrelated cluster must not block it")
+}
+
+func TestApplyOwnerRefRemapping_ResourceTimeout_QueuePreserved(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Simulate Pass 1 context expiration (resourceTimeout)
+
+	scheme := runtime.NewScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-parent-uid", "new-parent-uid")
+
+	// Quiesced root Cluster
+	state.RecordQuiescedObjectWithUID("old-parent-uid", velerov1api.QuiescedObjectRef{
+		Group:         "cluster.x-k8s.io",
+		Version:       "v1beta1",
+		Kind:          "Cluster",
+		Namespace:     "default",
+		Name:          "test-cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	})
+
+	// Machine child whose parent is the Cluster
+	state.EnqueueOwnerPatch(ownerref.OwnerPatchRequest{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Namespace: "default",
+		Name:      "worker-1",
+		OriginalOwnerRefs: []metav1.OwnerReference{
+			{
+				APIVersion: "cluster.x-k8s.io/v1beta1",
+				Kind:       "Cluster",
+				Name:       "test-cluster",
+				UID:        "old-parent-uid",
+			},
+		},
+	})
+
+	restore := &velerov1api.Restore{}
+	warnings, pending := ApplyOwnerRefRemapping(ctx, logrus.StandardLogger(), fakeClient, restore, state)
+
+	assert.False(t, warnings.IsEmpty(), "Warnings must record context cancellation")
+	require.Len(t, pending, 1, "Remaining ownerRef queue item must be preserved in PendingOwnerRefPatches")
+	assert.Equal(t, "Machine", pending[0].Kind)
+	assert.Equal(t, "ownerRef", pending[0].PatchType)
+	require.Len(t, pending[0].OwnerReferences, 1)
+	assert.Equal(t, types.UID("new-parent-uid"), pending[0].OwnerReferences[0].UID)
+	require.Len(t, pending[0].Targets, 1)
+	assert.Equal(t, "test-cluster", pending[0].Targets[0].Name)
+
+	// Ensure remainingQueue in state is also preserved
+	assert.Len(t, state.GetOwnerPatchQueue(), 1, "Owner patch queue must retain timed-out items")
+
+	// Quiesced root Cluster must NOT be unquiesced while child patch is pending
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.False(t, CanUnquiesce(quiesced[0], pending), "Cluster must remain paused because child patch is pending")
 }

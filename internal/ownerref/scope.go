@@ -288,6 +288,9 @@ func validateDottedSpecPath(path string) error {
 	if !strings.HasPrefix(path, "spec.") {
 		return fmt.Errorf("must start with 'spec.' (e.g. 'spec.infrastructureRef')")
 	}
+	if path == "spec." || strings.HasSuffix(path, ".") {
+		return fmt.Errorf("path cannot end with a dot")
+	}
 	normalized := strings.ReplaceAll(path, "[*]", ".[*].")
 	for _, seg := range strings.Split(normalized, ".") {
 		seg = strings.TrimSpace(seg)

@@ -255,9 +255,6 @@ func (s *OwnerRefRemapState) ResolveQuiescedRoots(req OwnerPatchRequest) []veler
 		// Check if this ancestor UID corresponds to a quiesced object
 		if rec, ok := s.quiescedByOldUID[curr]; ok {
 			targetNS := rec.Namespace
-			if targetNS == "" {
-				targetNS = req.Namespace
-			}
 			key := fmt.Sprintf("%s/%s/%s/%s", rec.Group, rec.Kind, targetNS, rec.Name)
 			if _, exists := seenTargets[key]; !exists {
 				seenTargets[key] = struct{}{}

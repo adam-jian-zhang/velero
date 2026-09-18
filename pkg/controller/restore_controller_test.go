@@ -1488,6 +1488,18 @@ func TestLoadOwnerRefScope(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-legacy"},
 	}
 	assert.Nil(t, r.loadOwnerRefScope(ctx, restoreLegacy))
+	assert.Empty(t, restoreLegacy.Status.ValidationErrors)
+
+	// Case 0b: Feature flag disabled and OwnerRefConfigMap specified -> returns nil and appends validation error
+	restoreFlagDisabledWithCM := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "restore-disabled-with-cm"},
+		Spec: velerov1api.RestoreSpec{
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Name: "some-cm"},
+		},
+	}
+	assert.Nil(t, r.loadOwnerRefScope(ctx, restoreFlagDisabledWithCM))
+	require.NotEmpty(t, restoreFlagDisabledWithCM.Status.ValidationErrors)
+	assert.Contains(t, restoreFlagDisabledWithCM.Status.ValidationErrors[0], "ownerRefConfigMap cannot be specified because feature flag OwnerRefRemap is not enabled")
 
 	// Enable feature flag for subsequent test cases
 	features.NewFeatureFlagSet(velerov1api.OwnerRefRemapFeatureFlag)

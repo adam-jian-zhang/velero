@@ -34,6 +34,7 @@ import (
 
 	"github.com/vmware-tanzu/velero/internal/ownerref"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/util/results"
 )
 
@@ -85,13 +86,14 @@ func InjectQuiesceMetadata(
 	obj.SetAnnotations(annotations)
 
 	if restoreName != "" {
-		labels[LabelQuiescedByRestore] = restoreName
+		validRestoreName := label.GetValidName(restoreName)
+		labels[LabelQuiescedByRestore] = validRestoreName
 		obj.SetLabels(labels)
 	}
 
 	if log != nil {
 		log.Infof("Auto-quiesced %s/%s via annotation %s=%q with tracking label %s=%q for restore",
-			obj.GetNamespace(), obj.GetName(), rule.AnnotationKey, rule.AnnotationValue, LabelQuiescedByRestore, restoreName)
+			obj.GetNamespace(), obj.GetName(), rule.AnnotationKey, rule.AnnotationValue, LabelQuiescedByRestore, label.GetValidName(restoreName))
 	}
 	return record, true
 }
@@ -185,6 +187,15 @@ func UnquiesceObjects(
 	}
 
 	for _, rec := range records {
+		if ctx.Err() != nil {
+			if log != nil {
+				log.WithError(ctx.Err()).Warnf("Context canceled or timed out; retaining %s/%s in quiescedObjects", rec.Namespace, rec.Name)
+			}
+			warnings.Add(rec.Namespace, ctx.Err())
+			failed = append(failed, rec)
+			continue
+		}
+
 		if strings.TrimSpace(rec.AnnotationKey) == "" {
 			if log != nil {
 				log.Warnf("Cannot unquiesce %s/%s: empty annotationKey in record", rec.Namespace, rec.Name)
@@ -195,6 +206,9 @@ func UnquiesceObjects(
 		}
 
 		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			liveObj := &unstructured.Unstructured{}
 			liveObj.SetGroupVersionKind(schema.GroupVersionKind{
 				Group:   rec.Group,
@@ -276,6 +290,7 @@ func CatchLeftoverPausedObjects(
 		return nil
 	}
 
+	validRestoreName := label.GetValidName(restoreName)
 	seen := make(map[string]struct{})
 	var leftover []velerov1api.QuiescedObjectRef
 
@@ -291,7 +306,7 @@ func CatchLeftoverPausedObjects(
 			list := &unstructured.UnstructuredList{}
 			gvk := schema.GroupVersionKind{Group: rule.Group, Version: version, Kind: rule.Kind}
 			list.SetGroupVersionKind(schema.GroupVersionKind{Group: gvk.Group, Version: gvk.Version, Kind: gvk.Kind + "List"})
-			if err := crClient.List(ctx, list, client.MatchingLabels{LabelQuiescedByRestore: restoreName}); err != nil {
+			if err := crClient.List(ctx, list, client.MatchingLabels{LabelQuiescedByRestore: validRestoreName}); err != nil {
 				if ctx.Err() != nil {
 					return leftover
 				}

@@ -522,8 +522,11 @@ func (r *restoreReconciler) loadResourceModifierConfigMap(
 }
 
 func (r *restoreReconciler) loadOwnerRefScope(ctx context.Context, restore *api.Restore) *ownerref.Scope {
-	ownerRefEnabled := features.IsEnabled(api.OwnerRefRemapFeatureFlag) || restore.Spec.OwnerRefConfigMap != nil
-	if !ownerRefEnabled {
+	if !features.IsEnabled(api.OwnerRefRemapFeatureFlag) {
+		if restore.Spec.OwnerRefConfigMap != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("ownerRefConfigMap cannot be specified because feature flag %s is not enabled on the Velero server", api.OwnerRefRemapFeatureFlag))
+		}
 		return nil
 	}
 
@@ -727,7 +730,7 @@ func (r *restoreReconciler) runValidatedRestore(
 	}
 
 	var ownerRefRemap *ownerref.OwnerRefRemapState
-	ownerRefEnabled := features.IsEnabled(api.OwnerRefRemapFeatureFlag) || restore.Spec.OwnerRefConfigMap != nil
+	ownerRefEnabled := features.IsEnabled(api.OwnerRefRemapFeatureFlag)
 	if ownerRefEnabled {
 		if ownerRefScope == nil {
 			ownerRefScope = ownerref.NewScope()
@@ -783,8 +786,9 @@ func (r *restoreReconciler) runValidatedRestore(
 			cancel()
 		}
 
-		// Persist state directly into Restore.Status for crash-proof recovery:
-		restore.Status.PendingOwnerRefPatches = pendingPatches
+		// Persist state into Restore.Status and hybrid overflow ConfigMap for crash-proof recovery:
+		saveWarnings := pkgrestore.SavePendingPatchesHybrid(r.ctx, patchClient, restore, pendingPatches, restoreReq.OwnerRefRemap, restoreLog)
+		restoreWarnings.Merge(&saveWarnings)
 		restore.Status.QuiescedObjects = stillQuiesced
 	}
 

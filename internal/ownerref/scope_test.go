@@ -469,9 +469,12 @@ func TestValidateDottedSpecPath(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "invalid bare spec", path: "spec", wantErr: true},
+		{name: "invalid bare spec with dot", path: "spec.", wantErr: true},
+		{name: "invalid trailing dot", path: "spec.ref.", wantErr: true},
 		{name: "valid simple spec path", path: "spec.ref", wantErr: false},
 		{name: "valid nested spec path", path: "spec.infrastructureRef", wantErr: false},
 		{name: "valid wildcard path", path: "spec.template.spec.volumes[*].dataVolume", wantErr: false},
+		{name: "valid wildcard path at end", path: "spec.clusterRefs[*]", wantErr: false},
 		{name: "empty path", path: "", wantErr: true},
 		{name: "jsonpath prefix $", path: "$.spec.infrastructureRef", wantErr: true},
 		{name: "jsonpath recursive descent ..", path: "spec..volumes", wantErr: true},

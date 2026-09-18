@@ -19,8 +19,10 @@ package restore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -79,17 +81,70 @@ func processSpecReferences(
 			continue
 		}
 
+		if ctx.Err() != nil {
+			// Pass 1 context expired (e.g. hit resourceTimeout): preserve queue item for Pass 2 without calling retry.OnError
+			warnings.Add(req.Namespace, ctx.Err())
+
+			lastPatchBytes, targets := fetchFallbackSpecPatch(crClient, gvk, req, paths, state, namespaceMapping, log)
+
+			allTargets := append([]velerov1api.TargetRef(nil), targets...)
+			for _, root := range state.ResolveQuiescedRoots(req) {
+				found := false
+				for _, existing := range allTargets {
+					if existing.Group == root.Group && existing.Kind == root.Kind && existing.Namespace == root.Namespace && existing.Name == root.Name {
+						found = true
+						break
+					}
+				}
+				if !found {
+					allTargets = append(allTargets, root)
+				}
+			}
+
+			if len(lastPatchBytes) > 0 {
+				remainingQueue = append(remainingQueue, req)
+				pendingPatches = append(pendingPatches, velerov1api.PendingPatchRef{
+					Group:         gvk.Group,
+					Version:       gvk.Version,
+					Kind:          gvk.Kind,
+					Namespace:     req.Namespace,
+					Name:          req.Name,
+					PatchType:     "specRef",
+					SpecPatchJSON: string(lastPatchBytes),
+					Targets:       allTargets,
+				})
+			} else {
+				for _, target := range allTargets {
+					targetNS := target.Namespace
+					if targetNS == "" {
+						targetNS = req.Namespace
+					}
+					state.BlockUnquiesceForTarget(target.Group, target.Kind, targetNS, target.Name)
+				}
+				if len(allTargets) == 0 {
+					state.BlockUnquiesceForNamespace(req.Namespace)
+				}
+			}
+			continue
+		}
+
 		var lastPatchBytes []byte
 		var targets []velerov1api.TargetRef
 		patched := false
 
 		err := retry.OnError(retry.DefaultBackoff, isRetriablePatchError, func() error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			obj := &unstructured.Unstructured{}
 			obj.SetGroupVersionKind(gvk)
 			if err := crClient.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: req.Name}, obj); err != nil {
 				return fmt.Errorf("get %s %s/%s for spec-ref remap: %w", gvk.String(), req.Namespace, req.Name, err)
 			}
 
+			// Note: allResolved (4th return value) is intentionally ignored here because Pass 1 executes
+			// after all backup resources are created in the cluster. Any unresolved spec ref UID is permanently
+			// missing from the backup and logged as a debug message; transient API error retry is governed by isRetriablePatchError.
 			changed, patchObj, collectedTargets, _, err := remapSpecRefFieldsWithTargets(obj, paths, state, namespaceMapping, log)
 			if err != nil {
 				return err
@@ -114,6 +169,13 @@ func processSpecReferences(
 		if err != nil {
 			log.WithError(err).Warnf("Failed to patch spec refs on %s/%s", req.Namespace, req.Name)
 			warnings.Add(req.Namespace, err)
+
+			// Timeout queue preservation: if Pass 1 context expired before lastPatchBytes was generated,
+			// attempt a short fallback fetch to compute the patch payload so this item is preserved for Pass 2 retry.
+			if len(lastPatchBytes) == 0 && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || ctx.Err() != nil) {
+				lastPatchBytes, targets = fetchFallbackSpecPatch(crClient, gvk, req, paths, state, namespaceMapping, log)
+			}
+
 			allTargets := append([]velerov1api.TargetRef(nil), targets...)
 			for _, root := range state.ResolveQuiescedRoots(req) {
 				found := false
@@ -163,6 +225,33 @@ func processSpecReferences(
 	state.SetSpecPatchQueue(remainingQueue)
 
 	return warnings, pendingPatches, specRefsRemapped
+}
+
+// fetchFallbackSpecPatch attempts a short standalone fetch and remap calculation
+// when Pass 1 context has expired, ensuring a computed patch payload is preserved for Pass 2.
+func fetchFallbackSpecPatch(
+	crClient client.Client,
+	gvk schema.GroupVersionKind,
+	req ownerref.OwnerPatchRequest,
+	paths []string,
+	state *ownerref.OwnerRefRemapState,
+	namespaceMapping map[string]string,
+	log logrus.FieldLogger,
+) ([]byte, []velerov1api.TargetRef) {
+	fallbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	fallbackObj := &unstructured.Unstructured{}
+	fallbackObj.SetGroupVersionKind(gvk)
+	if getErr := crClient.Get(fallbackCtx, client.ObjectKey{Namespace: req.Namespace, Name: req.Name}, fallbackObj); getErr == nil {
+		changed, patchObj, collectedTargets, _, remapErr := remapSpecRefFieldsWithTargets(fallbackObj, paths, state, namespaceMapping, log)
+		if remapErr == nil && changed && len(patchObj) > 0 {
+			if patchBytes, marshalErr := json.Marshal(patchObj); marshalErr == nil {
+				return patchBytes, collectedTargets
+			}
+		}
+	}
+	return nil, nil
 }
 
 func specRefPathsForGVK(entries []ownerref.SpecRefPathEntry, gvk schema.GroupVersionKind) []string {
@@ -285,6 +374,23 @@ func remapSpecRefFieldRecursiveWithTargets(
 		var targets []velerov1api.TargetRef
 		newSlice := make([]any, len(slice))
 		for i, item := range slice {
+			if len(tail) == 0 {
+				refMap, ok := item.(map[string]any)
+				if !ok {
+					newSlice[i] = item
+					continue
+				}
+				remappedMap, itemChanged, itemResolved, itemTargets := remapObjectReferenceMap(refMap, "[*]", state, namespaceMapping, log)
+				targets = append(targets, itemTargets...)
+				if itemChanged {
+					changed = true
+				}
+				if !itemResolved {
+					allResolved = false
+				}
+				newSlice[i] = remappedMap
+				continue
+			}
 			newItem, itemChanged, itemResolved, itemTargets, err := remapSpecRefFieldRecursiveWithTargets(item, tail, state, namespaceMapping, log)
 			if err != nil {
 				return val, false, false, nil, err
@@ -318,53 +424,9 @@ func remapSpecRefFieldRecursiveWithTargets(
 			return val, false, true, nil, nil
 		}
 
-		fieldChanged := false
-		resolved := true
-		var targets []velerov1api.TargetRef
-
-		targetKind, _ := refMap["kind"].(string)
-		targetName, _ := refMap["name"].(string)
-		targetAPIVersion, _ := refMap["apiVersion"].(string)
-		targetNS, _ := refMap[namespaceKey].(string)
-		if targetNS != "" {
-			targetNS = mapNamespace(targetNS, namespaceMapping)
-		}
-		if targetKind != "" && targetName != "" {
-			targets = append(targets, velerov1api.TargetRef{
-				Group:     ownerRefGroup(targetAPIVersion),
-				Kind:      targetKind,
-				Namespace: targetNS,
-				Name:      targetName,
-			})
-		}
-
-		if uidStr, ok := refMap[uidKey].(string); ok && uidStr != "" {
-			uid := types.UID(uidStr)
-			if newUID, found := state.GetNewUID(uid); found {
-				refMap[uidKey] = string(newUID)
-				if _, hasRV := refMap[resourceVersionKey]; hasRV {
-					refMap[resourceVersionKey] = nil
-				}
-				fieldChanged = true
-			} else if state.IsNewUID(uid) {
-				// Already remapped in a previous pass
-				resolved = true
-			} else {
-				resolved = false
-				if log != nil {
-					log.Debugf("Skipping unmapped spec ref uid %q at %s", uidStr, head)
-				}
-			}
-		}
-		if ns, ok := refMap[namespaceKey].(string); ok && ns != "" {
-			mappedNS := mapNamespace(ns, namespaceMapping)
-			if mappedNS != ns {
-				refMap[namespaceKey] = mappedNS
-				fieldChanged = true
-			}
-		}
+		remappedMap, fieldChanged, resolved, targets := remapObjectReferenceMap(refMap, head, state, namespaceMapping, log)
 		if fieldChanged {
-			m[head] = refMap
+			m[head] = remappedMap
 			return m, true, resolved, targets, nil
 		}
 		return val, false, resolved, targets, nil
@@ -385,6 +447,62 @@ func remapSpecRefFieldRecursiveWithTargets(
 		return m, true, childResolved, targets, nil
 	}
 	return val, false, childResolved, targets, nil
+}
+
+func remapObjectReferenceMap(
+	refMap map[string]any,
+	fieldDesc string,
+	state *ownerref.OwnerRefRemapState,
+	namespaceMapping map[string]string,
+	log logrus.FieldLogger,
+) (map[string]any, bool, bool, []velerov1api.TargetRef) {
+	fieldChanged := false
+	resolved := true
+	var targets []velerov1api.TargetRef
+
+	targetKind, _ := refMap["kind"].(string)
+	targetName, _ := refMap["name"].(string)
+	targetAPIVersion, _ := refMap["apiVersion"].(string)
+	targetNS, _ := refMap[namespaceKey].(string)
+	if targetNS != "" {
+		targetNS = mapNamespace(targetNS, namespaceMapping)
+	}
+	if targetKind != "" && targetName != "" {
+		targets = append(targets, velerov1api.TargetRef{
+			Group:     ownerRefGroup(targetAPIVersion),
+			Kind:      targetKind,
+			Namespace: targetNS,
+			Name:      targetName,
+		})
+	}
+
+	if uidStr, ok := refMap[uidKey].(string); ok && uidStr != "" {
+		uid := types.UID(uidStr)
+		if newUID, found := state.GetNewUID(uid); found {
+			refMap[uidKey] = string(newUID)
+			if _, hasRV := refMap[resourceVersionKey]; hasRV {
+				refMap[resourceVersionKey] = nil
+			}
+			fieldChanged = true
+		} else if state.IsNewUID(uid) {
+			// Already remapped in a previous pass
+			resolved = true
+		} else {
+			resolved = false
+			if log != nil {
+				log.Debugf("Skipping unmapped spec ref uid %q at %s", uidStr, fieldDesc)
+			}
+		}
+	}
+	if ns, ok := refMap[namespaceKey].(string); ok && ns != "" {
+		mappedNS := mapNamespace(ns, namespaceMapping)
+		if mappedNS != ns {
+			refMap[namespaceKey] = mappedNS
+			fieldChanged = true
+		}
+	}
+
+	return refMap, fieldChanged, resolved, targets
 }
 
 func setNestedValue(root map[string]any, fields []string, value any) error {

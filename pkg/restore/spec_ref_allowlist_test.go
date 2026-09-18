@@ -200,6 +200,69 @@ func TestRemapSpecRefFields_KubeVirtArrayWildcard(t *testing.T) {
 	assert.Equal(t, "target-ns", pvc["namespace"])
 }
 
+func TestRemapSpecRefFields_DirectArrayWildcard(t *testing.T) {
+	state := ownerref.NewOwnerRefRemapState()
+	state.RegisterUIDMapping("old-c1-uid", "new-c1-uid")
+	state.RegisterUIDMapping("old-c2-uid", "new-c2-uid")
+
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "multicluster.x-k8s.io/v1alpha1",
+			"kind":       "ClusterSet",
+			"metadata": map[string]any{
+				"name":      "set-1",
+				"namespace": "target-ns",
+			},
+			"spec": map[string]any{
+				"clusterRefs": []any{
+					map[string]any{
+						"apiVersion": "cluster.x-k8s.io/v1beta1",
+						"kind":       "Cluster",
+						"name":       "c1",
+						"namespace":  "src-ns",
+						"uid":        "old-c1-uid",
+					},
+					map[string]any{
+						"apiVersion": "cluster.x-k8s.io/v1beta1",
+						"kind":       "Cluster",
+						"name":       "c2",
+						"namespace":  "src-ns",
+						"uid":        "old-c2-uid",
+					},
+				},
+			},
+		},
+	}
+
+	paths := []string{
+		"spec.clusterRefs[*]",
+	}
+
+	namespaceMapping := map[string]string{
+		"src-ns": "target-ns",
+	}
+
+	changed, patchObj, allResolved, err := remapSpecRefFields(obj, paths, state, namespaceMapping, logrus.StandardLogger())
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.True(t, allResolved)
+
+	refs, found, err := unstructured.NestedSlice(patchObj, "spec", "clusterRefs")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Len(t, refs, 2)
+
+	r1, ok := refs[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "new-c1-uid", r1["uid"])
+	assert.Equal(t, "target-ns", r1["namespace"])
+
+	r2, ok := refs[1].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "new-c2-uid", r2["uid"])
+	assert.Equal(t, "target-ns", r2["namespace"])
+}
+
 func TestProcessSpecReferences_Integration(t *testing.T) {
 	scheme := runtime.NewScheme()
 	vm := &unstructured.Unstructured{
@@ -604,4 +667,301 @@ func TestProcessSpecReferences_CrossNamespaceTargetRefRemapped(t *testing.T) {
 	assert.Equal(t, "DataVolume", pending[0].Targets[0].Kind)
 	assert.Equal(t, "infra-dest", pending[0].Targets[0].Namespace)
 	assert.Equal(t, "dv-shared", pending[0].Targets[0].Name)
+}
+
+func TestProcessSpecReferences_MultiHopTransitiveRootInTargets(t *testing.T) {
+	scheme := runtime.NewScheme()
+	machine := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-1",
+				"namespace": "default",
+			},
+			"spec": map[string]any{
+				"infrastructureRef": map[string]any{
+					"apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
+					"kind":       "VSphereMachine",
+					"name":       "vsphere-vm-1",
+					"namespace":  "default",
+					"uid":        "old-vm-uid",
+				},
+			},
+		},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machine).Build()
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewConflict(
+			schema.GroupResource{Group: "cluster.x-k8s.io", Resource: "machines"},
+			"worker-1",
+			fmt.Errorf("conflict"),
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-vm-uid", "new-vm-uid")
+	state.RegisterUIDMapping("old-cluster-uid", "new-cluster-uid")
+	state.RegisterUIDMapping("old-ms-uid", "new-ms-uid")
+	state.RegisterUIDMapping("old-machine-uid", "new-machine-uid")
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObjectWithUID("old-cluster-uid", rec)
+
+	// Register multi-hop parent hierarchy:
+	// Machine -> MachineSet -> Cluster
+	state.RegisterParentUID("old-ms-uid", "old-cluster-uid")
+	state.RegisterParentUID("old-machine-uid", "old-ms-uid")
+
+	scope := ownerref.NewScope()
+	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
+		Group: "cluster.x-k8s.io",
+		Kind:  "Machine",
+		Paths: []string{"spec.infrastructureRef"},
+	})
+	state.SetScope(scope)
+
+	req := ownerref.OwnerPatchRequest{
+		OldUID:    "old-machine-uid",
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-1",
+	}
+	state.EnqueueSpecPatch(req)
+
+	warnings, pending, remapped := processSpecReferences(context.Background(), logrus.StandardLogger(), mockClient, state, nil)
+	assert.False(t, warnings.IsEmpty())
+	assert.Equal(t, 0, remapped)
+	require.Len(t, pending, 1)
+
+	// Targets must contain both spec target (VSphereMachine) and transitive quiesced root (Cluster)
+	require.Len(t, pending[0].Targets, 2, "Targets must contain spec target and quiesced root")
+
+	assert.Equal(t, "infrastructure.cluster.x-k8s.io", pending[0].Targets[0].Group)
+	assert.Equal(t, "VSphereMachine", pending[0].Targets[0].Kind)
+	assert.Equal(t, "default", pending[0].Targets[0].Namespace)
+	assert.Equal(t, "vsphere-vm-1", pending[0].Targets[0].Name)
+
+	assert.Equal(t, "cluster.x-k8s.io", pending[0].Targets[1].Group)
+	assert.Equal(t, "Cluster", pending[0].Targets[1].Kind)
+	assert.Equal(t, "default", pending[0].Targets[1].Namespace)
+	assert.Equal(t, "cluster-1", pending[0].Targets[1].Name)
+
+	// CanUnquiesce for Cluster must return FALSE due to Cluster pinned in Targets
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.False(t, CanUnquiesce(quiesced[0], pending), "CanUnquiesce must return false due to root Cluster pinned in Targets")
+}
+
+func TestProcessSpecReferences_MultiHopNonRetriableErrorBlocksQuiescedRoot(t *testing.T) {
+	scheme := runtime.NewScheme()
+	machine := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-1",
+				"namespace": "default",
+			},
+			"spec": map[string]any{
+				"infrastructureRef": map[string]any{
+					"apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
+					"kind":       "VSphereMachine",
+					"name":       "vsphere-vm-1",
+					"namespace":  "default",
+					"uid":        "old-vm-uid",
+				},
+			},
+		},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machine).Build()
+	mockClient := &mockErrorPatchClient{
+		Client: baseClient,
+		patchErr: apierrors.NewInvalid(
+			schema.GroupKind{Group: "cluster.x-k8s.io", Kind: "Machine"},
+			"worker-1",
+			nil,
+		),
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-vm-uid", "new-vm-uid")
+	state.RegisterUIDMapping("old-cluster-uid", "new-cluster-uid")
+	state.RegisterUIDMapping("old-ms-uid", "new-ms-uid")
+	state.RegisterUIDMapping("old-machine-uid", "new-machine-uid")
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObjectWithUID("old-cluster-uid", rec)
+
+	// Register multi-hop parent hierarchy:
+	// Machine -> MachineSet -> Cluster
+	state.RegisterParentUID("old-ms-uid", "old-cluster-uid")
+	state.RegisterParentUID("old-machine-uid", "old-ms-uid")
+
+	scope := ownerref.NewScope()
+	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
+		Group: "cluster.x-k8s.io",
+		Kind:  "Machine",
+		Paths: []string{"spec.infrastructureRef"},
+	})
+	state.SetScope(scope)
+
+	req := ownerref.OwnerPatchRequest{
+		OldUID:    "old-machine-uid",
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-1",
+	}
+	state.EnqueueSpecPatch(req)
+
+	warnings, pending, remapped := processSpecReferences(context.Background(), logrus.StandardLogger(), mockClient, state, nil)
+	assert.False(t, warnings.IsEmpty())
+	assert.Equal(t, 0, remapped)
+	assert.Empty(t, pending, "Non-retriable patch failure must not enter pendingPatches")
+
+	// Quiesced Cluster must be marked UnquiesceBlocked
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked, "Cluster must be marked UnquiesceBlocked when child specRef patch fails permanently")
+	assert.False(t, CanUnquiesce(quiesced[0], nil), "CanUnquiesce must return false for blocked cluster")
+}
+
+func TestProcessSpecReferences_ResourceTimeout_QueuePreserved(t *testing.T) {
+	scheme := runtime.NewScheme()
+	machineObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Machine",
+			"metadata": map[string]any{
+				"name":      "worker-1",
+				"namespace": "default",
+			},
+			"spec": map[string]any{
+				"infrastructureRef": map[string]any{
+					"apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
+					"kind":       "VSphereMachine",
+					"name":       "vm-1",
+					"uid":        "old-vm-uid",
+				},
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machineObj).Build()
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RegisterUIDMapping("old-vm-uid", "new-vm-uid")
+	state.RegisterUIDMapping("old-cluster-uid", "new-cluster-uid")
+	state.RegisterUIDMapping("old-machine-uid", "new-machine-uid")
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:         "cluster.x-k8s.io",
+		Kind:          "Cluster",
+		AnnotationKey: "cluster.x-k8s.io/paused",
+	}
+	rec, _ := InjectQuiesceMetadata(clusterObj, rule, "restore-test", logrus.StandardLogger())
+	state.RecordQuiescedObjectWithUID("old-cluster-uid", rec)
+
+	// Register Machine -> Cluster parent hierarchy
+	state.RegisterParentUID("old-machine-uid", "old-cluster-uid")
+
+	scope := ownerref.NewScope()
+	scope.SpecRefPaths = append(scope.SpecRefPaths, ownerref.SpecRefPathEntry{
+		Group: "cluster.x-k8s.io",
+		Kind:  "Machine",
+		Paths: []string{"spec.infrastructureRef"},
+	})
+	state.SetScope(scope)
+
+	req := ownerref.OwnerPatchRequest{
+		OldUID:    "old-machine-uid",
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Machine",
+		Resource:  "machines",
+		Namespace: "default",
+		Name:      "worker-1",
+	}
+	state.EnqueueSpecPatch(req)
+
+	// Simulate Pass 1 context timeout (resourceTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	warnings, pending, remapped := processSpecReferences(ctx, logrus.StandardLogger(), fakeClient, state, nil)
+	assert.False(t, warnings.IsEmpty(), "Warnings must capture context expiration")
+	assert.Equal(t, 0, remapped, "Remapped count must not increment on Pass 1 timeout")
+
+	// Verify pending patch was preserved with payload and targets via fallback fetch
+	require.Len(t, pending, 1, "Spec patch must be preserved in PendingOwnerRefPatches instead of disappearing")
+	assert.Equal(t, "Machine", pending[0].Kind)
+	assert.Equal(t, "specRef", pending[0].PatchType)
+	assert.Contains(t, pending[0].SpecPatchJSON, "new-vm-uid", "SpecPatchJSON must contain the remapped UID")
+
+	// Target must include the transitive quiesced root Cluster
+	var foundClusterTarget bool
+	for _, target := range pending[0].Targets {
+		if target.Group == "cluster.x-k8s.io" && target.Kind == "Cluster" && target.Name == "cluster-1" {
+			foundClusterTarget = true
+			break
+		}
+	}
+	assert.True(t, foundClusterTarget, "Targets must contain the transitive root Cluster")
+
+	// Spec patch queue in state must retain the timed-out item
+	assert.Len(t, state.GetSpecPatchQueue(), 1, "Spec patch queue must retain item for Pass 2")
+
+	// Quiesced Cluster must NOT be unquiesced while child spec patch is pending
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.False(t, CanUnquiesce(quiesced[0], pending), "Cluster must remain paused while child spec patch is pending")
 }
