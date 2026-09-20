@@ -300,7 +300,7 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 		&c.OwnerRefConfigMap,
 		"owner-ref-configmap",
 		c.OwnerRefConfigMap,
-		"The name of a ConfigMap in the Velero namespace containing custom inScope GVKs, specRefPaths, and quiesce rules for ownerReference remapping. Optional.",
+		"The name of a ConfigMap in the Velero namespace containing the baseline inScope GVKs, specRefPaths, and quiesce rules for ownerReference remapping. Optional. Distinct from velero restore create --owner-ref-restore-configmap.",
 	)
 	flags.IntVar(
 		&c.MaxBackupExtractionSize,

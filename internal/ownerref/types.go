@@ -44,9 +44,11 @@ type SpecRefPathEntry struct {
 // QuiesceRule configures automatic controller quiescing for a GVK on restore create.
 // SpecFieldPath is rejected at ConfigMap load; v1 quiesce is annotation-only.
 type QuiesceRule struct {
-	Group           string `yaml:"group" json:"group"`
-	Kind            string `yaml:"kind" json:"kind"`
-	AnnotationKey   string `yaml:"annotationKey,omitempty" json:"annotationKey,omitempty"`
+	Group         string `yaml:"group" json:"group"`
+	Kind          string `yaml:"kind" json:"kind"`
+	AnnotationKey string `yaml:"annotationKey,omitempty" json:"annotationKey,omitempty"`
+	// AnnotationValue is the inject payload only (CAPI uses "" for key presence).
+	// Unpause always deletes the key (null); value-based pauses are not supported.
 	AnnotationValue string `yaml:"annotationValue,omitempty" json:"annotationValue,omitempty"`
 	SpecFieldPath   string `yaml:"specFieldPath,omitempty" json:"specFieldPath,omitempty"`
 }
@@ -341,21 +343,6 @@ func (s *OwnerRefRemapState) BlockUnquiesceForTarget(group, kind, namespace, nam
 			if q.Namespace == "" || namespace == "" || q.Namespace == namespace {
 				q.UnquiesceBlocked = true
 			}
-		}
-	}
-}
-
-// BlockUnquiesceForNamespace marks all quiesced objects in the given namespace as unquiesceBlocked.
-func (s *OwnerRefRemapState) BlockUnquiesceForNamespace(namespace string) {
-	if s == nil {
-		return
-	}
-	s.queueLock.Lock()
-	defer s.queueLock.Unlock()
-	for i := range s.quiescedObjects {
-		q := &s.quiescedObjects[i]
-		if namespace == "" || q.Namespace == namespace {
-			q.UnquiesceBlocked = true
 		}
 	}
 }

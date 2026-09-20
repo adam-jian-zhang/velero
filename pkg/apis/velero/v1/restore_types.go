@@ -151,6 +151,7 @@ type RestoreSpec struct {
 	// OwnerRefConfigMap specifies an optional ConfigMap reference containing
 	// custom inScope GVKs, specRefPaths, and quiesceOnRestore rules for ownerReference remapping.
 	// If not set, falls back to the server-level --owner-ref-configmap or built-in defaults.
+	// Set via velero restore create --owner-ref-restore-configmap.
 	// +optional
 	// +nullable
 	OwnerRefConfigMap *corev1api.TypedLocalObjectReference `json:"ownerRefConfigMap,omitempty"`
@@ -363,6 +364,11 @@ const (
 	// MaxPendingPatches defines the maximum number of pending patches kept inline in Restore.Status
 	// to prevent etcd 1.5MB request limit issues. Excess patches spill over to an ephemeral ConfigMap.
 	MaxPendingPatches = 500
+
+	// MaxTotalPendingPatches is the hard cap on Status + overflow ConfigMap pending patches.
+	// Items beyond this count are dropped, overflow roots are blocked, and the restore
+	// is forced PartiallyFailed without unpausing. This design uses a single overflow ConfigMap.
+	MaxTotalPendingPatches = 10000
 )
 
 // RestoreStatus captures the current status of a Velero restore
@@ -443,8 +449,11 @@ type RestoreStatus struct {
 	// +nullable
 	PendingOwnerRefPatches []PendingPatchRef `json:"pendingOwnerRefPatches,omitempty"`
 
-	// PendingPatchesConfigMap names an ephemeral ConfigMap in the Velero namespace containing overflow
-	// pending patches (gzipped binaryData) when total pending patches exceed MaxPendingPatches.
+	// PendingPatchesConfigMap names the single ephemeral overflow ConfigMap in the Velero namespace
+	// (`<restore-name>-pending-patches`, gzipped binaryData["patches.json.gz"]) storing items
+	// 501 through MaxTotalPendingPatches. Gzip plus key must be ≤ 1 MiB; oversize, create/update
+	// failure after retry, or items beyond MaxTotalPendingPatches drop those patches, block roots,
+	// and force PartiallyFailed without unpausing.
 	// +optional
 	PendingPatchesConfigMap string `json:"pendingPatchesConfigMap,omitempty"`
 

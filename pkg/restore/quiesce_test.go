@@ -515,6 +515,43 @@ func TestUnquiesceObjects(t *testing.T) {
 	assert.Contains(t, warningsEmpty.Namespaces["default"][0], "missing pause annotation key")
 }
 
+func TestUnquiesceObjects_DeletesValuedPauseKey(t *testing.T) {
+	scheme := runtime.NewScheme()
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "example.io/v1",
+			"kind":       "App",
+			"metadata": map[string]any{
+				"name":      "app-1",
+				"namespace": "default",
+			},
+		},
+	}
+	rule := ownerref.QuiesceRule{
+		Group:           "example.io",
+		Kind:            "App",
+		AnnotationKey:   "example.io/paused",
+		AnnotationValue: "true",
+	}
+	rec, injected := InjectQuiesceMetadata(obj, rule, "rst-test", logrus.StandardLogger())
+	require.True(t, injected)
+	assert.Equal(t, "true", obj.GetAnnotations()["example.io/paused"])
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(obj).Build()
+	failed, warnings := UnquiesceObjects(context.Background(), logrus.StandardLogger(), fakeClient, []velerov1api.QuiescedObjectRef{rec})
+	assert.True(t, warnings.IsEmpty())
+	assert.Empty(t, failed)
+
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(schema.GroupVersionKind{Group: "example.io", Version: "v1", Kind: "App"})
+	err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "app-1"}, live)
+	require.NoError(t, err)
+	_, hasPaused := live.GetAnnotations()["example.io/paused"]
+	assert.False(t, hasPaused, "unpause must delete the key, not rewrite annotationValue to false")
+	assert.NotContains(t, live.GetAnnotations(), AnnotationQuiescedKey)
+	assert.NotContains(t, live.GetLabels(), LabelQuiescedByRestore)
+}
+
 func TestModeCLegacy_NonInterference(t *testing.T) {
 	// Mode C: Feature flag disabled and no OwnerRefConfigMap -> OwnerRefRemap is nil on Request
 	req := &Request{

@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -162,8 +163,9 @@ func TestSavePendingPatchesHybrid_OverLimitAndLoad(t *testing.T) {
 	assert.Equal(t, "machine-0524", overflow[24].Name)
 
 	// Test LoadPendingPatchesHybrid reconstructs all 525 items
-	loaded, loadWarnings := LoadPendingPatchesHybrid(context.Background(), fakeClient, restore)
+	loaded, loadWarnings, overflowLoadFailed := LoadPendingPatchesHybrid(context.Background(), fakeClient, restore)
 	assert.Empty(t, loadWarnings.Namespaces)
+	assert.False(t, overflowLoadFailed)
 	require.Len(t, loaded, 525)
 	assert.Equal(t, "machine-0000", loaded[0].Name)
 	assert.Equal(t, "machine-0524", loaded[524].Name)
@@ -268,4 +270,231 @@ func TestSavePendingPatchesHybrid_FallbackCircuitBreaker(t *testing.T) {
 	quiesced := state.GetQuiescedObjects()
 	require.Len(t, quiesced, 1)
 	assert.True(t, quiesced[0].UnquiesceBlocked)
+}
+
+func TestSavePendingPatchesHybrid_PreflightSizeLimit(t *testing.T) {
+	orig := overflowSizeLimit
+	overflowSizeLimit = 1
+	defer func() { overflowSizeLimit = orig }()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1api.AddToScheme(scheme))
+	require.NoError(t, velerov1api.AddToScheme(scheme))
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-restore",
+			Namespace: "velero",
+			UID:       "restore-uid-123",
+		},
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RecordQuiescedObject(velerov1api.QuiescedObjectRef{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Cluster",
+		Namespace: "default",
+		Name:      "prod-cluster",
+	})
+
+	patches := makeTestPendingPatches(510)
+	warnings := SavePendingPatchesHybrid(context.Background(), fakeClient, restore, patches, state, logrus.StandardLogger())
+	require.NotEmpty(t, warnings.Namespaces)
+	assert.Contains(t, warnings.Namespaces["velero"][0], "1MiB")
+
+	assert.Len(t, restore.Status.PendingOwnerRefPatches, 500)
+	assert.Empty(t, restore.Status.PendingPatchesConfigMap)
+
+	cmList := &corev1api.ConfigMapList{}
+	require.NoError(t, fakeClient.List(context.Background(), cmList))
+	assert.Empty(t, cmList.Items)
+
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked)
+}
+
+func TestSavePendingPatchesHybrid_TotalPendingCap(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1api.AddToScheme(scheme))
+	require.NoError(t, velerov1api.AddToScheme(scheme))
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-restore",
+			Namespace: "velero",
+			UID:       "restore-uid-123",
+		},
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RecordQuiescedObject(velerov1api.QuiescedObjectRef{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Cluster",
+		Namespace: "default",
+		Name:      "prod-cluster",
+	})
+
+	patches := makeTestPendingPatches(velerov1api.MaxTotalPendingPatches + 1)
+	warnings := SavePendingPatchesHybrid(context.Background(), fakeClient, restore, patches, state, logrus.StandardLogger())
+	require.NotEmpty(t, warnings.Namespaces)
+	assert.Contains(t, warnings.Namespaces["velero"][0], "MaxTotalPendingPatches")
+
+	assert.Len(t, restore.Status.PendingOwnerRefPatches, velerov1api.MaxPendingPatches)
+	assert.Equal(t, "test-restore-pending-patches", restore.Status.PendingPatchesConfigMap)
+
+	loaded, loadWarnings, overflowLoadFailed := LoadPendingPatchesHybrid(context.Background(), fakeClient, restore)
+	assert.Empty(t, loadWarnings.Namespaces)
+	assert.False(t, overflowLoadFailed)
+	assert.Len(t, loaded, velerov1api.MaxTotalPendingPatches)
+
+	quiesced := state.GetQuiescedObjects()
+	require.Len(t, quiesced, 1)
+	assert.True(t, quiesced[0].UnquiesceBlocked)
+}
+
+type flakyCreateClient struct {
+	client.Client
+	creates int
+}
+
+func (f *flakyCreateClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	f.creates++
+	if f.creates == 1 {
+		return apierrors.NewTooManyRequests("rate limited", 1)
+	}
+	return f.Client.Create(ctx, obj, opts...)
+}
+
+func TestSavePendingPatchesHybrid_RetryCreateSuccess(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1api.AddToScheme(scheme))
+	require.NoError(t, velerov1api.AddToScheme(scheme))
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	flaky := &flakyCreateClient{Client: baseClient}
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-restore",
+			Namespace: "velero",
+			UID:       "restore-uid-123",
+		},
+	}
+
+	patches := makeTestPendingPatches(510)
+	warnings := SavePendingPatchesHybrid(context.Background(), flaky, restore, patches, nil, logrus.StandardLogger())
+	assert.Empty(t, warnings.Namespaces)
+	assert.Equal(t, "test-restore-pending-patches", restore.Status.PendingPatchesConfigMap)
+	assert.GreaterOrEqual(t, flaky.creates, 2)
+
+	cm := &corev1api.ConfigMap{}
+	err := baseClient.Get(context.Background(), client.ObjectKey{Namespace: "velero", Name: "test-restore-pending-patches"}, cm)
+	require.NoError(t, err)
+}
+
+type alwaysRetriableCreateClient struct {
+	client.Client
+}
+
+func (f *alwaysRetriableCreateClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	return apierrors.NewTooManyRequests("rate limited", 1)
+}
+
+func TestSavePendingPatchesHybrid_RetryExhaustedCircuitBreaks(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1api.AddToScheme(scheme))
+	require.NoError(t, velerov1api.AddToScheme(scheme))
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	failingClient := &alwaysRetriableCreateClient{Client: baseClient}
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-restore",
+			Namespace: "velero",
+		},
+	}
+
+	state := ownerref.NewOwnerRefRemapState()
+	state.Enabled = true
+	state.RecordQuiescedObject(velerov1api.QuiescedObjectRef{
+		Group:     "cluster.x-k8s.io",
+		Version:   "v1beta1",
+		Kind:      "Cluster",
+		Namespace: "default",
+		Name:      "prod-cluster",
+	})
+
+	patches := makeTestPendingPatches(510)
+	warnings := SavePendingPatchesHybrid(context.Background(), failingClient, restore, patches, state, logrus.StandardLogger())
+	assert.NotEmpty(t, warnings.Namespaces)
+	assert.Len(t, restore.Status.PendingOwnerRefPatches, 500)
+	assert.Empty(t, restore.Status.PendingPatchesConfigMap)
+	assert.True(t, state.GetQuiescedObjects()[0].UnquiesceBlocked)
+}
+
+type flakyGetClient struct {
+	client.Client
+	gets int
+}
+
+func (f *flakyGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	f.gets++
+	if f.gets == 1 {
+		return apierrors.NewServiceUnavailable("unavailable")
+	}
+	return f.Client.Get(ctx, key, obj, opts...)
+}
+
+func TestLoadPendingPatchesHybrid_RetryGetSuccess(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1api.AddToScheme(scheme))
+	require.NoError(t, velerov1api.AddToScheme(scheme))
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-restore",
+			Namespace: "velero",
+			UID:       "restore-uid-123",
+		},
+	}
+
+	patches := makeTestPendingPatches(510)
+	_ = SavePendingPatchesHybrid(context.Background(), baseClient, restore, patches, nil, logrus.StandardLogger())
+
+	flaky := &flakyGetClient{Client: baseClient}
+	loaded, warnings, overflowLoadFailed := LoadPendingPatchesHybrid(context.Background(), flaky, restore)
+	assert.Empty(t, warnings.Namespaces)
+	assert.False(t, overflowLoadFailed)
+	assert.Len(t, loaded, 510)
+	assert.GreaterOrEqual(t, flaky.gets, 2)
+}
+
+func TestLoadPendingPatchesHybrid_MissingConfigMapFailClosed(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1api.AddToScheme(scheme))
+	require.NoError(t, velerov1api.AddToScheme(scheme))
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-restore",
+			Namespace: "velero",
+		},
+		Status: velerov1api.RestoreStatus{
+			PendingOwnerRefPatches:  makeTestPendingPatches(2),
+			PendingPatchesConfigMap: "test-restore-pending-patches",
+		},
+	}
+
+	loaded, warnings, overflowLoadFailed := LoadPendingPatchesHybrid(context.Background(), fakeClient, restore)
+	assert.NotEmpty(t, warnings.Namespaces)
+	assert.True(t, overflowLoadFailed)
+	assert.Len(t, loaded, 2)
 }

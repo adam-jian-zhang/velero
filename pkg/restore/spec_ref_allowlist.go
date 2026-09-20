@@ -121,9 +121,6 @@ func processSpecReferences(
 					}
 					state.BlockUnquiesceForTarget(target.Group, target.Kind, targetNS, target.Name)
 				}
-				if len(allTargets) == 0 {
-					state.BlockUnquiesceForNamespace(req.Namespace)
-				}
 			}
 			continue
 		}
@@ -204,18 +201,14 @@ func processSpecReferences(
 			} else {
 				// Non-retriable error or Get failed without patch payload:
 				// do NOT enqueue to pendingPatches with empty SpecPatchJSON (prevents etcd bloat and Pass 2 permanent failure).
-				// Instead, mark targets as unquiesceBlocked so parents remain safely paused.
+				// Pin known Targets and parentMap roots only. Do not namespace-block sibling quiesced objects
+				// when Targets were never parsed (graph-free independent unquiescing).
 				for _, target := range allTargets {
 					targetNS := target.Namespace
 					if targetNS == "" {
 						targetNS = req.Namespace
 					}
 					state.BlockUnquiesceForTarget(target.Group, target.Kind, targetNS, target.Name)
-				}
-				if len(allTargets) == 0 {
-					// If Get failed before targets could be parsed, block unquiescing for any quiesced object
-					// in this child's namespace to prevent unquiescing a parent that might have been referenced.
-					state.BlockUnquiesceForNamespace(req.Namespace)
 				}
 			}
 		} else if patched {

@@ -319,10 +319,9 @@ func ownerRefGroup(apiVersion string) string {
 	return gv.Group
 }
 
-// mergeOwnerReferences performs an additive merge: matching refs (Group, Kind, Name)
-// have UID, Controller, and BlockOwnerDeletion updated; unmanaged live refs are preserved;
-// new backup refs are appended. Enforces the Kubernetes invariant that at most one ownerReference
-// can have Controller: true using Live Precedence.
+// mergeOwnerReferences performs an additive merge: matching refs (Group, Kind, Name;
+// version suffix ignored) have UID, Controller, and BlockOwnerDeletion updated while
+// the live APIVersion is preserved; unmanaged live refs are kept; new backup refs are appended.
 //
 // Pre-existing live objects (existingResourcePolicy: update, skip, SA merge) are never enqueued
 // for remapping. Live Precedence specifically resolves controller claim races where an active
@@ -356,12 +355,9 @@ func mergeOwnerReferences(
 			}
 		}
 		if idx >= 0 {
-			// Update the existing live reference. APIVersion is overwritten with the backup's value
-			// because matching is by Group (parsed from APIVersion) + Kind + Name: when the live ref
-			// and the backup ref share a group/kind/name but differ in version (e.g. live v1beta1 vs
-			// backup v1), restore semantics favor the backed-up relationship's version. This is safe
-			// because the API server validates ownerReference apiVersion against served versions.
-			out[idx].APIVersion = r.APIVersion
+			// Match on Group (parsed from APIVersion) + Kind + Name. Keep the live
+			// APIVersion so a CAPI v1alpha4 backup ref vs v1beta1 live ref updates UID
+			// without duplicating the owner or writing an unserved version.
 			out[idx].UID = r.UID
 			out[idx].BlockOwnerDeletion = r.BlockOwnerDeletion
 			// If live was already controller, preserve it; otherwise take incoming only if no other live controller exists

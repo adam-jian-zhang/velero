@@ -2389,3 +2389,66 @@ func TestOwnerRefRemappingPass2_WithOverflowConfigMap_UnresolvedForcesPartiallyF
 	assert.Equal(t, "nonexistent-worker", restoreObj.Status.PendingOwnerRefPatches[0].Name)
 	assert.Empty(t, restoreObj.Status.PendingPatchesConfigMap)
 }
+
+func TestOwnerRefRemappingPass2_OverflowConfigMapLoadFailure_FailClosed(t *testing.T) {
+	logger := velerotest.NewLogger()
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "cluster.x-k8s.io/v1beta1",
+			"kind":       "Cluster",
+			"metadata": map[string]any{
+				"name":      "cluster-load-fail",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"cluster.x-k8s.io/paused": "",
+					"velero.io/quiesced-key":  "cluster.x-k8s.io/paused",
+				},
+				"labels": map[string]any{
+					"velero.io/quiesced-by-restore": "restore-load-fail",
+				},
+			},
+		},
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), clusterObj))
+
+	features.NewFeatureFlagSet(velerov1api.OwnerRefRemapFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreObj := builder.ForRestore("default", "restore-load-fail").Result()
+	restoreObj.Status.PendingPatchesConfigMap = "restore-load-fail-pending-patches"
+	restoreObj.Status.QuiescedObjects = []velerov1api.QuiescedObjectRef{
+		{
+			Group:         "cluster.x-k8s.io",
+			Version:       "v1beta1",
+			Kind:          "Cluster",
+			Namespace:     "default",
+			Name:          "cluster-load-fail",
+			AnnotationKey: "cluster.x-k8s.io/paused",
+		},
+	}
+
+	finalizerCtx := &finalizerContext{
+		logger:           logger,
+		restore:          restoreObj,
+		crClient:         fakeClient,
+		multiHookTracker: hook.NewMultiHookTracker(),
+		resourceTimeout:  10 * time.Second,
+	}
+	require.NoError(t, fakeClient.Create(t.Context(), finalizerCtx.restore))
+
+	warnings, errs := finalizerCtx.execute()
+	assert.False(t, warnings.IsEmpty())
+	assert.False(t, errs.IsEmpty())
+
+	liveCluster := &unstructured.Unstructured{}
+	liveCluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "Cluster"})
+	err := fakeClient.Get(t.Context(), crclient.ObjectKey{Namespace: "default", Name: "cluster-load-fail"}, liveCluster)
+	require.NoError(t, err)
+	assert.Contains(t, liveCluster.GetAnnotations(), "cluster.x-k8s.io/paused")
+
+	assert.Equal(t, "restore-load-fail-pending-patches", restoreObj.Status.PendingPatchesConfigMap)
+	require.Len(t, restoreObj.Status.QuiescedObjects, 1)
+	assert.Equal(t, "cluster-load-fail", restoreObj.Status.QuiescedObjects[0].Name)
+}

@@ -356,7 +356,7 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 		}
 
 		// 1. Load pending patches from Layer 2 Status & overflow ConfigMap:
-		allPending, loadWarnings := pkgrestore.LoadPendingPatchesHybrid(remapCtx, ctx.crClient, ctx.restore)
+		allPending, loadWarnings, overflowLoadFailed := pkgrestore.LoadPendingPatchesHybrid(remapCtx, ctx.crClient, ctx.restore)
 		warnings.Merge(&loadWarnings)
 
 		// 2. Retry transiently failed patches:
@@ -367,16 +367,22 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 			remainingPending = remaining
 		}
 
-		// 3. Unquiesce eligible objects via graph-free check against remaining pending patches:
-		if len(ctx.restore.Status.QuiescedObjects) > 0 {
-			stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restore.Status.QuiescedObjects, remainingPending)
-			warnings.Merge(&unquiesceWarnings)
-			ctx.restore.Status.QuiescedObjects = stillQuiesced
-		}
+		// Overflow load failure is fail-closed: skip unquiesce and skip ConfigMap drain
+		// so an incomplete pending list cannot look empty.
+		if overflowLoadFailed {
+			warnings.Add(ctx.restore.Namespace, fmt.Errorf("failed to load overflow ConfigMap %s after retries; skipping unquiesce to avoid waking controllers over unpatched children", ctx.restore.Status.PendingPatchesConfigMap))
+		} else {
+			// 3. Unquiesce eligible objects via graph-free check against remaining pending patches:
+			if len(ctx.restore.Status.QuiescedObjects) > 0 {
+				stillQuiesced, unquiesceWarnings := pkgrestore.UnquiesceEligibleObjects(remapCtx, ctx.logger, ctx.crClient, ctx.restore.Status.QuiescedObjects, remainingPending)
+				warnings.Merge(&unquiesceWarnings)
+				ctx.restore.Status.QuiescedObjects = stillQuiesced
+			}
 
-		// 4. Drain & Reconcile overflow ConfigMap:
-		reconcileWarnings := pkgrestore.ReconcilePendingPatchesConfigMap(remapCtx, ctx.crClient, ctx.restore, remainingPending)
-		warnings.Merge(&reconcileWarnings)
+			// 4. Drain & Reconcile overflow ConfigMap:
+			reconcileWarnings := pkgrestore.ReconcilePendingPatchesConfigMap(remapCtx, ctx.crClient, ctx.restore, remainingPending)
+			warnings.Merge(&reconcileWarnings)
+		}
 
 		// 5. Layer 1 leftover-pause catch-up (Finalizing-only leftover unpause):
 		// Catch-up is Finalizing + empty QuiescedObjects + empty PendingOwnerRefPatches + empty PendingPatchesConfigMap only.

@@ -536,7 +536,7 @@ func TestProcessSpecReferences_RetriablePatchErrorEnqueuesNonEmptyPatch(t *testi
 	assert.Equal(t, "dv-1", pending[0].Targets[0].Name)
 }
 
-func TestProcessSpecReferences_GetFailureBlocksNamespaceAndOmitsEmptyPatch(t *testing.T) {
+func TestProcessSpecReferences_GetFailureOmitsEmptyPatchDoesNotNamespaceBlock(t *testing.T) {
 	scheme := runtime.NewScheme()
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	mockClient := &mockErrorGetClient{
@@ -590,7 +590,7 @@ func TestProcessSpecReferences_GetFailureBlocksNamespaceAndOmitsEmptyPatch(t *te
 
 	quiesced := state.GetQuiescedObjects()
 	require.Len(t, quiesced, 1)
-	assert.True(t, quiesced[0].UnquiesceBlocked, "Namespace fallback must mark DataVolume as UnquiesceBlocked")
+	assert.False(t, quiesced[0].UnquiesceBlocked, "GET-before-Targets must not namespace-block sibling quiesced objects")
 }
 
 func TestProcessSpecReferences_CrossNamespaceTargetRefRemapped(t *testing.T) {

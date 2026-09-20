@@ -137,6 +137,7 @@ func TestMergeOwnerReferences(t *testing.T) {
 	mergedCrossVersion := mergeOwnerReferences(merged, crossVersionRemap, logrus.StandardLogger(), "default", "pod-1")
 	require.Len(t, mergedCrossVersion, 3, "should match on Group/Kind/Name and not create duplicate entry")
 	assert.Equal(t, types.UID("updated-ms-uid"), mergedCrossVersion[2].UID)
+	assert.Equal(t, "cluster.x-k8s.io/v1beta1", mergedCrossVersion[2].APIVersion, "live apiVersion must be preserved across version skew")
 }
 
 func TestGenerateOwnerRefMergePatch(t *testing.T) {

@@ -109,7 +109,7 @@ func TestCreateCommand(t *testing.T) {
 		flags.Parse([]string{"--item-operation-timeout", itemOperationTimeout})
 		flags.Parse([]string{"--resource-modifier-configmap", resourceModifierConfigMap})
 		flags.Parse([]string{"--resource-policies-configmap", ResourcePoliciesConfigMap})
-		flags.Parse([]string{"--owner-ref-configmap", ownerRefConfigMap})
+		flags.Parse([]string{"--owner-ref-restore-configmap", ownerRefConfigMap})
 		flags.Parse([]string{"--skip-default-resource-modifier"})
 		flags.Parse([]string{"--write-sparse-files", writeSparseFiles})
 		flags.Parse([]string{"--delete-extra-files", deleteExtraFiles})

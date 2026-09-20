@@ -409,6 +409,7 @@ spec:
                   OwnerRefConfigMap specifies an optional ConfigMap reference containing
                   custom inScope GVKs, specRefPaths, and quiesceOnRestore rules for ownerReference remapping.
                   If not set, falls back to the server-level --owner-ref-configmap or built-in defaults.
+                  Set via velero restore create --owner-ref-restore-configmap.
                 nullable: true
                 properties:
                   apiGroup:
