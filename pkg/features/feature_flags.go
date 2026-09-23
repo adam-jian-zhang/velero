@@ -20,6 +20,13 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+)
+
+const (
+	// OwnerRefRelink enables dynamic ownerReference relinking and controller quiescing
+	OwnerRefRelink = velerov1api.OwnerRefRelinkFeatureFlag
 )
 
 type featureFlagSet struct {

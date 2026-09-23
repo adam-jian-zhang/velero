@@ -376,6 +376,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 		namespacedFilterMap:            namespacedFilterMap,
 		namespacedFilterPatterns:       namespacedFilterPatterns,
 		namespaceFilterCache:           make(map[string]*resolvedNamespaceFilter),
+		ownerRemapState:                req.OwnerRemapState,
 	}
 
 	return restoreCtx.execute()
@@ -441,6 +442,8 @@ type restoreContext struct {
 	// namespaceFilterCache memoizes the resolved filter for a given namespace
 	// to avoid re-evaluating glob patterns on every call.
 	namespaceFilterCache map[string]*resolvedNamespaceFilter
+
+	ownerRemapState *OwnerRefRemapState
 }
 
 type resolvedResourceFilter struct {
@@ -1630,6 +1633,14 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		}
 	}
 
+	var originalOwnerRefs []metav1.OwnerReference
+	if ctx.ownerRemapState != nil && ctx.ownerRemapState.Enabled && ctx.ownerRemapState.Scope != nil {
+		gvk := obj.GroupVersionKind()
+		if ctx.ownerRemapState.Scope.IsInScope(gvk) {
+			originalOwnerRefs = FilterDeniedOwnerRefs(copyOwnerReferences(obj.GetOwnerReferences()))
+		}
+	}
+
 	objStatus, statusFieldExists, statusFieldErr := unstructured.NestedFieldCopy(obj.Object, "status")
 	// Clear out non-core metadata fields and status.
 	if obj, err = resetMetadataAndStatus(obj); err != nil {
@@ -1905,6 +1916,38 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		fromCluster, err = ctx.getResource(newGR, obj, namespace)
 	}
 	if err != nil || fromCluster == nil {
+		if ctx.ownerRemapState != nil && ctx.ownerRemapState.Enabled && ctx.ownerRemapState.Scope != nil {
+			gvk := obj.GroupVersionKind()
+			if rule := ctx.ownerRemapState.Scope.ShouldQuiesce(gvk); rule != nil &&
+				!backupAlreadyPaused(itemFromBackup.GetAnnotations(), rule.AnnotationKey) {
+				if rule.AnnotationKey != "" {
+					annotations := obj.GetAnnotations()
+					if annotations == nil {
+						annotations = make(map[string]string)
+					}
+					annotations[rule.AnnotationKey] = rule.AnnotationValue
+					annotations[velerov1api.QuiescedKeyAnnotation] = rule.AnnotationKey
+					obj.SetAnnotations(annotations)
+				}
+
+				labels := obj.GetLabels()
+				if labels == nil {
+					labels = make(map[string]string)
+				}
+				labels[velerov1api.QuiescedByRestoreLabel] = label.GetValidName(ctx.restore.Name)
+				obj.SetLabels(labels)
+
+				restoreLogger.Infof("Auto-quiesced %s/%s via annotation %s=%q for restore", obj.GetNamespace(), obj.GetName(), rule.AnnotationKey, rule.AnnotationValue)
+			}
+		}
+
+		if ctx.ownerRemapState != nil && ctx.ownerRemapState.Enabled {
+			if len(obj.GetOwnerReferences()) > 0 {
+				restoreLogger.Warnf("Stripping re-injected metadata.ownerReferences on %s %s/%s prior to create to prevent immediate Garbage Collection deletion", obj.GetKind(), obj.GetNamespace(), obj.GetName())
+				unstructured.RemoveNestedField(obj.Object, "metadata", "ownerReferences")
+			}
+		}
+
 		// couldn't find the resource, attempt to create
 		restoreLogger.Debugf("Creating %s", obj.GetName())
 		createdObj, restoreErr = resourceClient.Create(obj)
@@ -1914,6 +1957,30 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 				action:      ItemRestoreResultCreated,
 				itemExists:  itemExists,
 				createdName: createdObj.GetName(),
+			}
+			if ctx.ownerRemapState != nil && ctx.ownerRemapState.Enabled {
+				targetNS := createdObj.GetNamespace()
+				if targetNS == "" {
+					targetNS = obj.GetNamespace()
+				}
+				ctx.ownerRemapState.RegisterUIDMapping(itemFromBackup.GetUID(), createdObj.GetUID(), targetNS)
+				if len(originalOwnerRefs) > 0 {
+					gvk := createdObj.GroupVersionKind()
+					if gvk.Empty() {
+						gvk = obj.GroupVersionKind()
+					}
+					targetName := createdObj.GetName()
+					if targetName == "" {
+						targetName = obj.GetName()
+					}
+					ctx.ownerRemapState.EnqueueOwnerPatch(
+						gvk,
+						newGR.Resource,
+						targetNS,
+						targetName,
+						originalOwnerRefs,
+					)
+				}
 			}
 		}
 	}
@@ -1941,10 +2008,30 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 	}
 
 	if fromCluster != nil {
+		if ctx.ownerRemapState != nil && ctx.ownerRemapState.Enabled && ctx.ownerRemapState.Scope != nil {
+			gvk := fromCluster.GroupVersionKind()
+			if gvk.Empty() {
+				gvk = obj.GroupVersionKind()
+			}
+			if rule := ctx.ownerRemapState.Scope.ShouldQuiesce(gvk); rule != nil {
+				targetNS := fromCluster.GetNamespace()
+				if targetNS == "" {
+					targetNS = namespace
+				}
+				err := errors.Errorf("cannot restore under pre-existing quiesce target %s %s/%s: existing resource is active/unquiesced and would race against newly restored children", gvk.Kind, targetNS, fromCluster.GetName())
+				errs.Add(namespace, err)
+				return warnings, errs, itemExists
+			}
+		}
+
 		itemExists = true
 		itemStatus := ctx.restoredItems[itemKey]
 		itemStatus.itemExists = itemExists
 		ctx.restoredItems[itemKey] = itemStatus
+
+		if ctx.ownerRemapState != nil && ctx.ownerRemapState.Enabled {
+			ctx.ownerRemapState.RegisterUIDMapping(itemFromBackup.GetUID(), fromCluster.GetUID(), fromCluster.GetNamespace())
+		}
 
 		// PodVolumeRestores are only created for pods Velero creates, so an
 		// existing pod silently skips the volume data restore. For an in-place

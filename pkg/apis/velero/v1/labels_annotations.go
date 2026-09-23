@@ -26,6 +26,12 @@ const (
 	// RestoreNameLabel is the label key used to identify a restore by name.
 	RestoreNameLabel = "velero.io/restore-name"
 
+	// QuiescedByRestoreLabel is the label key used to identify resources quiesced by a restore.
+	QuiescedByRestoreLabel = "velero.io/quiesced-by-restore"
+
+	// QuiescedKeyAnnotation records the pause annotation key injected by a restore.
+	QuiescedKeyAnnotation = "velero.io/quiesced-key"
+
 	// ScheduleNameLabel is the label key used to identify a schedule by name.
 	ScheduleNameLabel = "velero.io/schedule-name"
 
