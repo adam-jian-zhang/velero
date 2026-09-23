@@ -191,6 +191,7 @@ type Config struct {
 	GlobalBackupVolumePoliciesConfigMap string
 	DefaultResourceModifierConfigMap    string
 	MaxBackupExtractionSize             int
+	OwnerRefConfigMap                   string
 }
 
 func GetDefaultConfig() *Config {
@@ -303,5 +304,11 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 		"max-backup-extraction-size",
 		c.MaxBackupExtractionSize,
 		"Maximum size of a backup extraction in megabytes. If not set, default value (16GB) will be used.",
+	)
+	flags.StringVar(
+		&c.OwnerRefConfigMap,
+		"owner-ref-configmap",
+		c.OwnerRefConfigMap,
+		"The name of a ConfigMap in the Velero namespace containing baseline ownerReference relinking and quiescing rules. Defaults to 'velero-ownerref-config' if unset.",
 	)
 }

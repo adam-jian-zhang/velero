@@ -157,6 +157,12 @@ type RestoreSpec struct {
 	// +optional
 	// +nullable
 	UploaderConfig *UploaderConfigForRestore `json:"uploaderConfig,omitempty"`
+
+	// OwnerRefConfigMap optionally references a ConfigMap in the Velero installation namespace
+	// containing supplemental or overriding inScope GVKs and quiesceOnRestore rules.
+	// +optional
+	// +nullable
+	OwnerRefConfigMap *corev1api.TypedLocalObjectReference `json:"ownerRefConfigMap,omitempty"`
 }
 
 // UploaderConfigForRestore defines the configuration for the restore.

@@ -409,6 +409,29 @@ spec:
                   x-kubernetes-map-type: atomic
                 nullable: true
                 type: array
+              ownerRefConfigMap:
+                description: |-
+                  OwnerRefConfigMap optionally references a ConfigMap in the Velero installation namespace
+                  containing supplemental or overriding inScope GVKs and quiesceOnRestore rules.
+                nullable: true
+                properties:
+                  apiGroup:
+                    description: |-
+                      APIGroup is the group for the resource being referenced.
+                      If APIGroup is not specified, the specified Kind must be in the core API group.
+                      For any other third-party types, APIGroup is required.
+                    type: string
+                  kind:
+                    description: Kind is the type of resource being referenced
+                    type: string
+                  name:
+                    description: Name is the name of resource being referenced
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+                x-kubernetes-map-type: atomic
               preserveNodePorts:
                 description: PreserveNodePorts specifies whether to restore old nodePorts
                   from backup.

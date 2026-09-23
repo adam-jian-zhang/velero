@@ -68,6 +68,7 @@ type Request struct {
 	BackupVolumeInfoMap           map[string]volume.BackupVolumeInfo
 	RestoreVolumeInfoTracker      *volume.RestoreVolumeInfoTracker
 	ResourceDeletionStatusTracker kube.ResourceDeletionStatusTracker
+	OwnerRemapState               *OwnerRefRemapState
 }
 
 type restoredItemStatus struct {

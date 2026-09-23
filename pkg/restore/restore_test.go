@@ -5451,3 +5451,136 @@ func TestRestoreInplaceSourceSizeCarrierAnnotation(t *testing.T) {
 		assert.NotContains(t, got.GetAnnotations(), velerov1api.InplaceRestoreSourceSizeAnnotation)
 	})
 }
+
+func TestRestore_PreExistingQuiesceTargetFailFast(t *testing.T) {
+	h := newHarness(t)
+
+	clusterObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "mygroup.io/v1",
+			"kind":       "MyCustomKind",
+			"metadata": map[string]any{
+				"namespace": "ns-1",
+				"name":      "custom-1",
+			},
+		},
+	}
+
+	clusterResource := &test.APIResource{
+		Group:      "mygroup.io",
+		Version:    "v1",
+		Name:       "mycustomkinds",
+		Kind:       "MyCustomKind",
+		Namespaced: true,
+		Items:      []metav1.Object{clusterObj},
+	}
+	h.AddItems(t, clusterResource)
+
+	tarball := test.NewTarWriter(t).
+		AddItems("mycustomkinds.mygroup.io", clusterObj).
+		Done()
+
+	scope := &ScopeConfig{
+		InScope: []InScopeEntry{
+			{Group: "mygroup.io"},
+		},
+		QuiesceOnRestore: []QuiesceRule{
+			{
+				Group:         "mygroup.io",
+				Kind:          "MyCustomKind",
+				AnnotationKey: "mygroup.io/paused",
+			},
+		},
+	}
+	state := NewOwnerRefRemapState(true, scope)
+
+	req := &Request{
+		Log:             h.log,
+		Restore:         defaultRestore().Result(),
+		Backup:          defaultBackup().Result(),
+		BackupReader:    tarball,
+		RestoredItems:   map[itemKey]restoredItemStatus{},
+		OwnerRemapState: state,
+	}
+
+	_, errs := h.restorer.Restore(req, nil, nil)
+	require.NotEmpty(t, errs.Namespaces["ns-1"])
+	assert.Contains(t, errs.Namespaces["ns-1"][0], "cannot restore under pre-existing quiesce target MyCustomKind ns-1/custom-1")
+}
+
+func TestRestore_ResourceModifierOwnerRefsStripped(t *testing.T) {
+	h := newHarness(t)
+
+	childResource := &test.APIResource{
+		Group:      "mygroup.io",
+		Version:    "v1",
+		Name:       "mycustomkinds",
+		Kind:       "MyCustomKind",
+		Namespaced: true,
+	}
+	h.AddItems(t, childResource)
+
+	childObj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "mygroup.io/v1",
+			"kind":       "MyCustomKind",
+			"metadata": map[string]any{
+				"namespace": "ns-1",
+				"name":      "child-1",
+			},
+		},
+	}
+	tarball := test.NewTarWriter(t).
+		AddItems("mycustomkinds.mygroup.io", childObj).
+		Done()
+
+	scope := &ScopeConfig{
+		InScope: []InScopeEntry{
+			{Group: "mygroup.io"},
+		},
+	}
+	state := NewOwnerRefRemapState(true, scope)
+
+	// An action that re-injects metadata.ownerReferences on the object (simulating ResourceModifier or RIA)
+	action := &pluggableAction{
+		executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+			item := input.Item.(*unstructured.Unstructured).DeepCopy()
+			item.SetOwnerReferences([]metav1.OwnerReference{
+				{
+					APIVersion: "mygroup.io/v1",
+					Kind:       "MyClusterCustomKind",
+					Name:       "parent-1",
+					UID:        "stale-backup-uid",
+				},
+			})
+			return &velero.RestoreItemActionExecuteOutput{
+				UpdatedItem: item,
+			}, nil
+		},
+	}
+
+	req := &Request{
+		Log:             h.log,
+		Restore:         defaultRestore().Result(),
+		Backup:          defaultBackup().Result(),
+		BackupReader:    tarball,
+		RestoredItems:   map[itemKey]restoredItemStatus{},
+		OwnerRemapState: state,
+	}
+
+	warnings, errs := h.restorer.Restore(req, []riav2.RestoreItemAction{action}, nil)
+	assertEmptyResults(t, errs)
+	assertEmptyResults(t, warnings)
+
+	// Verify the object created in API server has ownerReferences stripped
+	client, err := h.restorer.dynamicFactory.ClientForGroupVersionResource(
+		schema.GroupVersion{Group: "mygroup.io", Version: "v1"},
+		metav1.APIResource{Name: "mycustomkinds", Namespaced: true},
+		"ns-1",
+	)
+	require.NoError(t, err)
+
+	liveChild, err := client.Get("child-1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, liveChild.GetOwnerReferences())
+}
