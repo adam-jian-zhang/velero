@@ -46,4 +46,10 @@ const (
 
 	// APIGroupVersionsFeatureFlag is the feature flag string that defines whether or not to handle multiple API Group Versions
 	APIGroupVersionsFeatureFlag = "EnableAPIGroupVersions"
+
+	// OwnerRefRelinkFeatureFlag enables dynamic ownerReference relinking and controller quiescing.
+	OwnerRefRelinkFeatureFlag = "OwnerRefRelink"
+
+	// OwnerRefConfigMapKind is the supported Kind for restore.spec.ownerRefConfigMap.
+	OwnerRefConfigMapKind = "ConfigMap"
 )
