@@ -48,6 +48,7 @@ import (
 	"github.com/vmware-tanzu/velero/internal/volume"
 	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/constant"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
@@ -116,6 +117,7 @@ type restoreReconciler struct {
 	globalCrClient                   client.Client
 	resourceTimeout                  time.Duration
 	defaultResourceModifierConfigMap string
+	ownerRefConfigMap                string
 }
 
 type backupInfo struct {
@@ -140,6 +142,7 @@ func NewRestoreReconciler(
 	globalCrClient client.Client,
 	resourceTimeout time.Duration,
 	defaultResourceModifierConfigMap string,
+	ownerRefConfigMap string,
 ) *restoreReconciler {
 	r := &restoreReconciler{
 		ctx:                         ctx,
@@ -163,6 +166,7 @@ func NewRestoreReconciler(
 		globalCrClient:                   globalCrClient,
 		resourceTimeout:                  resourceTimeout,
 		defaultResourceModifierConfigMap: defaultResourceModifierConfigMap,
+		ownerRefConfigMap:                ownerRefConfigMap,
 	}
 
 	// Move the periodical backup and restore metrics computing logic from controllers to here.
@@ -464,6 +468,31 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 		}
 	}
 
+	// validate OwnerRefConfigMap
+	if restore.Spec.OwnerRefConfigMap != nil && restore.Spec.OwnerRefConfigMap.Name != "" {
+		if restore.Spec.OwnerRefConfigMap.Kind != "" && !strings.EqualFold(restore.Spec.OwnerRefConfigMap.Kind, api.OwnerRefConfigMapKind) {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				fmt.Sprintf("unsupported ownerRefConfigMap kind %q, only %q is supported", restore.Spec.OwnerRefConfigMap.Kind, api.OwnerRefConfigMapKind))
+		} else if !features.IsEnabled(api.OwnerRefRelinkFeatureFlag) {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+				"OwnerRefRelink feature flag must be enabled to use ownerRefConfigMap")
+		} else {
+			targetClient := r.kbClient
+			if targetClient == nil {
+				targetClient = r.globalCrClient
+			}
+			ns := r.namespace
+			if ns == "" {
+				ns = restore.Namespace
+			}
+			_, err := pkgrestore.LoadSingleConfigMap(ctx, targetClient, ns, restore.Spec.OwnerRefConfigMap.Name)
+			if err != nil {
+				restore.Status.ValidationErrors = append(restore.Status.ValidationErrors,
+					fmt.Sprintf("failed to get ownerRefConfigMap %s/%s: %v", ns, restore.Spec.OwnerRefConfigMap.Name, err))
+			}
+		}
+	}
+
 	return info, resourceModifiers, restoreResPolicies
 }
 
@@ -654,6 +683,36 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 		podVolumeBackups = append(podVolumeBackups, &podVolumeBackupList.Items[i])
 	}
 
+	var remapState *pkgrestore.OwnerRefRemapState
+	if features.IsEnabled(api.OwnerRefRelinkFeatureFlag) {
+		targetClient := r.kbClient
+		if targetClient == nil {
+			targetClient = r.globalCrClient
+		}
+		ns := r.namespace
+		if ns == "" {
+			ns = restore.Namespace
+		}
+		reqCtx := r.ctx
+		if reqCtx == nil {
+			reqCtx = context.Background()
+		}
+		scopeConfig, err := pkgrestore.LoadScopeConfig(
+			reqCtx,
+			targetClient,
+			ns,
+			r.ownerRefConfigMap,
+			restore.Spec.OwnerRefConfigMap,
+			restoreLog,
+		)
+		if err != nil {
+			// LoadScopeConfig returns an error only when the per-restore ConfigMap cannot be loaded.
+			// Baseline misses stay non-fatal inside LoadScopeConfig.
+			return fmt.Errorf("failed to resolve ownerReference scope: %w", err)
+		}
+		remapState = pkgrestore.NewOwnerRefRemapState(true, scopeConfig)
+	}
+
 	restoreReq := &pkgrestore.Request{
 		Log:                           restoreLog,
 		Restore:                       restore,
@@ -668,8 +727,41 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 		BackupVolumeInfoMap:           backupVolumeInfoMap,
 		RestoreVolumeInfoTracker:      volume.NewRestoreVolInfoTracker(restore, restoreLog, r.globalCrClient),
 		ResourceDeletionStatusTracker: kubeutil.NewResourceDeletionStatusTracker(),
+		OwnerRemapState:               remapState,
 	}
 	restoreWarnings, restoreErrors := r.restorer.RestoreWithResolvers(restoreReq, actionsResolver, pluginManager)
+
+	// Post-item loop: Phase 1B Relinking and Unquiescing
+	if remapState != nil && remapState.Enabled {
+		targetClient := r.globalCrClient
+		if targetClient == nil {
+			targetClient = r.kbClient
+		}
+		reqCtx := r.ctx
+		if reqCtx == nil {
+			reqCtx = context.Background()
+		}
+		relinkWarnings := pkgrestore.ApplyOwnerRefRelinking(
+			reqCtx,
+			restoreLog,
+			targetClient,
+			remapState,
+		)
+		restoreWarnings.Merge(&relinkWarnings)
+
+		var quiesceRules []pkgrestore.QuiesceRule
+		if remapState.Scope != nil {
+			quiesceRules = remapState.Scope.QuiesceOnRestore
+		}
+		unquiesceWarnings := pkgrestore.UnquiesceObjects(
+			reqCtx,
+			restoreLog,
+			targetClient,
+			restore.Name,
+			quiesceRules...,
+		)
+		restoreWarnings.Merge(&unquiesceWarnings)
+	}
 
 	// Iterate over restore item operations and update progress.
 	// Any errors on operations at this point should be added to restore errors.

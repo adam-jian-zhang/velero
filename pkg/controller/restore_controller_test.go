@@ -39,6 +39,7 @@ import (
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	persistencemocks "github.com/vmware-tanzu/velero/pkg/persistence/mocks"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
@@ -117,6 +118,7 @@ func TestFetchBackupInfo(t *testing.T) {
 				false,
 				fakeGlobalClient,
 				10*time.Minute,
+				"",
 				"",
 			)
 
@@ -201,6 +203,7 @@ func TestProcessQueueItemSkips(t *testing.T) {
 				fakeGlobalClient,
 				10*time.Minute,
 				"",
+				"",
 			)
 
 			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{
@@ -267,6 +270,7 @@ func TestRestoreReconcile_CSISnapshotTimeoutDefaulting(t *testing.T) {
 				false,
 				fakeGlobalClient,
 				10*time.Minute,
+				"",
 				"",
 			)
 
@@ -708,6 +712,7 @@ func TestRestoreReconcile(t *testing.T) {
 				fakeGlobalClient,
 				10*time.Minute,
 				"",
+				"",
 			)
 
 			r.clock = clocktesting.NewFakeClock(now)
@@ -898,6 +903,7 @@ func TestValidateAndCompleteWhenScheduleNameSpecified(t *testing.T) {
 		fakeGlobalClient,
 		10*time.Minute,
 		"",
+		"",
 	)
 
 	restore := &velerov1api.Restore{
@@ -995,6 +1001,7 @@ func TestValidateAndCompleteWithResourcePolicySpecified(t *testing.T) {
 		false,
 		fakeGlobalClient,
 		10*time.Minute,
+		"",
 		"",
 	)
 
@@ -1126,6 +1133,7 @@ func TestValidateAndCompleteWithResourceModifierSpecified(t *testing.T) {
 		false,
 		fakeGlobalClient,
 		10*time.Minute,
+		"",
 		"",
 	)
 
@@ -1276,6 +1284,7 @@ func TestValidateAndCompleteWithDefaultResourceModifier(t *testing.T) {
 			fakeGlobalClient,
 			10*time.Minute,
 			defaultCM,
+			"",
 		)
 
 		location := builder.ForBackupStorageLocation("velero", "default").Provider("myCloud").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
@@ -1527,6 +1536,195 @@ func NewRestore(ns, name, backup, includeNS, includeResource string, phase veler
 	restore.ExcludedResources(nonRestorableResources...)
 
 	return restore
+}
+
+func TestValidateAndCompleteWithOwnerRefConfigMapSpecified(t *testing.T) {
+	formatFlag := logging.FormatText
+
+	var (
+		logger           = velerotest.NewLogger()
+		pluginManager    = &pluginmocks.Manager{}
+		fakeClient       = velerotest.NewFakeControllerRuntimeClient(t)
+		fakeGlobalClient = velerotest.NewFakeControllerRuntimeClient(t)
+		backupStore      = &persistencemocks.BackupStore{}
+	)
+
+	r := NewRestoreReconciler(
+		t.Context(),
+		velerov1api.DefaultNamespace,
+		nil,
+		fakeClient,
+		logger,
+		logrus.DebugLevel,
+		func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager },
+		NewFakeSingleObjectBackupStoreGetter(backupStore),
+		metrics.NewServerMetrics(),
+		formatFlag,
+		30*time.Minute,
+		60*time.Minute,
+		false,
+		fakeGlobalClient,
+		10*time.Minute,
+		"",
+		"",
+	)
+
+	location := builder.ForBackupStorageLocation("velero", "default").Provider("myCloud").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	require.NoError(t, r.kbClient.Create(t.Context(), location))
+
+	require.NoError(t, r.kbClient.Create(
+		t.Context(),
+		defaultBackup().
+			ObjectMeta(
+				builder.WithName("backup-1"),
+			).StorageLocation("default").
+			Phase(velerov1api.BackupPhaseCompleted).
+			Result(),
+	))
+
+	// 1. Feature flag disabled: should fail validation
+	features.NewFeatureFlagSet()
+	restore := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "restore-ff-disabled",
+		},
+		Spec: velerov1api.RestoreSpec{
+			BackupName: "backup-1",
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: velerov1api.OwnerRefConfigMapKind,
+				Name: "test-ownerref-cm",
+			},
+		},
+	}
+	r.validateAndComplete(t.Context(), restore)
+	require.NotEmpty(t, restore.Status.ValidationErrors)
+	assert.Contains(t, restore.Status.ValidationErrors[0], "OwnerRefRelink feature flag must be enabled")
+
+	// 2. Feature flag enabled, but ConfigMap missing: should fail validation
+	features.Enable(velerov1api.OwnerRefRelinkFeatureFlag)
+	defer features.NewFeatureFlagSet()
+
+	restoreMissingCM := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "restore-cm-missing",
+		},
+		Spec: velerov1api.RestoreSpec{
+			BackupName: "backup-1",
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: velerov1api.OwnerRefConfigMapKind,
+				Name: "missing-cm",
+			},
+		},
+	}
+	r.validateAndComplete(t.Context(), restoreMissingCM)
+	require.NotEmpty(t, restoreMissingCM.Status.ValidationErrors)
+	assert.Contains(t, restoreMissingCM.Status.ValidationErrors[0], "failed to get ownerRefConfigMap velero/missing-cm")
+
+	// 3. Feature flag enabled, ConfigMap present and valid: should pass validation
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "valid-cm",
+		},
+		Data: map[string]string{
+			"inScope": "- group: cluster.x-k8s.io\n",
+		},
+	}
+	require.NoError(t, r.kbClient.Create(t.Context(), cm))
+
+	restoreValid := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "restore-valid",
+		},
+		Spec: velerov1api.RestoreSpec{
+			BackupName: "backup-1",
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: velerov1api.OwnerRefConfigMapKind,
+				Name: "valid-cm",
+			},
+		},
+	}
+	r.validateAndComplete(t.Context(), restoreValid)
+	assert.Empty(t, restoreValid.Status.ValidationErrors)
+
+	// 4. Feature flag enabled, ConfigMap present but invalid: should fail validation
+	cmInvalid := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "invalid-cm",
+		},
+		Data: map[string]string{
+			"inScope": ": invalid: yaml: [",
+		},
+	}
+	require.NoError(t, r.kbClient.Create(t.Context(), cmInvalid))
+
+	restoreInvalid := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "restore-invalid",
+		},
+		Spec: velerov1api.RestoreSpec{
+			BackupName: "backup-1",
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: velerov1api.OwnerRefConfigMapKind,
+				Name: "invalid-cm",
+			},
+		},
+	}
+	r.validateAndComplete(t.Context(), restoreInvalid)
+	require.NotEmpty(t, restoreInvalid.Status.ValidationErrors)
+	assert.Contains(t, restoreInvalid.Status.ValidationErrors[0], "failed to get ownerRefConfigMap velero/invalid-cm")
+
+	// 5. Feature flag enabled, ConfigMap present but contains deny-listed kind: should fail validation
+	cmDeny := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "deny-cm",
+		},
+		Data: map[string]string{
+			"inScope": "- group: \"\"\n  kind: Pod\n",
+		},
+	}
+	require.NoError(t, r.kbClient.Create(t.Context(), cmDeny))
+
+	restoreDeny := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "restore-deny",
+		},
+		Spec: velerov1api.RestoreSpec{
+			BackupName: "backup-1",
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: velerov1api.OwnerRefConfigMapKind,
+				Name: "deny-cm",
+			},
+		},
+	}
+	r.validateAndComplete(t.Context(), restoreDeny)
+	require.NotEmpty(t, restoreDeny.Status.ValidationErrors)
+	assert.Contains(t, restoreDeny.Status.ValidationErrors[0], "is a core leaf workload and is forbidden by the built-in deny list")
+
+	// 6. Feature flag enabled, but unsupported Kind specified on OwnerRefConfigMap: should fail validation
+	restoreUnsupportedKind := &velerov1api.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: velerov1api.DefaultNamespace,
+			Name:      "restore-unsupported-kind",
+		},
+		Spec: velerov1api.RestoreSpec{
+			BackupName: "backup-1",
+			OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{
+				Kind: "Secret",
+				Name: "valid-cm",
+			},
+		},
+	}
+	r.validateAndComplete(t.Context(), restoreUnsupportedKind)
+	require.NotEmpty(t, restoreUnsupportedKind.Status.ValidationErrors)
+	assert.Contains(t, restoreUnsupportedKind.Status.ValidationErrors[0], "unsupported ownerRefConfigMap kind \"Secret\"")
 }
 
 type fakeRestorer struct {
