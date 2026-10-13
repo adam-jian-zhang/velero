@@ -79,6 +79,7 @@ func TestCreateCommand(t *testing.T) {
 		includeClusterResources := "true"
 		allowPartiallyFailed := "true"
 		itemOperationTimeout := "10m0s"
+		ownerRefConfigMap := "ownerref-cm"
 		resourceModifierConfigMap := "modifier-cm"
 		ResourcePoliciesConfigMap := "policies-cm"
 		writeSparseFiles := "true"
@@ -108,6 +109,7 @@ func TestCreateCommand(t *testing.T) {
 		flags.Parse([]string{"--include-cluster-resources", includeClusterResources})
 		flags.Parse([]string{"--allow-partially-failed", allowPartiallyFailed})
 		flags.Parse([]string{"--item-operation-timeout", itemOperationTimeout})
+		flags.Parse([]string{"--owner-ref-restore-configmap", ownerRefConfigMap})
 		flags.Parse([]string{"--resource-modifier-configmap", resourceModifierConfigMap})
 		flags.Parse([]string{"--resource-policies-configmap", ResourcePoliciesConfigMap})
 		flags.Parse([]string{"--skip-default-resource-modifier"})
@@ -152,6 +154,13 @@ func TestCreateCommand(t *testing.T) {
 		require.Equal(t, includeClusterResources, o.IncludeClusterResources.String())
 		require.Equal(t, allowPartiallyFailed, o.AllowPartiallyFailed.String())
 		require.Equal(t, itemOperationTimeout, o.ItemOperationTimeout.String())
+		require.Equal(t, ownerRefConfigMap, o.OwnerRefConfigMap)
+		created := &velerov1api.RestoreList{}
+		require.NoError(t, client.List(t.Context(), created))
+		require.Len(t, created.Items, 1)
+		require.NotNil(t, created.Items[0].Spec.OwnerRefConfigMap)
+		require.Equal(t, ownerRefConfigMap, created.Items[0].Spec.OwnerRefConfigMap.Name)
+		require.Equal(t, "ConfigMap", created.Items[0].Spec.OwnerRefConfigMap.Kind)
 		require.Equal(t, resourceModifierConfigMap, o.ResourceModifierConfigMap)
 		require.Equal(t, ResourcePoliciesConfigMap, o.ResourcePoliciesConfigMap)
 		require.True(t, o.SkipDefaultResourceModifier)

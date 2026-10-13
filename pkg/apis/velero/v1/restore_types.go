@@ -24,6 +24,9 @@ import (
 
 // RestoreSpec defines the specification for a Velero restore.
 type RestoreSpec struct {
+	// OwnerRefConfigMap selects an additive ownerReference scope ConfigMap in the Velero namespace.
+	// +optional
+	OwnerRefConfigMap *corev1api.TypedLocalObjectReference `json:"ownerRefConfigMap,omitempty"`
 	// BackupName is the unique name of the Velero backup to restore
 	// from.
 	// +optional
@@ -366,6 +369,9 @@ const (
 
 // RestoreStatus captures the current status of a Velero restore
 type RestoreStatus struct {
+	// OwnerRefsRelinked counts children whose ownerReferences were successfully relinked.
+	// +optional
+	OwnerRefsRelinked int `json:"ownerRefsRelinked,omitempty"`
 	// Phase is the current state of the Restore
 	// +optional
 	Phase RestorePhase `json:"phase,omitempty"`

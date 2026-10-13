@@ -190,6 +190,7 @@ type Config struct {
 	ConcurrentBackups                   int
 	GlobalBackupVolumePoliciesConfigMap string
 	DefaultResourceModifierConfigMap    string
+	OwnerRefConfigMap                   string
 	MaxBackupExtractionSize             int
 }
 
@@ -298,6 +299,7 @@ func (c *Config) BindFlags(flags *pflag.FlagSet) {
 		c.DefaultResourceModifierConfigMap,
 		"The name of a ConfigMap in the Velero namespace containing default resource modifier rules applied to all restores. Ignored when a per-restore resource modifier is specified.",
 	)
+	flags.StringVar(&c.OwnerRefConfigMap, "owner-ref-configmap", "", "Baseline ownerReference inScope ConfigMap in the Velero namespace; defaults to velero-ownerref-config when OwnerRefRelink is enabled.")
 	flags.IntVar(
 		&c.MaxBackupExtractionSize,
 		"max-backup-extraction-size",

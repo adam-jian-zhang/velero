@@ -469,3 +469,14 @@ func TestDescribeRestore(t *testing.T) {
 	assert.Contains(t, out, "Existing Resource Policy:      update")
 	assert.Contains(t, out, "Existing Volume Data Policy:   full")
 }
+
+func TestDescribeOwnerRefRelinkedChildren(t *testing.T) {
+	c := velerotest.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "restore").Result()
+	restore.Status.OwnerRefsRelinked = 7
+	out := DescribeRestore(t.Context(), c, restore, nil, false, false, "")
+	assert.Contains(t, out, "OwnerReference Relinking:")
+	assert.Regexp(t, `Relinked Children:\s+7 items`, out)
+	assert.NotContains(t, out, "Pending Patches:")
+	assert.NotContains(t, out, "Pending Snapshot:")
+}
