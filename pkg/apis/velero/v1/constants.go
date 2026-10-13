@@ -17,6 +17,8 @@ limitations under the License.
 package v1
 
 const (
+	// OwnerRefRelinkFeatureFlag enables restore-side ownerReference relinking.
+	OwnerRefRelinkFeatureFlag = "OwnerRefRelink"
 	// DefaultNamespace is the Kubernetes namespace that is used by default for
 	// the Velero server and API objects.
 	DefaultNamespace = "velero"

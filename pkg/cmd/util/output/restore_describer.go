@@ -111,6 +111,16 @@ func DescribeRestore(
 		}
 
 		describeRestoreResults(ctx, kbClient, d, restore, insecureSkipTLSVerify, caCertFile)
+		if restore.Spec.OwnerRefConfigMap != nil || restore.Status.OwnerRefsRelinked > 0 {
+			d.Println()
+			d.Printf("OwnerReference Relinking:\n")
+			configMap := "server baseline"
+			if restore.Spec.OwnerRefConfigMap != nil {
+				configMap = restore.Spec.OwnerRefConfigMap.Name
+			}
+			d.Printf("\tConfigMap:\t%s\n", configMap)
+			d.Printf("\tRelinked Children:\t%d items\n", restore.Status.OwnerRefsRelinked)
+		}
 
 		d.Println()
 		d.Printf("Backup:\t%s\n", restore.Spec.BackupName)

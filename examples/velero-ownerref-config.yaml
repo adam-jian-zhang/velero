@@ -1,0 +1,15 @@
+# Apply in the Velero install namespace and enable server --features=OwnerRefRelink.
+# PVCs require a separate, explicit per-restore inScope entry.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-ownerref-config
+  namespace: velero
+data:
+  inScope: |
+    - group: cluster.x-k8s.io
+    - group: controlplane.cluster.x-k8s.io
+    - group: bootstrap.cluster.x-k8s.io
+    - group: infrastructure.cluster.x-k8s.io
+    - group: ipam.cluster.x-k8s.io
+    - group: addons.cluster.x-k8s.io

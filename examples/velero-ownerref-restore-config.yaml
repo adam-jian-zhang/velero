@@ -1,0 +1,15 @@
+# Per-restore additions and exclusions for ownerReference relinking.
+# Select with: velero restore create <name> --from-backup <backup> --owner-ref-restore-configmap restore-ownerrefs
+# Requires the server feature OwnerRefRelink. Do not use as a server baseline.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: restore-ownerrefs
+  namespace: velero
+data:
+  inScope: |
+    - group: ""
+      kind: PersistentVolumeClaim
+  outOfScope: |
+    - group: cluster.x-k8s.io
+      kind: Machine
