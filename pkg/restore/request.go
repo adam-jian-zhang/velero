@@ -25,6 +25,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/velero-io/velero/internal/ownerref"
 	"github.com/velero-io/velero/internal/resourcemodifiers"
 	"github.com/velero-io/velero/internal/resourcepolicies"
 	"github.com/velero-io/velero/internal/volume"
@@ -52,6 +53,7 @@ func resourceKey(obj runtime.Object) string {
 }
 
 type Request struct {
+	OwnerRefRelink *ownerref.OwnerRefRelinkState
 	*velerov1api.Restore
 
 	Log                           logrus.FieldLogger

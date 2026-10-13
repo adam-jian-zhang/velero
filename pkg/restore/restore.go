@@ -56,6 +56,7 @@ import (
 
 	"github.com/velero-io/velero/internal/credentials"
 	"github.com/velero-io/velero/internal/hook"
+	"github.com/velero-io/velero/internal/ownerref"
 	"github.com/velero-io/velero/internal/resourcemodifiers"
 	"github.com/velero-io/velero/internal/resourcepolicies"
 	"github.com/velero-io/velero/internal/volume"
@@ -332,6 +333,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 	req.RestoredItems = make(map[itemKey]restoredItemStatus)
 
 	restoreCtx := &restoreContext{
+		ownerRefRelink:                 req.OwnerRefRelink,
 		backup:                         req.Backup,
 		backupReader:                   req.BackupReader,
 		restore:                        req.Restore,
@@ -382,6 +384,8 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 }
 
 type restoreContext struct {
+	ownerRefRelink                 *ownerref.OwnerRefRelinkState
+	ownerRefNamespaces             map[string]bool
 	backup                         *velerov1api.Backup
 	backupReader                   io.Reader
 	restore                        *velerov1api.Restore
@@ -1052,6 +1056,9 @@ func (ctx *restoreContext) processSelectedResource(
 					}
 					ctx.restoredItems[itemKey] = restoredItemStatus{action: ItemRestoreResultCreated, itemExists: true, createdName: ns.Name}
 				}
+				if err := ctx.registerOwnerRefNamespace(nsPath, ns, nsCreated); err != nil {
+					warnings.Add("", err)
+				}
 
 				// Keep track of namespaces that we know exist so we don't
 				// have to try to create them multiple times.
@@ -1477,11 +1484,22 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 			}
 			ctx.restoredItems[itemKey] = restoredItemStatus{action: ItemRestoreResultCreated, itemExists: true, createdName: nsToEnsure.Name}
 		}
+		if err := ctx.registerOwnerRefNamespace(nsPath, nsToEnsure, nsCreated); err != nil {
+			warnings.Add("", err)
+		}
 	}
 
 	// Make a copy of object retrieved from backup to make it available unchanged
 	//inside restore actions.
 	itemFromBackup := obj.DeepCopy()
+	ownerRefBackup := itemFromBackup
+	if ctx.ownerRefRelink != nil {
+		// Keep the source identity independently of objects passed to plugins.
+		// Only these metadata fields are needed by the relinking engine.
+		ownerRefBackup = &unstructured.Unstructured{}
+		ownerRefBackup.SetUID(itemFromBackup.GetUID())
+		ownerRefBackup.SetOwnerReferences(itemFromBackup.GetOwnerReferences())
+	}
 
 	complete, err := isCompleted(obj, groupResource)
 	if err != nil {
@@ -1909,6 +1927,7 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		restoreLogger.Debugf("Creating %s", obj.GetName())
 		createdObj, restoreErr = resourceClient.Create(obj)
 		if restoreErr == nil {
+			ctx.registerOwnerRefObject(ownerRefBackup, createdObj, obj.GroupVersionKind(), true)
 			itemExists = true
 			ctx.restoredItems[itemKey] = restoredItemStatus{
 				action:      ItemRestoreResultCreated,
@@ -1990,6 +2009,8 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 			}
 		}
 
+		// Retain identity before resetMetadataAndStatus clears the live UID.
+		liveOwnerRefObject := fromCluster.DeepCopy()
 		// Remove insubstantial metadata.
 		fromCluster, err = resetMetadataAndStatus(fromCluster)
 		if err != nil {
@@ -2004,7 +2025,11 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		addRestoreLabels(fromCluster, labels[velerov1api.RestoreNameLabel], labels[velerov1api.BackupNameLabel])
 		fromClusterWithLabels := fromCluster.DeepCopy() // saving the in-cluster object so that we can create label patch if overall patch fails
 
-		if !equality.Semantic.DeepEqual(fromCluster, obj) {
+		equalExistingObject := equality.Semantic.DeepEqual(fromCluster, obj)
+		if equalExistingObject || newGR == kuberesource.ServiceAccounts || ctx.restore.Spec.ExistingResourcePolicy == velerov1api.ResourcePolicyTypeUpdate || (newGR == kuberesource.PersistentVolumeClaims && ctx.restore.IsVolumeDataInplaceRestore()) {
+			ctx.registerOwnerRefObject(ownerRefBackup, liveOwnerRefObject, obj.GroupVersionKind(), false)
+		}
+		if !equalExistingObject {
 			switch newGR {
 			case kuberesource.ServiceAccounts:
 				desired, err := mergeServiceAccounts(fromCluster, obj)
