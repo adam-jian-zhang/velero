@@ -469,3 +469,16 @@ func TestDescribeRestore(t *testing.T) {
 	assert.Contains(t, out, "Existing Resource Policy:      update")
 	assert.Contains(t, out, "Existing Volume Data Policy:   full")
 }
+
+func TestDescribeOwnerRefOverflowWithoutInlineWork(t *testing.T) {
+	c := velerotest.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "restore").Result()
+	restore.Status.PendingPatchesConfigMap = "restore-pending-patches-snapshot"
+	out := DescribeRestore(t.Context(), c, restore, nil, false, false, "")
+	assert.Contains(t, out, "OwnerReference Relinking:")
+	assert.Contains(t, out, "restore-pending-patches-snapshot")
+	assert.Contains(t, out, "Inline Pending Patches:")
+	assert.NotContains(t, out, "Pending Patches:     none")
+	assert.NotContains(t, out, "SpecRefsRelinked")
+	assert.NotContains(t, out, "Quiesced")
+}

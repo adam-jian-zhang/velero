@@ -37,16 +37,19 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/velero-io/velero/internal/hook"
+	"github.com/velero-io/velero/internal/ownerref"
 	"github.com/velero-io/velero/internal/resourcepolicies"
 	"github.com/velero-io/velero/internal/volume"
 	api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/constant"
+	"github.com/velero-io/velero/pkg/features"
 	"github.com/velero-io/velero/pkg/itemoperation"
 	"github.com/velero-io/velero/pkg/label"
 	"github.com/velero-io/velero/pkg/metrics"
@@ -117,11 +120,14 @@ type restoreReconciler struct {
 	globalCrClient                   client.Client
 	resourceTimeout                  time.Duration
 	defaultResourceModifierConfigMap string
+	ownerRefConfigMap                string
 }
 
 type backupInfo struct {
-	backup   *api.Backup
-	location *api.BackupStorageLocation
+	ownerRefState    *ownerref.OwnerRefRelinkState
+	ownerRefWarnings results.Result
+	backup           *api.Backup
+	location         *api.BackupStorageLocation
 }
 
 func NewRestoreReconciler(
@@ -141,6 +147,7 @@ func NewRestoreReconciler(
 	globalCrClient client.Client,
 	resourceTimeout time.Duration,
 	defaultResourceModifierConfigMap string,
+	ownerRefConfigMap ...string,
 ) *restoreReconciler {
 	r := &restoreReconciler{
 		ctx:                         ctx,
@@ -164,6 +171,10 @@ func NewRestoreReconciler(
 		globalCrClient:                   globalCrClient,
 		resourceTimeout:                  resourceTimeout,
 		defaultResourceModifierConfigMap: defaultResourceModifierConfigMap,
+	}
+
+	if len(ownerRefConfigMap) > 0 {
+		r.ownerRefConfigMap = ownerRefConfigMap[0]
 	}
 
 	// Move the periodical backup and restore metrics computing logic from controllers to here.
@@ -280,7 +291,7 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.runValidatedRestore(restore, info, resourceModifiers, restoreResPolicies); err != nil {
+	if err := r.runValidatedRestore(ctx, restore, info, resourceModifiers, restoreResPolicies); err != nil {
 		log.WithError(err).Debug("Restore failed")
 		restore.Status.Phase = api.RestorePhaseFailed
 		restore.Status.FailureReason = fmt.Sprintf("restore execution failed: %v", err)
@@ -300,13 +311,62 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// WaitingForPluginOperationsPartiallyFailed
 	// Finalizing
 	// FinalizingPartiallyFailed
-	if err = kubeutil.PatchResourceWithRetriesOnErrors(r.resourceTimeout, original, restore, r.kbClient); err != nil {
+	if info.ownerRefState != nil {
+		persistCtx, cancel := pkgrestore.OwnerRefStageContext(ctx, r.resourceTimeout)
+		err = r.commitOwnerRefRestore(persistCtx, original, restore)
+		cancel()
+	} else {
+		err = kubeutil.PatchResourceWithRetriesOnErrors(r.resourceTimeout, original, restore, r.kbClient)
+	}
+	if err != nil {
 		log.WithError(errors.WithStack(err)).Infof("Error updating restore's status from %v to %v", original.Status.Phase, restore.Status.Phase)
 		// No need to re-enqueue here, because restore's already set to InProgress before.
 		// Controller only handle New restore.
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// Progress updates performed during synchronous restoration advance the live
+// resourceVersion. Refresh that precondition without replacing the diff's base:
+// this preserves concurrently written progress fields, and refuses to commit
+// pending data onto a replacement Restore or a phase another actor advanced.
+func (r *restoreReconciler) commitOwnerRefRestore(ctx context.Context, original, restore *api.Restore) error {
+	var lastErr error
+	err := wait.ExponentialBackoffWithContext(ctx, retry.DefaultBackoff, func(ctx context.Context) (bool, error) {
+		live := &api.Restore{}
+		if err := r.globalCrClient.Get(ctx, client.ObjectKeyFromObject(restore), live); err != nil {
+			lastErr = err
+			if pkgrestore.IsRetriableOwnerRefError(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if live.UID != restore.UID || live.Status.Phase != api.RestorePhaseInProgress {
+			return false, fmt.Errorf("Restore identity or InProgress phase changed before ownerReference status commit")
+		}
+		base := original.DeepCopy()
+		base.ResourceVersion = live.ResourceVersion
+		restore.ResourceVersion = live.ResourceVersion
+		lastErr = r.kbClient.Patch(ctx, restore, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+		if lastErr == nil {
+			return true, nil
+		}
+		if pkgrestore.IsRetriableOwnerRefError(lastErr) {
+			return false, nil
+		}
+		return false, lastErr
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if lastErr != nil {
+			return lastErr
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *restoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -470,6 +530,19 @@ func (r *restoreReconciler) validateAndComplete(ctx context.Context, restore *ap
 		}
 	}
 
+	if !features.IsEnabled(api.OwnerRefRelinkFeatureFlag) {
+		if restore.Spec.OwnerRefConfigMap != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, "ownerRefConfigMap requires server feature flag OwnerRefRelink")
+		}
+	} else {
+		scope, warnings, err := ownerref.LoadScope(ctx, r.kbClient, r.namespace, r.ownerRefConfigMap, restore.Spec.OwnerRefConfigMap)
+		if err != nil {
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, err.Error())
+		} else {
+			info.ownerRefState = ownerref.NewState(scope)
+			info.ownerRefWarnings = warnings
+		}
+	}
 	return info, resourceModifiers, restoreResPolicies
 }
 
@@ -589,7 +662,7 @@ func fetchBackupInfoInternal(kbClient client.Client, namespace, backupName strin
 // The log and results files are uploaded to backup storage. Any error returned from this function
 // means that the restore failed. This function updates the restore API object with warning and error
 // counts, but *does not* update its phase or patch it via the API.
-func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backupInfo, resourceModifiers *resourcemodifiers.ResourceModifiers, restoreResPolicies *resourcepolicies.Policies) error {
+func (r *restoreReconciler) runValidatedRestore(ctx context.Context, restore *api.Restore, info backupInfo, resourceModifiers *resourcemodifiers.ResourceModifiers, restoreResPolicies *resourcepolicies.Policies) error {
 	// instantiate the per-restore logger that will output both to a temp file
 	// (for upload to object storage) and to stdout.
 	restoreLog, err := logging.NewTempFileLogger(r.restoreLogLevel, r.logFormat, nil, logrus.Fields{"restore": kubeutil.NamespaceAndName(restore)})
@@ -626,7 +699,7 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 	}
 
 	podVolumeBackupList := &api.PodVolumeBackupList{}
-	err = r.kbClient.List(context.TODO(), podVolumeBackupList, listOpts)
+	err = r.kbClient.List(ctx, podVolumeBackupList, listOpts)
 	if err != nil {
 		restoreLog.Errorf("Fail to list PodVolumeBackup :%s", err.Error())
 		return errors.WithStack(err)
@@ -661,6 +734,7 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 	}
 
 	restoreReq := &pkgrestore.Request{
+		OwnerRefRelink:                info.ownerRefState,
 		Log:                           restoreLog,
 		Restore:                       restore,
 		Backup:                        info.backup,
@@ -676,6 +750,25 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 		ResourceDeletionStatusTracker: kubeutil.NewResourceDeletionStatusTracker(),
 	}
 	restoreWarnings, restoreErrors := r.restorer.RestoreWithResolvers(restoreReq, actionsResolver, pluginManager)
+	if info.ownerRefState != nil {
+		parent := ctx
+		if parent == nil {
+			parent = r.ctx
+		}
+		if parent == nil {
+			parent = context.Background()
+		}
+		patchCtx, cancel := pkgrestore.OwnerRefStageContext(parent, r.resourceTimeout)
+		warnings, errs, pending := pkgrestore.ApplyOwnerRefRelinking(patchCtx, r.globalCrClient, restore, info.ownerRefState)
+		cancel()
+		restoreWarnings.Merge(&info.ownerRefWarnings)
+		restoreWarnings.Merge(&warnings)
+		restoreErrors.Merge(&errs)
+		persistCtx, persistCancel := pkgrestore.OwnerRefStageContext(parent, r.resourceTimeout)
+		storageErrors := pkgrestore.SavePendingPatchesHybrid(persistCtx, r.kbClient, restore, pending)
+		persistCancel()
+		restoreErrors.Merge(&storageErrors)
+	}
 
 	// Iterate over restore item operations and update progress.
 	// Any errors on operations at this point should be added to restore errors.
@@ -764,7 +857,7 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 		r.logger.WithError(err).Error("Error uploading restore item action operation resource list to backup storage")
 	}
 
-	restoreReq.RestoreVolumeInfoTracker.Populate(context.TODO(), restoreReq.RestoredResourceList())
+	restoreReq.RestoreVolumeInfoTracker.Populate(ctx, restoreReq.RestoredResourceList())
 	if err := putRestoreVolumeInfoList(restore, restoreReq.RestoreVolumeInfoTracker.Result(), backupStore); err != nil {
 		r.logger.WithError(err).Error("Error uploading restored volume info to backup storage")
 	}

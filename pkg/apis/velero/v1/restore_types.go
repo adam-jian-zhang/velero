@@ -20,10 +20,14 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // RestoreSpec defines the specification for a Velero restore.
 type RestoreSpec struct {
+	// OwnerRefConfigMap selects an additive ownerReference scope ConfigMap in the Velero namespace.
+	// +optional
+	OwnerRefConfigMap *corev1api.TypedLocalObjectReference `json:"ownerRefConfigMap,omitempty"`
 	// BackupName is the unique name of the Velero backup to restore
 	// from.
 	// +optional
@@ -366,6 +370,15 @@ const (
 
 // RestoreStatus captures the current status of a Velero restore
 type RestoreStatus struct {
+	// PendingOwnerRefPatches contains the inline resolved ownerReference retry partition.
+	// +optional
+	PendingOwnerRefPatches []PendingPatchRef `json:"pendingOwnerRefPatches,omitempty"`
+	// PendingPatchesConfigMap names the authoritative immutable overflow snapshot.
+	// +optional
+	PendingPatchesConfigMap string `json:"pendingPatchesConfigMap,omitempty"`
+	// OwnerRefsRelinked counts children whose ownerReferences were successfully relinked.
+	// +optional
+	OwnerRefsRelinked int `json:"ownerRefsRelinked,omitempty"`
 	// Phase is the current state of the Restore
 	// +optional
 	Phase RestorePhase `json:"phase,omitempty"`
@@ -429,6 +442,18 @@ type RestoreStatus struct {
 	// +optional
 	// +nullable
 	HookStatus *HookStatus `json:"hookStatus,omitempty"`
+}
+
+// PendingPatchRef stores a child identity and already-resolved parent UIDs.
+type PendingPatchRef struct {
+	Group       string    `json:"group"`
+	Version     string    `json:"version"`
+	Kind        string    `json:"kind"`
+	Namespace   string    `json:"namespace"`
+	Name        string    `json:"name"`
+	RestoredUID types.UID `json:"restoredUID"`
+	// +optional
+	OwnerReferences []metav1.OwnerReference `json:"ownerReferences,omitempty"`
 }
 
 // RestoreProgress stores information about the restore's execution progress
