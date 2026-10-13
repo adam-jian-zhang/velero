@@ -113,6 +113,7 @@ type CreateOptions struct {
 	AllowPartiallyFailed        flag.OptionalBool
 	ItemOperationTimeout        time.Duration
 	ResourceModifierConfigMap   string
+	OwnerRefConfigMap           string
 	ResourcePoliciesConfigMap   string
 	SkipDefaultResourceModifier bool
 	WriteSparseFiles            flag.OptionalBool
@@ -173,6 +174,7 @@ func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
 
 	flags.BoolVarP(&o.Wait, "wait", "w", o.Wait, "Wait for the operation to complete.")
 
+	flags.StringVar(&o.OwnerRefConfigMap, "owner-ref-restore-configmap", "", "Additive ownerReference inScope ConfigMap; requires server feature OwnerRefRelink. PVCs require per-restore opt-in.")
 	flags.StringVar(&o.ResourceModifierConfigMap, "resource-modifier-configmap", "", "Reference to the resource modifier configmap that restore will use")
 
 	flags.StringVar(&o.ResourcePoliciesConfigMap, "resource-policies-configmap", "", "Reference to the ConfigMap containing restore resource filter policies")
@@ -342,6 +344,11 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		}
 	}
 
+	var ownerRefConfig *corev1api.TypedLocalObjectReference
+	if o.OwnerRefConfigMap != "" {
+		ownerRefConfig = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: o.OwnerRefConfigMap}
+	}
+
 	var resPolicies *corev1api.TypedLocalObjectReference
 
 	if o.ResourcePoliciesConfigMap != "" {
@@ -374,6 +381,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 			RestorePVs:                  o.RestoreVolumes.Value,
 			PreserveNodePorts:           o.PreserveNodePorts.Value,
 			IncludeClusterResources:     o.IncludeClusterResources.Value,
+			OwnerRefConfigMap:           ownerRefConfig,
 			ResourceModifier:            resModifiers,
 			ResourcePolicy:              resPolicies,
 			ItemOperationTimeout: metav1.Duration{

@@ -111,6 +111,25 @@ func DescribeRestore(
 		}
 
 		describeRestoreResults(ctx, kbClient, d, restore, insecureSkipTLSVerify, caCertFile)
+		if restore.Spec.OwnerRefConfigMap != nil || restore.Status.OwnerRefsRelinked > 0 || len(restore.Status.PendingOwnerRefPatches) > 0 || restore.Status.PendingPatchesConfigMap != "" {
+			d.Println()
+			d.Printf("OwnerReference Relinking:\n")
+			configMap := "server baseline"
+			if restore.Spec.OwnerRefConfigMap != nil {
+				configMap = restore.Spec.OwnerRefConfigMap.Name
+			}
+			d.Printf("\tConfigMap:\t%s\n", configMap)
+			d.Printf("\tRelinked OwnerRefs:\t%d items\n", restore.Status.OwnerRefsRelinked)
+			d.Printf("\tInline Pending Patches:\t%d\n", len(restore.Status.PendingOwnerRefPatches))
+			snapshot := restore.Status.PendingPatchesConfigMap
+			if snapshot == "" {
+				snapshot = "none"
+			}
+			d.Printf("\tOverflow Snapshot:\t%s\n", snapshot)
+			for _, request := range restore.Status.PendingOwnerRefPatches {
+				d.Printf("\tPending: %s/%s %s/%s\n", request.Group, request.Kind, request.Namespace, request.Name)
+			}
+		}
 
 		d.Println()
 		d.Printf("Backup:\t%s\n", restore.Spec.BackupName)

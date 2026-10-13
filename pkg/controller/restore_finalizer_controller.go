@@ -44,11 +44,13 @@ import (
 	velerov2alpha1 "github.com/velero-io/velero/pkg/apis/velero/v2alpha1"
 	serverconfig "github.com/velero-io/velero/pkg/cmd/server/config"
 	"github.com/velero-io/velero/pkg/constant"
+	"github.com/velero-io/velero/pkg/features"
 	"github.com/velero-io/velero/pkg/itemoperation"
 	"github.com/velero-io/velero/pkg/metrics"
 	"github.com/velero-io/velero/pkg/persistence"
 	"github.com/velero-io/velero/pkg/plugin/clientmgmt"
 	"github.com/velero-io/velero/pkg/plugin/velero"
+	pkgrestore "github.com/velero-io/velero/pkg/restore"
 	"github.com/velero-io/velero/pkg/util/boolptr"
 	csiutil "github.com/velero-io/velero/pkg/util/csi"
 	kubeutil "github.com/velero-io/velero/pkg/util/kube"
@@ -56,6 +58,7 @@ import (
 )
 
 type restoreFinalizerReconciler struct {
+	apiReader client.Reader
 	client.Client
 	namespace         string
 	logger            logrus.FieldLogger
@@ -94,6 +97,7 @@ func NewRestoreFinalizerReconciler(
 }
 
 func (r *restoreFinalizerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.apiReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov1api.Restore{}).
 		Named(constant.ControllerRestoreFinalizer).
@@ -124,6 +128,11 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	)
 
 	switch restore.Status.Phase {
+	case velerov1api.RestorePhaseCompleted, velerov1api.RestorePhasePartiallyFailed:
+		// A previous terminal commit may have succeeded despite returning an
+		// error. Durable terminal status confirms that hook outcomes can go.
+		r.multiHookTracker.Delete(restore.Name)
+		return r.cleanupOwnerRefSnapshots(ctx, restore)
 	case velerov1api.RestorePhaseFinalizing, velerov1api.RestorePhaseFinalizingPartiallyFailed:
 	default:
 		log.Debug("Restore is not awaiting finalization, skipping")
@@ -179,6 +188,7 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	finalizerCtx := &finalizerContext{
+		parent:             ctx,
 		logger:             log,
 		backupStore:        backupStore,
 		restore:            restore,
@@ -192,7 +202,10 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			items: restoreItemOperations,
 		},
 	}
-	warnings, errs := finalizerCtx.execute()
+	warnings, errs, persistenceErr := finalizerCtx.execute()
+	if persistenceErr != nil {
+		return ctrl.Result{}, persistenceErr
+	}
 
 	warningCnt := len(warnings.Velero) + len(warnings.Cluster)
 	for _, w := range warnings.Namespaces {
@@ -202,15 +215,25 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	for _, e := range errs.Namespaces {
 		errCnt += len(e)
 	}
-	restore.Status.Warnings += warningCnt
-	restore.Status.Errors += errCnt
+	ownerRefWork := hasOwnerRefWork(original) || hasOwnerRefWork(restore)
+	if !ownerRefWork {
+		restore.Status.Warnings += warningCnt
+		restore.Status.Errors += errCnt
+	}
 
 	if !errs.IsEmpty() {
 		restore.Status.Phase = velerov1api.RestorePhaseFinalizingPartiallyFailed
 	}
 
-	if warningCnt > 0 || errCnt > 0 {
-		err := r.updateResults(backupStore, restore, &warnings, &errs)
+	if ownerRefWork || warningCnt > 0 || errCnt > 0 {
+		var err error
+		if ownerRefWork {
+			// Results can be durable even though a previous terminal status
+			// commit failed. Reload them even if this attempt has no messages.
+			err = updateOwnerRefResults(backupStore, restore, &warnings, &errs)
+		} else {
+			err = r.updateResults(backupStore, restore, &warnings, &errs)
+		}
 		if err != nil {
 			log.WithError(err).Error("error updating results")
 			return ctrl.Result{}, errors.Wrap(err, "error updating results")
@@ -218,17 +241,23 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	finalPhase := velerov1api.RestorePhaseCompleted
-	if restore.Status.Phase == velerov1api.RestorePhaseFinalizingPartiallyFailed {
+	if restore.Status.Phase == velerov1api.RestorePhaseFinalizingPartiallyFailed || restore.Status.Errors > 0 || len(restore.Status.PendingOwnerRefPatches) > 0 || restore.Status.PendingPatchesConfigMap != "" {
 		finalPhase = velerov1api.RestorePhasePartiallyFailed
 	}
 	log.Infof("Marking restore %s", finalPhase)
 
-	if err := r.finishProcessing(finalPhase, restore, original); err != nil {
+	if err := r.finishProcessing(finalPhase, restore, original, ctx); err != nil {
 		log.WithError(err).Error("error updating restore's final status")
 		return ctrl.Result{}, errors.Wrap(err, "error updating restore's final status")
 	}
+	r.multiHookTracker.Delete(restore.Name)
 
-	return ctrl.Result{}, nil
+	// Retain the original evidence of ownerReference relinking work even when permanent failures
+	// drained every request without incrementing the relink counter.
+	if hasOwnerRefWork(original) {
+		return r.cleanupOwnerRefSnapshots(ctx, original)
+	}
+	return r.cleanupOwnerRefSnapshots(ctx, restore)
 }
 
 func (r *restoreFinalizerReconciler) updateResults(backupStore persistence.BackupStore, restore *velerov1api.Restore, newWarnings *results.Result, newErrs *results.Result) error {
@@ -252,7 +281,7 @@ func (r *restoreFinalizerReconciler) updateResults(backupStore persistence.Backu
 	return nil
 }
 
-func (r *restoreFinalizerReconciler) finishProcessing(restorePhase velerov1api.RestorePhase, restore *velerov1api.Restore, original *velerov1api.Restore) error {
+func (r *restoreFinalizerReconciler) finishProcessing(restorePhase velerov1api.RestorePhase, restore *velerov1api.Restore, original *velerov1api.Restore, parents ...context.Context) error {
 	if restorePhase == velerov1api.RestorePhasePartiallyFailed {
 		restore.Status.Phase = velerov1api.RestorePhasePartiallyFailed
 		r.metrics.RegisterRestorePartialFailure(restore.Spec.ScheduleName)
@@ -264,6 +293,15 @@ func (r *restoreFinalizerReconciler) finishProcessing(restorePhase velerov1api.R
 	// retry `Finalizing`/`FinalizingPartiallyFailed` to
 	// - `Completed`
 	// - `PartiallyFailed`
+	if hasOwnerRefWork(original) || hasOwnerRefWork(restore) {
+		parent := context.Background()
+		if len(parents) > 0 {
+			parent = parents[0]
+		}
+		commitCtx, cancel := pkgrestore.OwnerRefStageContext(parent, r.resourceTimeout)
+		defer cancel()
+		return r.Patch(commitCtx, restore, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{}))
+	}
 	return kubeutil.PatchResourceWithRetriesOnErrors(r.resourceTimeout, original, restore, r.Client)
 }
 
@@ -297,6 +335,7 @@ func (r *restoreItemOperationList) SelectByPVC(ns, name string) []*itemoperation
 // finalizerContext includes all the dependencies required by finalization tasks and
 // a function execute() to orderly implement task logic.
 type finalizerContext struct {
+	parent                   context.Context
 	logger                   logrus.FieldLogger
 	restore                  *velerov1api.Restore
 	crClient                 client.Client
@@ -309,7 +348,7 @@ type finalizerContext struct {
 	resourceTimeout          time.Duration
 }
 
-func (ctx *finalizerContext) execute() (results.Result, results.Result) {
+func (ctx *finalizerContext) execute() (results.Result, results.Result, error) {
 	warnings, errs := results.Result{}, results.Result{}
 
 	// implement finalization tasks
@@ -327,7 +366,33 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result) {
 	rehErrs := ctx.WaitRestoreExecHook()
 	errs.Merge(&rehErrs)
 
-	return warnings, errs
+	if hasOwnerRefWork(ctx.restore) {
+		parent := ctx.parent
+		if parent == nil {
+			parent = context.Background()
+		}
+		loadCtx, loadCancel := pkgrestore.OwnerRefStageContext(parent, ctx.resourceTimeout)
+		pending, err := pkgrestore.LoadPendingPatchesHybrid(loadCtx, ctx.crClient, ctx.restore)
+		loadCancel()
+		if err != nil {
+			return warnings, errs, err
+		}
+		patchCtx, patchCancel := pkgrestore.OwnerRefStageContext(parent, ctx.resourceTimeout)
+		retryWarnings, retryErrors, remaining := pkgrestore.RetryPendingPatches(patchCtx, ctx.crClient, ctx.restore, pending)
+		patchCancel()
+		warnings.Merge(&retryWarnings)
+		errs.Merge(&retryErrors)
+		persistCtx, persistCancel := pkgrestore.OwnerRefStageContext(parent, ctx.resourceTimeout)
+		err = pkgrestore.ReconcilePendingPatchesConfigMap(persistCtx, ctx.crClient, ctx.restore, remaining)
+		persistCancel()
+		if err != nil {
+			return warnings, errs, err
+		}
+		if len(remaining) > 0 {
+			errs.AddVeleroError(fmt.Errorf("restore finalized with %d pending ownerReference requests; external remediation required", len(remaining)))
+		}
+	}
+	return warnings, errs, nil
 }
 
 // patchDynamicPV patches newly dynamically provisioned PV using volume info
@@ -673,13 +738,46 @@ func (ctx *finalizerContext) WaitRestoreExecHook() (errs results.Result) {
 	updated.Status.HookStatus.HooksAttempted, updated.Status.HookStatus.HooksFailed = ctx.multiHookTracker.Stat(ctx.restore.Name)
 	log.Debugf("hookAttempted: %d, hookFailed: %d", updated.Status.HookStatus.HooksAttempted, updated.Status.HookStatus.HooksFailed)
 
-	if err := kubeutil.PatchResource(ctx.restore, updated, ctx.crClient); err != nil {
+	if hasOwnerRefWork(ctx.restore) {
+		// OwnerReference relinking commits hook results with the pending partition and final phase.
+		// An intermediate hook-status patch would invalidate that commit's
+		// resourceVersion precondition on every reconciliation.
+		ctx.restore.Status.HookStatus = updated.Status.HookStatus
+	} else if err := kubeutil.PatchResource(ctx.restore, updated, ctx.crClient); err != nil {
 		log.WithError(errors.WithStack((err))).Error("Updating restore status")
 		errs.Add(ctx.restore.Namespace, err)
 	}
 
-	// delete the hook data for this restore
-	ctx.multiHookTracker.Delete(ctx.restore.Name)
+	if !hasOwnerRefWork(ctx.restore) {
+		// OwnerReference relinking retains hook outcomes until the terminal status commit succeeds,
+		// so a persistence failure can retry without losing errors or counts.
+		ctx.multiHookTracker.Delete(ctx.restore.Name)
+	}
 
 	return errs
+}
+
+// hasOwnerRefWork also recovers already-persisted work after a server restart.
+func hasOwnerRefWork(restore *velerov1api.Restore) bool {
+	return features.IsEnabled(velerov1api.OwnerRefRelinkFeatureFlag) || restore.Spec.OwnerRefConfigMap != nil || restore.Status.OwnerRefsRelinked > 0 || len(restore.Status.PendingOwnerRefPatches) > 0 || restore.Status.PendingPatchesConfigMap != ""
+}
+
+func (r *restoreFinalizerReconciler) cleanupOwnerRefSnapshots(parent context.Context, restore *velerov1api.Restore) (ctrl.Result, error) {
+	if !hasOwnerRefWork(restore) || restore.UID == "" {
+		return ctrl.Result{}, nil
+	}
+	reader := r.apiReader
+	if reader == nil {
+		reader = r.crClient
+	}
+	if reader == nil {
+		reader = r.Client
+	}
+	cleanupCtx, cancel := pkgrestore.OwnerRefStageContext(parent, r.resourceTimeout)
+	defer cancel()
+	if err := pkgrestore.CleanupPendingSnapshots(cleanupCtx, reader, r.Client, restore); err != nil {
+		r.logger.WithError(err).Warn("pending ownerReference snapshot cleanup failed")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	return ctrl.Result{}, nil
 }
