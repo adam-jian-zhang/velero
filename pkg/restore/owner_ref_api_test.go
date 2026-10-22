@@ -58,12 +58,20 @@ func TestOwnerRefAPISchemaAndOptimisticOwnerRefPatches(t *testing.T) {
 	assert.True(t, apierrors.IsConflict(c.Patch(ctx, updated, client.MergeFromWithOptions(stale, client.MergeFromWithOptimisticLock{}))))
 	r := &velerov1.Restore{ObjectMeta: metav1.ObjectMeta{Name: "restore", Namespace: ns.Name}, Spec: velerov1.RestoreSpec{BackupName: "backup", OwnerRefConfigMap: &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "scope"}}}
 	req := velerov1.PendingPatchRef{Version: "v1", Kind: "ConfigMap", Name: child.Name, Namespace: child.Namespace, RestoredUID: child.UID, OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: parent.Name, UID: parent.UID}}}
-	r.Status.PendingOwnerRefPatches = []velerov1.PendingPatchRef{req}
 	require.NoError(t, c.Create(ctx, r))
+	require.NoError(t, ReconcilePendingPatchesConfigMap(ctx, c, r, []velerov1.PendingPatchRef{req}))
+	require.NoError(t, c.Update(ctx, r))
 	loaded := &velerov1.Restore{}
 	require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(r), loaded))
-	require.Equal(t, r.Status.PendingOwnerRefPatches, loaded.Status.PendingOwnerRefPatches)
-	warnings, errs, pending := RetryPendingPatches(ctx, c, r, r.Status.PendingOwnerRefPatches)
+	require.Equal(t, 1, loaded.Status.PendingOwnerRefPatchCount)
+	require.Equal(t, r.Status.PendingPatchesConfigMap, loaded.Status.PendingPatchesConfigMap)
+	invalid := loaded.DeepCopy()
+	invalid.Status.PendingOwnerRefPatchCount = -1
+	assert.True(t, apierrors.IsInvalid(c.Update(ctx, invalid)), "the CRD must reject negative pending counts")
+	saved, err := LoadPendingPatches(ctx, c, loaded)
+	require.NoError(t, err)
+	require.Equal(t, []velerov1.PendingPatchRef{req}, saved)
+	warnings, errs, pending := RetryPendingPatches(ctx, c, r, saved)
 	assert.True(t, warnings.IsEmpty())
 	assert.True(t, errs.IsEmpty())
 	assert.Empty(t, pending)

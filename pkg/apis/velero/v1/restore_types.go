@@ -370,10 +370,11 @@ const (
 
 // RestoreStatus captures the current status of a Velero restore
 type RestoreStatus struct {
-	// PendingOwnerRefPatches contains the inline resolved ownerReference retry partition.
+	// PendingOwnerRefPatchCount counts child patch requests retained in the pending snapshot.
 	// +optional
-	PendingOwnerRefPatches []PendingPatchRef `json:"pendingOwnerRefPatches,omitempty"`
-	// PendingPatchesConfigMap names the authoritative immutable overflow snapshot.
+	// +kubebuilder:validation:Minimum=0
+	PendingOwnerRefPatchCount int `json:"pendingOwnerRefPatchCount,omitempty"`
+	// PendingPatchesConfigMap names the authoritative immutable snapshot of all pending requests.
 	// +optional
 	PendingPatchesConfigMap string `json:"pendingPatchesConfigMap,omitempty"`
 	// OwnerRefsRelinked counts children whose ownerReferences were successfully relinked.

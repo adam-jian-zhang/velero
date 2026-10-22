@@ -30,6 +30,7 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
 	storagev1api "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -241,7 +242,7 @@ func (r *restoreFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	finalPhase := velerov1api.RestorePhaseCompleted
-	if restore.Status.Phase == velerov1api.RestorePhaseFinalizingPartiallyFailed || restore.Status.Errors > 0 || len(restore.Status.PendingOwnerRefPatches) > 0 || restore.Status.PendingPatchesConfigMap != "" {
+	if restore.Status.Phase == velerov1api.RestorePhaseFinalizingPartiallyFailed || restore.Status.Errors > 0 || restore.Status.PendingOwnerRefPatchCount > 0 || restore.Status.PendingPatchesConfigMap != "" {
 		finalPhase = velerov1api.RestorePhasePartiallyFailed
 	}
 	log.Infof("Marking restore %s", finalPhase)
@@ -372,7 +373,7 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result, error) {
 			parent = context.Background()
 		}
 		loadCtx, loadCancel := pkgrestore.OwnerRefStageContext(parent, ctx.resourceTimeout)
-		pending, err := pkgrestore.LoadPendingPatchesHybrid(loadCtx, ctx.crClient, ctx.restore)
+		pending, err := pkgrestore.LoadPendingPatches(loadCtx, ctx.crClient, ctx.restore)
 		loadCancel()
 		if err != nil {
 			return warnings, errs, err
@@ -382,11 +383,15 @@ func (ctx *finalizerContext) execute() (results.Result, results.Result, error) {
 		patchCancel()
 		warnings.Merge(&retryWarnings)
 		errs.Merge(&retryErrors)
-		persistCtx, persistCancel := pkgrestore.OwnerRefStageContext(parent, ctx.resourceTimeout)
-		err = pkgrestore.ReconcilePendingPatchesConfigMap(persistCtx, ctx.crClient, ctx.restore, remaining)
-		persistCancel()
-		if err != nil {
-			return warnings, errs, err
+		// The loaded snapshot is already validated and immutable. Reuse it
+		// without CREATE/GET calls when neither requests nor parent identities changed.
+		if !equality.Semantic.DeepEqual(pending, remaining) {
+			persistCtx, persistCancel := pkgrestore.OwnerRefStageContext(parent, ctx.resourceTimeout)
+			err = pkgrestore.ReconcilePendingPatchesConfigMap(persistCtx, ctx.crClient, ctx.restore, remaining)
+			persistCancel()
+			if err != nil {
+				return warnings, errs, err
+			}
 		}
 		if len(remaining) > 0 {
 			errs.AddVeleroError(fmt.Errorf("restore finalized with %d pending ownerReference requests; external remediation required", len(remaining)))
@@ -739,7 +744,7 @@ func (ctx *finalizerContext) WaitRestoreExecHook() (errs results.Result) {
 	log.Debugf("hookAttempted: %d, hookFailed: %d", updated.Status.HookStatus.HooksAttempted, updated.Status.HookStatus.HooksFailed)
 
 	if hasOwnerRefWork(ctx.restore) {
-		// OwnerReference relinking commits hook results with the pending partition and final phase.
+		// OwnerReference relinking commits hook results with the snapshot reference/count and final phase.
 		// An intermediate hook-status patch would invalidate that commit's
 		// resourceVersion precondition on every reconciliation.
 		ctx.restore.Status.HookStatus = updated.Status.HookStatus
@@ -759,7 +764,7 @@ func (ctx *finalizerContext) WaitRestoreExecHook() (errs results.Result) {
 
 // hasOwnerRefWork also recovers already-persisted work after a server restart.
 func hasOwnerRefWork(restore *velerov1api.Restore) bool {
-	return features.IsEnabled(velerov1api.OwnerRefRelinkFeatureFlag) || restore.Spec.OwnerRefConfigMap != nil || restore.Status.OwnerRefsRelinked > 0 || len(restore.Status.PendingOwnerRefPatches) > 0 || restore.Status.PendingPatchesConfigMap != ""
+	return features.IsEnabled(velerov1api.OwnerRefRelinkFeatureFlag) || restore.Spec.OwnerRefConfigMap != nil || restore.Status.OwnerRefsRelinked > 0 || restore.Status.PendingOwnerRefPatchCount > 0 || restore.Status.PendingPatchesConfigMap != ""
 }
 
 func (r *restoreFinalizerReconciler) cleanupOwnerRefSnapshots(parent context.Context, restore *velerov1api.Restore) (ctrl.Result, error) {

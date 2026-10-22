@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,7 @@ import (
 	persistencemocks "github.com/velero-io/velero/pkg/persistence/mocks"
 	"github.com/velero-io/velero/pkg/plugin/clientmgmt"
 	pluginmocks "github.com/velero-io/velero/pkg/plugin/mocks"
+	pkgrestore "github.com/velero-io/velero/pkg/restore"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	"github.com/velero-io/velero/pkg/util/results"
 )
@@ -121,6 +123,7 @@ func TestOwnerRefFinalizerCompletionStorageFailureAndTerminalNoReplay(t *testing
 		{name: "transient", transient: true, phase: velerov1api.RestorePhasePartiallyFailed},
 		{name: "missing snapshot", corrupt: true, phase: velerov1api.RestorePhaseFinalizing},
 		{name: "replaced parent", replaced: true, phase: velerov1api.RestorePhaseCompleted},
+		{name: "replaced parent with pending child", replaced: true, transient: true, phase: velerov1api.RestorePhasePartiallyFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newOwnerRefFinalizerClient(t)
@@ -128,7 +131,8 @@ func TestOwnerRefFinalizerCompletionStorageFailureAndTerminalNoReplay(t *testing
 			location := builder.ForBackupStorageLocation("velero", "default").Provider("cloud").Bucket("bucket").Result()
 			restore := builder.ForRestore("velero", "restore").Backup(backup.Name).Phase(velerov1api.RestorePhaseFinalizing).Result()
 			restore.UID = "restore-uid"
-			restore.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{{Version: "v1", Kind: "ConfigMap", Namespace: "work", Name: "child", RestoredUID: "child-uid", OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "parent", UID: "parent-new"}}}}
+			pending := []velerov1api.PendingPatchRef{{Version: "v1", Kind: "ConfigMap", Namespace: "work", Name: "child", RestoredUID: "child-uid", OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "parent", UID: "parent-new"}}}}
+			require.NoError(t, pkgrestore.ReconcilePendingPatchesConfigMap(t.Context(), c, restore, pending))
 			if tc.corrupt {
 				restore.Status.PendingPatchesConfigMap = "absent"
 			}
@@ -161,7 +165,25 @@ func TestOwnerRefFinalizerCompletionStorageFailureAndTerminalNoReplay(t *testing
 			if tc.transient {
 				patchClient = &ownerRefTransientPatchClient{Client: c}
 			}
-			r := NewRestoreFinalizerReconciler(velerotest.NewLogger(), "velero", c, func(logrus.FieldLogger) clientmgmt.Manager { return pm }, NewFakeSingleObjectBackupStoreGetter(store), metrics.NewServerMetrics(), patchClient, hook.NewMultiHookTracker(), time.Second)
+			snapshotCreates, snapshotReads := 0, 0
+			countedClient := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				Create: func(ctx context.Context, base client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if strings.Contains(obj.GetName(), "-pending-patches-") {
+						snapshotCreates++
+					}
+					return base.Create(ctx, obj, opts...)
+				},
+				Get: func(ctx context.Context, base client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if key.Name == restore.Status.PendingPatchesConfigMap {
+						snapshotReads++
+					}
+					return base.Get(ctx, key, obj, opts...)
+				},
+				Patch: func(ctx context.Context, _ client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					return patchClient.Patch(ctx, obj, patch, opts...)
+				},
+			})
+			r := NewRestoreFinalizerReconciler(velerotest.NewLogger(), "velero", c, func(logrus.FieldLogger) clientmgmt.Manager { return pm }, NewFakeSingleObjectBackupStoreGetter(store), metrics.NewServerMetrics(), countedClient, hook.NewMultiHookTracker(), time.Second)
 			request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(restore)}
 			_, err := r.Reconcile(t.Context(), request)
 			if tc.corrupt {
@@ -169,10 +191,16 @@ func TestOwnerRefFinalizerCompletionStorageFailureAndTerminalNoReplay(t *testing
 			} else {
 				require.NoError(t, err)
 			}
+			assert.Equal(t, 1, snapshotReads, "load the complete queue once")
+			if tc.replaced && tc.transient {
+				assert.Equal(t, 1, snapshotCreates, "persist refreshed identities even if the pending count is unchanged")
+			} else {
+				assert.Zero(t, snapshotCreates, "drained or unchanged queues need no replacement snapshot")
+			}
 			loaded := &velerov1api.Restore{}
 			require.NoError(t, c.Get(t.Context(), request.NamespacedName, loaded))
 			assert.Equal(t, tc.phase, loaded.Status.Phase)
-			if tc.replaced {
+			if tc.replaced && !tc.transient {
 				assert.Zero(t, loaded.Status.Errors)
 				assert.Positive(t, loaded.Status.Warnings)
 				assert.Equal(t, 1, loaded.Status.OwnerRefsRelinked)
@@ -182,9 +210,17 @@ func TestOwnerRefFinalizerCompletionStorageFailureAndTerminalNoReplay(t *testing
 				assert.Equal(t, "replacement-parent", string(child.OwnerReferences[0].UID))
 			}
 			if tc.transient || tc.corrupt {
-				require.Len(t, loaded.Status.PendingOwnerRefPatches, 1)
+				require.Equal(t, 1, loaded.Status.PendingOwnerRefPatchCount)
+				assert.NotEmpty(t, loaded.Status.PendingPatchesConfigMap)
+				if tc.replaced {
+					retained, err := pkgrestore.LoadPendingPatches(t.Context(), c, loaded)
+					require.NoError(t, err)
+					require.Len(t, retained, 1)
+					assert.Equal(t, "replacement-parent", string(retained[0].OwnerReferences[0].UID))
+				}
 			} else {
-				assert.Empty(t, loaded.Status.PendingOwnerRefPatches)
+				assert.Zero(t, loaded.Status.PendingOwnerRefPatchCount)
+				assert.Empty(t, loaded.Status.PendingPatchesConfigMap)
 			}
 			if !tc.corrupt {
 				count := loaded.Status.OwnerRefsRelinked
@@ -222,13 +258,15 @@ func TestOwnerRefCommitStillGuardsResourceVersionAfterPermanentFailuresDrain(t *
 	t.Cleanup(func() { features.NewFeatureFlagSet() })
 	c := velerotest.NewFakeControllerRuntimeClient(t)
 	restore := builder.ForRestore("velero", "restore").Phase(velerov1api.RestorePhaseFinalizing).Result()
-	restore.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{{Name: "child"}}
+	restore.Status.PendingOwnerRefPatchCount = 1
+	restore.Status.PendingPatchesConfigMap = "pending"
 	require.NoError(t, c.Create(t.Context(), restore))
 	original := restore.DeepCopy()
 	live := restore.DeepCopy()
 	live.Annotations = map[string]string{"concurrent": "update"}
 	require.NoError(t, c.Update(t.Context(), live))
-	restore.Status.PendingOwnerRefPatches = nil
+	restore.Status.PendingOwnerRefPatchCount = 0
+	restore.Status.PendingPatchesConfigMap = ""
 	r := NewRestoreFinalizerReconciler(velerotest.NewLogger(), "velero", c, nil, nil, metrics.NewServerMetrics(), c, hook.NewMultiHookTracker(), time.Second)
 	err := r.finishProcessing(velerov1api.RestorePhasePartiallyFailed, restore, original, t.Context())
 	assert.True(t, apierrors.IsConflict(err))

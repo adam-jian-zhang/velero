@@ -43,18 +43,6 @@ const (
 	maxPendingSnapshotBytes = 1 << 20
 )
 
-func partitionPendingPatches(pending []velerov1.PendingPatchRef) ([]velerov1.PendingPatchRef, []velerov1.PendingPatchRef) {
-	inlineEnd, references := 0, 0
-	for _, request := range pending {
-		if inlineEnd >= ownerref.MaxPendingPatches || len(request.OwnerReferences) > ownerref.MaxInlineOwnerReferences-references {
-			break
-		}
-		inlineEnd++
-		references += len(request.OwnerReferences)
-	}
-	return pending[:inlineEnd], pending[inlineEnd:]
-}
-
 func compressPendingPatches(pending []velerov1.PendingPatchRef) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := gzip.NewWriter(&buf)
@@ -96,11 +84,11 @@ func pendingSnapshotName(restore *velerov1.Restore, payload []byte) string {
 	return prefix + suffix
 }
 
-func preparePendingSnapshot(ctx context.Context, c client.Client, restore *velerov1.Restore, overflow []velerov1.PendingPatchRef) (string, error) {
+func preparePendingSnapshot(ctx context.Context, c client.Client, restore *velerov1.Restore, pending []velerov1.PendingPatchRef) (string, error) {
 	if restore.UID == "" {
 		return "", fmt.Errorf("cannot create pending snapshot without Restore UID")
 	}
-	payload, err := compressPendingPatches(overflow)
+	payload, err := compressPendingPatches(pending)
 	if err != nil {
 		return "", err
 	}
@@ -144,51 +132,44 @@ func preparePendingSnapshot(ctx context.Context, c client.Client, restore *veler
 	return cm.Name, nil
 }
 
-// SavePendingPatchesHybrid prepares Pass 1 storage. Only this initial pass may
-// drop overflow that cannot fit/be saved; every dropped request is an error.
-func SavePendingPatchesHybrid(ctx context.Context, c client.Client, restore *velerov1.Restore, pending []velerov1.PendingPatchRef) results.Result {
+// SavePendingPatches prepares Pass 1 storage. Only this initial pass may drop
+// requests that cannot fit/be saved; every dropped request is an error.
+func SavePendingPatches(ctx context.Context, c client.Client, restore *velerov1.Restore, pending []velerov1.PendingPatchRef) results.Result {
 	errs := results.Result{}
 	if len(pending) > ownerref.MaxTotalPendingPatches {
 		errs.AddVeleroError(fmt.Errorf("dropped %d ownerReference requests beyond the %d pending limit", len(pending)-ownerref.MaxTotalPendingPatches, ownerref.MaxTotalPendingPatches))
 		pending = pending[:ownerref.MaxTotalPendingPatches]
 	}
-	inline, overflow := partitionPendingPatches(pending)
-	restore.Status.PendingOwnerRefPatches = inline
+	restore.Status.PendingOwnerRefPatchCount = 0
 	restore.Status.PendingPatchesConfigMap = ""
-	if len(overflow) > 0 {
-		name, err := preparePendingSnapshot(ctx, c, restore, overflow)
-		if err != nil {
-			errs.AddVeleroError(fmt.Errorf("dropped %d pending ownerReference requests: %w", len(overflow), err))
-		} else {
-			restore.Status.PendingPatchesConfigMap = name
-		}
+	if err := ReconcilePendingPatchesConfigMap(ctx, c, restore, pending); err != nil {
+		errs.AddVeleroError(fmt.Errorf("dropped %d pending ownerReference requests: %w", len(pending), err))
 	}
 	return errs
 }
 
-// ReconcilePendingPatchesConfigMap stages a complete replacement partition.
-// Neither the old status partition nor any existing snapshot is changed on error.
+// ReconcilePendingPatchesConfigMap stages a complete replacement snapshot.
+// Neither the old status reference/count nor any existing snapshot is changed on error.
 func ReconcilePendingPatchesConfigMap(ctx context.Context, c client.Client, restore *velerov1.Restore, pending []velerov1.PendingPatchRef) error {
-	if len(pending) > ownerref.MaxTotalPendingPatches {
-		return fmt.Errorf("durable pending partition exceeds %d requests", ownerref.MaxTotalPendingPatches)
+	if err := validatePendingPatches(pending); err != nil {
+		return err
 	}
-	inline, overflow := partitionPendingPatches(pending)
 	name := ""
-	if len(overflow) > 0 {
+	if len(pending) > 0 {
 		var err error
-		name, err = preparePendingSnapshot(ctx, c, restore, overflow)
+		name, err = preparePendingSnapshot(ctx, c, restore, pending)
 		if err != nil {
 			return err
 		}
 	}
-	restore.Status.PendingOwnerRefPatches = inline
+	restore.Status.PendingOwnerRefPatchCount = len(pending)
 	restore.Status.PendingPatchesConfigMap = name
 	return nil
 }
 
 func validatePendingPatches(pending []velerov1.PendingPatchRef) error {
 	if len(pending) > ownerref.MaxTotalPendingPatches {
-		return fmt.Errorf("pending partition exceeds total count limit")
+		return fmt.Errorf("pending queue exceeds total count limit")
 	}
 	for _, req := range pending {
 		if req.Name == "" || req.Kind == "" || req.Version == "" || req.RestoredUID == "" || len(req.OwnerReferences) == 0 {
@@ -203,8 +184,8 @@ func validatePendingPatches(pending []velerov1.PendingPatchRef) error {
 	return nil
 }
 
-func LoadPendingPatchesHybrid(ctx context.Context, c client.Client, restore *velerov1.Restore) ([]velerov1.PendingPatchRef, error) {
-	pending := append([]velerov1.PendingPatchRef(nil), restore.Status.PendingOwnerRefPatches...)
+func LoadPendingPatches(ctx context.Context, c client.Client, restore *velerov1.Restore) ([]velerov1.PendingPatchRef, error) {
+	var pending []velerov1.PendingPatchRef
 	if restore.Status.PendingPatchesConfigMap != "" {
 		cm := &corev1api.ConfigMap{}
 		var lastErr error
@@ -224,24 +205,28 @@ func LoadPendingPatchesHybrid(ctx context.Context, c client.Client, restore *vel
 		if !ownsPendingSnapshot(restore, cm) {
 			return nil, fmt.Errorf("pending snapshot %s is not owned by this Restore", cm.Name)
 		}
+		if cm.Immutable == nil || !*cm.Immutable || cm.Labels[pendingRestoreUIDLabel] != string(restore.UID) {
+			return nil, fmt.Errorf("pending snapshot %s is not immutable or has an invalid ownership label", cm.Name)
+		}
 		reader, err := gzip.NewReader(bytes.NewReader(cm.BinaryData[pendingPatchesKey]))
 		if err != nil {
 			return nil, fmt.Errorf("invalid pending snapshot %s: %w", cm.Name, err)
 		}
 		defer reader.Close()
-		var overflow []velerov1.PendingPatchRef
 		decoder := json.NewDecoder(reader)
-		if err := decoder.Decode(&overflow); err != nil {
+		if err := decoder.Decode(&pending); err != nil {
 			return nil, fmt.Errorf("decode pending snapshot %s: %w", cm.Name, err)
 		}
 		var trailing any
 		if err := decoder.Decode(&trailing); err != io.EOF {
 			return nil, fmt.Errorf("pending snapshot %s has trailing data or invalid gzip checksum", cm.Name)
 		}
-		if len(overflow) == 0 {
+		if len(pending) == 0 {
 			return nil, fmt.Errorf("referenced pending snapshot %s is empty", cm.Name)
 		}
-		pending = append(pending, overflow...)
+	}
+	if len(pending) != restore.Status.PendingOwnerRefPatchCount {
+		return nil, fmt.Errorf("pending snapshot count mismatch: status has %d requests, storage has %d", restore.Status.PendingOwnerRefPatchCount, len(pending))
 	}
 	if err := validatePendingPatches(pending); err != nil {
 		return nil, err
@@ -262,18 +247,6 @@ func CleanupPendingSnapshots(ctx context.Context, reader client.Reader, c client
 	var list corev1api.ConfigMapList
 	if err := reader.List(ctx, &list, client.InNamespace(restore.Namespace), client.MatchingLabels{pendingRestoreUIDLabel: string(restore.UID)}); err != nil {
 		return err
-	}
-	// Older conventional-name storage may have no ownership label.
-	legacyName := restore.Name + "-pending-patches"
-	if len(legacyName) <= 253 {
-		legacy := &corev1api.ConfigMap{}
-		if err := reader.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: legacyName}, legacy); err == nil {
-			if legacy.Labels[pendingRestoreUIDLabel] != string(restore.UID) {
-				list.Items = append(list.Items, *legacy)
-			}
-		} else if !apierrors.IsNotFound(err) {
-			return err
-		}
 	}
 	for i := range list.Items {
 		cm := &list.Items[i]

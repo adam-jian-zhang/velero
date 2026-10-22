@@ -74,9 +74,9 @@ func TestOwnerRefUnavailableParentsRemainPending(t *testing.T) {
 			}}
 			// Replay the persisted payload, as a finalizer after a restart would.
 			r := newOwnerRefRestore()
-			storageErrors := SavePendingPatchesHybrid(t.Context(), base, r, []velerov1.PendingPatchRef{newOwnerRefPending(0)})
+			storageErrors := SavePendingPatches(t.Context(), base, r, []velerov1.PendingPatchRef{newOwnerRefPending(0)})
 			require.True(t, storageErrors.IsEmpty(), "%+v", storageErrors)
-			pending, err := LoadPendingPatchesHybrid(t.Context(), base, r)
+			pending, err := LoadPendingPatches(t.Context(), base, r)
 			require.NoError(t, err)
 			warnings, errs, remaining := RetryPendingPatches(t.Context(), c, r, pending)
 			assert.True(t, errs.IsEmpty(), "%+v", errs)
@@ -301,9 +301,9 @@ func TestOwnerRefPass2PersistsRefreshedUIDAndRediscoversOnReplay(t *testing.T) {
 	require.True(t, errs.IsEmpty(), "%+v", errs)
 	require.Len(t, pending, 1)
 	assert.Equal(t, types.UID("replacement"), pending[0].OwnerReferences[0].UID)
-	storageErrors := SavePendingPatchesHybrid(t.Context(), base, r, pending)
+	storageErrors := SavePendingPatches(t.Context(), base, r, pending)
 	require.True(t, storageErrors.IsEmpty(), "%+v", storageErrors)
-	loaded, err := LoadPendingPatchesHybrid(t.Context(), base, r)
+	loaded, err := LoadPendingPatches(t.Context(), base, r)
 	require.NoError(t, err)
 	require.Equal(t, pending, loaded)
 	require.NoError(t, base.Delete(t.Context(), parent))

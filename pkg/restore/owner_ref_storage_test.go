@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/velero-io/velero/internal/ownerref"
 	velerov1 "github.com/velero-io/velero/pkg/apis/velero/v1"
@@ -48,22 +49,24 @@ func newOwnerRefPendingList(count, owners int) []velerov1.PendingPatchRef {
 	return list
 }
 
-func TestOwnerRefPendingPartitionBoundaries(t *testing.T) {
-	for _, tc := range []struct{ count, owners, inline int }{
-		{100, 4, 100}, {101, 4, 100}, {50, 8, 50}, {51, 8, 50}, {1, 401, 0}, {100, 5, 80},
+func TestOwnerRefPendingSnapshotRoundTrip(t *testing.T) {
+	for _, tc := range []struct{ count, owners int }{
+		{0, 0}, {1, 1}, {100, 4}, {101, 4}, {50, 8}, {51, 8}, {1, 401}, {100, 5},
 	} {
 		t.Run(fmt.Sprintf("%d-%d", tc.count, tc.owners), func(t *testing.T) {
 			pending := newOwnerRefPendingList(tc.count, tc.owners)
-			inline, overflow := partitionPendingPatches(pending)
-			assert.Len(t, inline, tc.inline)
-			assert.Equal(t, pending, append(append([]velerov1.PendingPatchRef{}, inline...), overflow...))
 			r := newOwnerRefRestore()
 			c := newOwnerRefRestoreClient(t)
-			require.NoError(t, ReconcilePendingPatchesConfigMap(context.Background(), c, r, pending))
-			loaded, err := LoadPendingPatchesHybrid(context.Background(), c, r)
+			require.NoError(t, ReconcilePendingPatchesConfigMap(t.Context(), c, r, pending))
+			loaded, err := LoadPendingPatches(t.Context(), c, r)
 			require.NoError(t, err)
-			assert.Equal(t, pending, loaded)
-			assert.Equal(t, tc.inline < tc.count, r.Status.PendingPatchesConfigMap != "")
+			assert.Equal(t, tc.count, r.Status.PendingOwnerRefPatchCount)
+			assert.Equal(t, tc.count > 0, r.Status.PendingPatchesConfigMap != "")
+			if tc.count == 0 {
+				assert.Empty(t, loaded)
+			} else {
+				assert.Equal(t, pending, loaded)
+			}
 		})
 	}
 }
@@ -80,10 +83,10 @@ func TestOwnerRefCopyOnWriteCommitCleanupAndPreparationFailure(t *testing.T) {
 	require.NoError(t, ReconcilePendingPatchesConfigMap(ctx, c, r, pending[1:]))
 	nameB := r.Status.PendingPatchesConfigMap
 	assert.NotEqual(t, nameA, nameB)
-	loaded, err := LoadPendingPatchesHybrid(ctx, c, durable)
+	loaded, err := LoadPendingPatches(ctx, c, durable)
 	require.NoError(t, err)
 	assert.Equal(t, pending, loaded)
-	// A preparation failure cannot replace the previous inline list/reference.
+	// A preparation failure cannot replace the previous count/reference.
 	failing := &ownerRefInterceptClient{Client: c, create: func(context.Context, client.Object, ...client.CreateOption) error {
 		return apierrors.NewForbidden(schema.GroupResource{}, "snapshot", fmt.Errorf("denied"))
 	}}
@@ -96,72 +99,73 @@ func TestOwnerRefCopyOnWriteCommitCleanupAndPreparationFailure(t *testing.T) {
 	require.NoError(t, CleanupPendingSnapshots(ctx, c, c, before))
 	assert.True(t, apierrors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: nameA}, &corev1api.ConfigMap{})))
 	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: nameB}, &corev1api.ConfigMap{}))
-	// Inline migration does not delete B before its reference is durably cleared.
-	require.NoError(t, ReconcilePendingPatchesConfigMap(ctx, c, r, pending[:50]))
+	// Draining work does not delete B before its reference is durably cleared.
+	require.NoError(t, ReconcilePendingPatchesConfigMap(ctx, c, r, nil))
 	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: nameB}, &corev1api.ConfigMap{}))
 	require.NoError(t, c.Update(ctx, r))
 	require.NoError(t, CleanupPendingSnapshots(ctx, c, c, r))
 	assert.True(t, apierrors.IsNotFound(c.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: nameB}, &corev1api.ConfigMap{})))
 }
 
-func TestOwnerRefSnapshotLoadFailsClosedAndLegacyNameMigration(t *testing.T) {
-	ctx := context.Background()
-	r := newOwnerRefRestore()
-	c := newOwnerRefRestoreClient(t)
-	pending := newOwnerRefPendingList(101, 1)
-	require.NoError(t, ReconcilePendingPatchesConfigMap(ctx, c, r, pending))
-	cm := &corev1api.ConfigMap{}
-	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: r.Status.PendingPatchesConfigMap}, cm))
-	legacy := cm.DeepCopy()
-	legacy.ResourceVersion = ""
-	legacy.Name = r.Name + "-pending-patches"
-	legacy.Labels = nil
-	legacy.Immutable = nil
-	require.NoError(t, c.Create(ctx, legacy))
-	r.Status.PendingPatchesConfigMap = legacy.Name
-	loaded, err := LoadPendingPatchesHybrid(ctx, c, r)
-	require.NoError(t, err)
-	assert.Equal(t, pending, loaded)
-	require.NoError(t, ReconcilePendingPatchesConfigMap(ctx, c, r, pending))
-	assert.NotEqual(t, legacy.Name, r.Status.PendingPatchesConfigMap)
-	for _, tc := range []struct {
-		name string
-		data []byte
-	}{
-		{"absent", nil}, {"corrupt", []byte("bad gzip")},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r.Status.PendingPatchesConfigMap = "broken"
-			broken := legacy.DeepCopy()
-			broken.Name = "broken"
-			broken.ResourceVersion = ""
-			broken.BinaryData = map[string][]byte{pendingPatchesKey: tc.data}
-			if tc.name == "corrupt" {
-				require.NoError(t, c.Create(ctx, broken))
-				defer c.Delete(ctx, broken)
+func TestOwnerRefSnapshotLoadFailsClosed(t *testing.T) {
+	for _, mode := range []string{"missing", "corrupt", "empty", "foreign", "mutable", "wrong label", "wrong count", "zero count", "count without snapshot", "invalid request", "trailing data"} {
+		t.Run(mode, func(t *testing.T) {
+			r := newOwnerRefRestore()
+			c := newOwnerRefRestoreClient(t)
+			pending := newOwnerRefPendingList(1, 1)
+			require.NoError(t, ReconcilePendingPatchesConfigMap(t.Context(), c, r, pending))
+			cm := &corev1api.ConfigMap{}
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Namespace: r.Namespace, Name: r.Status.PendingPatchesConfigMap}, cm))
+			switch mode {
+			case "missing":
+				require.NoError(t, c.Delete(t.Context(), cm))
+			case "corrupt":
+				cm.BinaryData[pendingPatchesKey] = []byte("bad gzip")
+			case "empty":
+				payload, err := compressPendingPatches(nil)
+				require.NoError(t, err)
+				cm.BinaryData[pendingPatchesKey] = payload
+			case "foreign":
+				cm.OwnerReferences[0].UID = "foreign"
+			case "mutable":
+				cm.Immutable = nil
+			case "wrong label":
+				cm.Labels[pendingRestoreUIDLabel] = "foreign"
+			case "wrong count":
+				r.Status.PendingOwnerRefPatchCount = 2
+			case "zero count":
+				r.Status.PendingOwnerRefPatchCount = 0
+			case "count without snapshot":
+				r.Status.PendingPatchesConfigMap = ""
+			case "invalid request":
+				pending[0].RestoredUID = ""
+				payload, err := compressPendingPatches(pending)
+				require.NoError(t, err)
+				cm.BinaryData[pendingPatchesKey] = payload
+			case "trailing data":
+				payload, err := compressPendingPatches(pending)
+				require.NoError(t, err)
+				cm.BinaryData[pendingPatchesKey] = append(cm.BinaryData[pendingPatchesKey], payload...)
 			}
-			_, err := LoadPendingPatchesHybrid(ctx, c, r)
+			// The fake client permits simulating malformed storage even when immutable.
+			if mode != "missing" {
+				require.NoError(t, c.Update(t.Context(), cm))
+			}
+			before := r.DeepCopy()
+			_, err := LoadPendingPatches(t.Context(), c, r)
 			require.Error(t, err)
-			assert.Equal(t, "broken", r.Status.PendingPatchesConfigMap)
-			assert.Len(t, r.Status.PendingOwnerRefPatches, 100)
+			assert.Equal(t, before.Status, r.Status)
 		})
 	}
-	refs := legacy.OwnerReferences
-	refs[0].UID = "foreign"
-	legacy.OwnerReferences = refs
-	require.NoError(t, c.Update(ctx, legacy))
-	r.Status.PendingPatchesConfigMap = legacy.Name
-	_, err = LoadPendingPatchesHybrid(ctx, c, r)
-	require.ErrorContains(t, err, "owned")
 }
 
 func TestOwnerRefTotalCapAndSnapshotFailureAreRestoreErrors(t *testing.T) {
 	ctx := context.Background()
 	r := newOwnerRefRestore()
 	c := newOwnerRefRestoreClient(t)
-	errs := SavePendingPatchesHybrid(ctx, c, r, newOwnerRefPendingList(ownerref.MaxTotalPendingPatches+1, 1))
+	errs := SavePendingPatches(ctx, c, r, newOwnerRefPendingList(ownerref.MaxTotalPendingPatches+1, 1))
 	assert.False(t, errs.IsEmpty())
-	loaded, err := LoadPendingPatchesHybrid(ctx, c, r)
+	loaded, err := LoadPendingPatches(ctx, c, r)
 	require.NoError(t, err)
 	assert.Len(t, loaded, ownerref.MaxTotalPendingPatches)
 	before := r.DeepCopy()
@@ -170,9 +174,9 @@ func TestOwnerRefTotalCapAndSnapshotFailureAreRestoreErrors(t *testing.T) {
 	failing := &ownerRefInterceptClient{Client: c, create: func(context.Context, client.Object, ...client.CreateOption) error {
 		return apierrors.NewForbidden(schema.GroupResource{}, "snapshot", fmt.Errorf("denied"))
 	}}
-	errs = SavePendingPatchesHybrid(ctx, failing, r, newOwnerRefPendingList(101, 1))
+	errs = SavePendingPatches(ctx, failing, r, newOwnerRefPendingList(101, 1))
 	assert.False(t, errs.IsEmpty())
-	assert.Len(t, r.Status.PendingOwnerRefPatches, 100)
+	assert.Zero(t, r.Status.PendingOwnerRefPatchCount)
 	assert.Empty(t, r.Status.PendingPatchesConfigMap)
 	r.Name = strings.Repeat("r", 253)
 	assert.LessOrEqual(t, len(pendingSnapshotName(r, []byte("payload"))), 253)
@@ -188,21 +192,119 @@ func TestOwnerRefCompressedSnapshotCapacityPreflight(t *testing.T) {
 			pending[i].OwnerReferences[j].Name = hex.EncodeToString(bytes[:])[:253]
 		}
 	}
-	_, overflow := partitionPendingPatches(pending)
-	_, err := compressPendingPatches(overflow)
+	_, err := compressPendingPatches(pending)
 	require.ErrorContains(t, err, "1 MiB")
 	r := newOwnerRefRestore()
 	c := newOwnerRefRestoreClient(t)
-	errs := SavePendingPatchesHybrid(t.Context(), c, r, pending)
+	errs := SavePendingPatches(t.Context(), c, r, pending)
 	assert.False(t, errs.IsEmpty())
-	assert.Len(t, r.Status.PendingOwnerRefPatches, 3)
+	assert.Zero(t, r.Status.PendingOwnerRefPatchCount)
 	assert.Empty(t, r.Status.PendingPatchesConfigMap)
-	// Pass 2 must preserve the old partition rather than applying Pass 1's drop rule.
+	// Pass 2 must preserve the old snapshot reference/count rather than applying Pass 1's drop rule.
 	r.Status.PendingPatchesConfigMap = "authoritative"
+	r.Status.PendingOwnerRefPatchCount = 1
 	before := r.DeepCopy()
 	require.Error(t, ReconcilePendingPatchesConfigMap(t.Context(), c, r, pending))
 	assert.Equal(t, before.Status, r.Status)
 	var list corev1api.ConfigMapList
 	require.NoError(t, c.List(t.Context(), &list))
 	assert.Empty(t, list.Items)
+}
+
+// Count storage calls separately from the existing Restore commit calls.
+func TestOwnerRefSnapshotStorageAPICalls(t *testing.T) {
+	for _, tc := range []struct {
+		name                                        string
+		initial, remaining, creates, reads, deletes int
+	}{
+		{name: "empty"},
+		{name: "single drained", initial: 1, creates: 1, reads: 1, deletes: 1},
+		{name: "many drained", initial: 101, creates: 1, reads: 1, deletes: 1},
+		{name: "changed remainder", initial: 2, remaining: 1, creates: 2, reads: 1, deletes: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newOwnerRefRestore()
+			base := newOwnerRefRestoreClient(t, r)
+			creates, reads, deletes, restoreReads, lists := 0, 0, 0, 0, 0
+			c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					creates++
+					return c.Create(ctx, obj, opts...)
+				},
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*corev1api.ConfigMap); ok {
+						reads++
+					} else {
+						restoreReads++
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					deletes++
+					return c.Delete(ctx, obj, opts...)
+				},
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					lists++
+					return c.List(ctx, list, opts...)
+				},
+			})
+			pending := newOwnerRefPendingList(tc.initial, 1)
+			errs := SavePendingPatches(t.Context(), c, r, pending)
+			require.True(t, errs.IsEmpty(), "%+v", errs)
+			require.NoError(t, c.Update(t.Context(), r))
+			loaded, err := LoadPendingPatches(t.Context(), c, r)
+			require.NoError(t, err)
+			require.Len(t, loaded, tc.initial)
+			require.NoError(t, ReconcilePendingPatchesConfigMap(t.Context(), c, r, loaded[:tc.remaining]))
+			r.Status.Phase = velerov1.RestorePhaseCompleted
+			if tc.remaining > 0 {
+				r.Status.Phase = velerov1.RestorePhasePartiallyFailed
+			}
+			require.NoError(t, c.Update(t.Context(), r))
+			require.NoError(t, CleanupPendingSnapshots(t.Context(), c, c, r))
+			assert.Equal(t, tc.creates, creates)
+			assert.Equal(t, tc.reads, reads)
+			assert.Equal(t, tc.deletes, deletes)
+			assert.Equal(t, 1, restoreReads)
+			assert.Equal(t, 1, lists)
+			assert.Equal(t, tc.remaining, r.Status.PendingOwnerRefPatchCount)
+			if tc.remaining > 0 {
+				retained, err := LoadPendingPatches(t.Context(), base, r)
+				require.NoError(t, err)
+				assert.Equal(t, loaded[:tc.remaining], retained)
+			}
+		})
+	}
+}
+
+func TestOwnerRefSnapshotReuseValidatesExistingObject(t *testing.T) {
+	for _, mode := range []string{"valid", "owner", "immutable", "label", "payload"} {
+		t.Run(mode, func(t *testing.T) {
+			r := newOwnerRefRestore()
+			c := newOwnerRefRestoreClient(t)
+			pending := newOwnerRefPendingList(1, 1)
+			require.NoError(t, ReconcilePendingPatchesConfigMap(t.Context(), c, r, pending))
+			cm := &corev1api.ConfigMap{}
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Namespace: r.Namespace, Name: r.Status.PendingPatchesConfigMap}, cm))
+			switch mode {
+			case "owner":
+				cm.OwnerReferences[0].UID = "foreign"
+			case "immutable":
+				cm.Immutable = nil
+			case "label":
+				cm.Labels = nil
+			case "payload":
+				cm.BinaryData[pendingPatchesKey] = []byte("different")
+			}
+			require.NoError(t, c.Update(t.Context(), cm))
+			before := r.DeepCopy()
+			err := ReconcilePendingPatchesConfigMap(t.Context(), c, r, pending)
+			if mode == "valid" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			assert.Equal(t, before.Status, r.Status)
+		})
+	}
 }
