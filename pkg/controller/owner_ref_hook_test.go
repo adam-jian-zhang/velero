@@ -77,8 +77,8 @@ func TestOwnerRefHookOutcomesSurviveFinalizerRetry(t *testing.T) {
 			restore := builder.ForRestore("velero", "restore-hooks").Backup(backup.Name).Phase(velerov1api.RestorePhaseFinalizing).Result()
 			restore.UID = "restore-uid"
 			pendingCount := 1
-			if tc.failure == "load" || tc.failure == "prepare" {
-				pendingCount = 101
+			if tc.failure == "prepare" {
+				pendingCount = 2
 			}
 			pending := make([]velerov1api.PendingPatchRef, pendingCount)
 			for i := range pending {
@@ -89,7 +89,7 @@ func TestOwnerRefHookOutcomesSurviveFinalizerRetry(t *testing.T) {
 				}
 				require.NoError(t, c.Create(t.Context(), &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "work", UID: "child-uid"}}))
 			}
-			storageErrors := pkgrestore.SavePendingPatchesHybrid(t.Context(), c, restore, pending)
+			storageErrors := pkgrestore.SavePendingPatches(t.Context(), c, restore, pending)
 			require.True(t, storageErrors.IsEmpty(), "%+v", storageErrors)
 			for _, obj := range []client.Object{backup, location, restore} {
 				require.NoError(t, c.Create(t.Context(), obj))
@@ -113,7 +113,7 @@ func TestOwnerRefHookOutcomesSurviveFinalizerRetry(t *testing.T) {
 				},
 				Patch: func(ctx context.Context, base client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 					if _, ok := obj.(*velerov1api.Restore); !ok {
-						if tc.failure == "prepare" {
+						if tc.failure == "prepare" && obj.GetName() != "child-0" {
 							return apierrors.NewTooManyRequests("child patch remains pending", 0)
 						}
 						return base.Patch(ctx, obj, patch, opts...)
@@ -173,6 +173,12 @@ func TestOwnerRefHookOutcomesSurviveFinalizerRetry(t *testing.T) {
 			_, err := r.Reconcile(t.Context(), request)
 			require.Error(t, err)
 			require.True(t, faultInjected)
+			if tc.failure != "ambiguous" {
+				durable := &velerov1api.Restore{}
+				require.NoError(t, c.Get(t.Context(), request.NamespacedName, durable))
+				assert.Equal(t, restore.Status.PendingPatchesConfigMap, durable.Status.PendingPatchesConfigMap)
+				assert.Equal(t, pendingCount, durable.Status.PendingOwnerRefPatchCount)
+			}
 			attempted, failed := tracker.Stat(restore.Name)
 			assert.Equal(t, 1, attempted, "retain hook outcomes while the terminal commit is unconfirmed")
 			assert.Equal(t, failedHooks, failed)
@@ -226,7 +232,8 @@ func TestOwnerRefResultsSurviveRestartAfterStatusConflict(t *testing.T) {
 				block := true
 				ref.BlockOwnerDeletion = &block
 			}
-			restore.Status.PendingOwnerRefPatches = []velerov1api.PendingPatchRef{{Version: "v1", Kind: "ConfigMap", Namespace: "work", Name: "child", RestoredUID: "child-uid", OwnerReferences: []metav1.OwnerReference{ref}}}
+			pending := []velerov1api.PendingPatchRef{{Version: "v1", Kind: "ConfigMap", Namespace: "work", Name: "child", RestoredUID: "child-uid", OwnerReferences: []metav1.OwnerReference{ref}}}
+			require.NoError(t, pkgrestore.ReconcilePendingPatchesConfigMap(t.Context(), c, restore, pending))
 			for _, obj := range []client.Object{backup, location, restore, &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "work", Name: "child", UID: "child-uid"}}} {
 				require.NoError(t, c.Create(t.Context(), obj))
 			}
@@ -275,7 +282,8 @@ func TestOwnerRefResultsSurviveRestartAfterStatusConflict(t *testing.T) {
 			}
 			live := &velerov1api.Restore{}
 			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(restore), live))
-			assert.Empty(t, live.Status.PendingOwnerRefPatches)
+			assert.Zero(t, live.Status.PendingOwnerRefPatchCount)
+			assert.Empty(t, live.Status.PendingPatchesConfigMap)
 			assert.Equal(t, 1, live.Status.OwnerRefsRelinked)
 			if diagnostic == "error" {
 				assert.Equal(t, velerov1api.RestorePhasePartiallyFailed, live.Status.Phase)

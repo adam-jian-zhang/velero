@@ -121,7 +121,7 @@ func TestOwnerRefVersionSurvivesPendingPersistence(t *testing.T) {
 	require.Len(t, pending, 1)
 	assert.Equal(t, "example.io/v2", pending[0].OwnerReferences[0].APIVersion)
 	require.NoError(t, ReconcilePendingPatchesConfigMap(t.Context(), base, r, pending))
-	loaded, err := LoadPendingPatchesHybrid(t.Context(), base, r)
+	loaded, err := LoadPendingPatches(t.Context(), base, r)
 	require.NoError(t, err)
 	_, errs, remaining := RetryPendingPatches(t.Context(), base, r, loaded)
 	require.True(t, errs.IsEmpty(), "%+v", errs)
@@ -171,7 +171,7 @@ func TestOwnerRefPass2SharesUIDAcrossVersionsAndRetainsVersionCorrection(t *test
 	assert.Equal(t, "replacement-parent", string(remaining[0].OwnerReferences[0].UID))
 	assert.Equal(t, "example.io/removed", pending[0].OwnerReferences[0].APIVersion, "old durable input must remain untouched")
 	require.NoError(t, ReconcilePendingPatchesConfigMap(t.Context(), base, r, remaining))
-	loaded, err := LoadPendingPatchesHybrid(t.Context(), base, r)
+	loaded, err := LoadPendingPatches(t.Context(), base, r)
 	require.NoError(t, err)
 	assert.Equal(t, remaining, loaded)
 	for _, req := range pending[1:] {

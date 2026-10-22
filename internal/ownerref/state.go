@@ -23,11 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-const (
-	MaxPendingPatches        = 100
-	MaxInlineOwnerReferences = 400
-	MaxTotalPendingPatches   = 10000
-)
+const MaxTotalPendingPatches = 10000
 
 type UIDMappingRecord struct {
 	LiveUID   types.UID

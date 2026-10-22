@@ -265,10 +265,10 @@ func TestOwnerRefTimeoutResolutionAndIndependentPersistence(t *testing.T) {
 	require.Len(t, pending, 101)
 	persist, persistCancel := OwnerRefStageContext(parent, time.Second)
 	defer persistCancel()
-	storageErrs := SavePendingPatchesHybrid(persist, base, r, pending)
+	storageErrs := SavePendingPatches(persist, base, r, pending)
 	assert.True(t, storageErrs.IsEmpty())
 	assert.NotEmpty(t, r.Status.PendingPatchesConfigMap)
-	loaded, err := LoadPendingPatchesHybrid(persist, base, r)
+	loaded, err := LoadPendingPatches(persist, base, r)
 	require.NoError(t, err)
 	assert.Equal(t, pending, loaded)
 	// Pass 2 likewise retains all work after its own child deadline and can

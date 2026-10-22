@@ -759,7 +759,7 @@ func (r *restoreReconciler) runValidatedRestore(ctx context.Context, restore *ap
 		restoreWarnings.Merge(&warnings)
 		restoreErrors.Merge(&errs)
 		persistCtx, persistCancel := pkgrestore.OwnerRefStageContext(parent, r.resourceTimeout)
-		storageErrors := pkgrestore.SavePendingPatchesHybrid(persistCtx, r.kbClient, restore, pending)
+		storageErrors := pkgrestore.SavePendingPatches(persistCtx, r.kbClient, restore, pending)
 		persistCancel()
 		restoreErrors.Merge(&storageErrors)
 	}
