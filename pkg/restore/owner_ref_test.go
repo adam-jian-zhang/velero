@@ -361,6 +361,50 @@ func TestOwnerRefItemLoopRegistersSynchronousAdditionalParents(t *testing.T) {
 	assert.Empty(t, live.GetOwnerReferences())
 }
 
+func TestOwnerRefExcludedChildStillSuppliesParentUID(t *testing.T) {
+	h := newHarness(t)
+	h.AddItems(t, velerotest.Secrets())
+	h.AddItems(t, velerotest.ServiceAccounts())
+	h.DynamicClient.PrependReactor("create", "*", func(action ktesting.Action) (bool, runtime.Object, error) {
+		obj := action.(ktesting.CreateAction).GetObject().(*unstructured.Unstructured).DeepCopy()
+		obj.SetUID(types.UID("created-" + obj.GetName()))
+		err := h.DynamicClient.Tracker().Create(action.GetResource(), obj, action.GetNamespace())
+		return true, obj, err
+	})
+	parent := &corev1api.ServiceAccount{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"}, ObjectMeta: metav1.ObjectMeta{
+		Name: "parent", Namespace: "work", UID: "parent-old",
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Namespace", Name: "work", UID: "namespace-old"}},
+	}}
+	child := &corev1api.Secret{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: metav1.ObjectMeta{
+		Name: "child", Namespace: "work", UID: "child-old",
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "ServiceAccount", Name: parent.Name, UID: parent.UID}},
+	}}
+	scope := ownerref.NewScope()
+	require.NoError(t, scope.MergeConfigMap(&corev1api.ConfigMap{Data: map[string]string{"inScope": "- kind: Secret\n- kind: ServiceAccount"}}, true))
+	require.NoError(t, scope.MergeConfigMap(&corev1api.ConfigMap{Data: map[string]string{"outOfScope": "- kind: ServiceAccount"}}, false))
+	state := ownerref.NewState(scope)
+	request := &Request{
+		Restore: defaultRestore().IncludedResources("secrets", "serviceaccounts").Result(),
+		Backup:  defaultBackup().Result(), Log: h.log, OwnerRefRelink: state,
+		BackupReader: velerotest.NewTarWriter(t).AddItems("secrets", child).AddItems("serviceaccounts", parent).Done(),
+	}
+	warnings, errs := h.restorer.Restore(request, nil, nil)
+	require.True(t, errs.IsEmpty(), "%+v", errs)
+	require.True(t, warnings.IsEmpty(), "%+v", warnings)
+	records, queue := state.Freeze()
+	require.Len(t, queue, 1)
+	assert.Equal(t, "Secret", queue[0].Kind)
+	require.Contains(t, records, types.UID("parent-old"))
+	assert.Equal(t, types.UID("created-parent"), records["parent-old"].LiveUID)
+	resolved := resolveOwnerReferences(queue[0], records, &warnings)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, types.UID("created-parent"), resolved[0].UID)
+	assert.True(t, warnings.IsEmpty(), "%+v", warnings)
+	live, err := h.DynamicClient.Resource(schema.GroupVersionResource{Version: "v1", Resource: "serviceaccounts"}).Namespace("work").Get(t.Context(), "parent", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, live.GetOwnerReferences())
+}
+
 func TestOwnerRefTransportFailuresRemainPending(t *testing.T) {
 	for _, failure := range []error{
 		&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
@@ -390,8 +434,8 @@ func TestOwnerRefTransportFailuresRemainPending(t *testing.T) {
 	}
 }
 
-func TestOwnerRefNamespacesParticipateInRestore(t *testing.T) {
-	for _, mode := range []string{"explicit", "implicit", "additional", "existing equal", "existing different", "existing update"} {
+func TestOwnerRefNamespacesRegisterAsParentsOnly(t *testing.T) {
+	for _, mode := range []string{"explicit", "implicit", "additional", "existing equal", "existing different", "existing update", "synthesized"} {
 		t.Run(mode, func(t *testing.T) {
 			h := newHarness(t)
 			h.AddItems(t, velerotest.Namespaces())
@@ -413,14 +457,14 @@ func TestOwnerRefNamespacesParticipateInRestore(t *testing.T) {
 			ns := &corev1api.Namespace{TypeMeta: root.TypeMeta, ObjectMeta: metav1.ObjectMeta{Name: "work", UID: "namespace-old", OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Namespace", Name: root.Name, UID: root.UID}}}}
 			child := &corev1api.Secret{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: metav1.ObjectMeta{Name: "child", Namespace: ns.Name, UID: "child-old", OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Namespace", Name: ns.Name, UID: ns.UID}}}}
 			r := defaultRestore().Result()
-			if mode == "implicit" || mode == "additional" {
+			if mode == "implicit" || mode == "additional" || mode == "synthesized" {
 				r.Spec.IncludedResources = []string{"secrets"}
 			}
 			existing := mode == "existing equal" || mode == "existing different" || mode == "existing update"
 			if existing {
 				live := ns.DeepCopy()
 				live.UID = "existing-namespace"
-				live.OwnerReferences = nil
+				live.OwnerReferences = []metav1.OwnerReference{{APIVersion: "example.io/v1", Kind: "ClusterOwner", Name: "live-owner", UID: "live-owner-uid"}}
 				if mode != "existing equal" {
 					live.Labels = map[string]string{"changed": "true"}
 				}
@@ -430,9 +474,12 @@ func TestOwnerRefNamespacesParticipateInRestore(t *testing.T) {
 				require.NoError(t, h.KubeClient.Tracker().Add(live))
 			}
 			scope := ownerref.NewScope()
-			require.NoError(t, scope.MergeConfigMap(&corev1api.ConfigMap{Data: map[string]string{"inScope": "- kind: Namespace\n- kind: Secret"}}, false))
+			require.NoError(t, scope.MergeConfigMap(&corev1api.ConfigMap{Data: map[string]string{"inScope": "- kind: Secret\n- kind: PersistentVolumeClaim"}}, false))
 			state := ownerref.NewState(scope)
-			archive := velerotest.NewTarWriter(t).AddItems("namespaces", root, ns).AddItems("secrets", child)
+			archive := velerotest.NewTarWriter(t).AddItems("secrets", child)
+			if mode != "synthesized" {
+				archive.AddItems("namespaces", root, ns)
+			}
 			var actions []riav2.RestoreItemAction
 			if mode == "additional" {
 				// The outer item passes the selector, while its additional item
@@ -455,7 +502,7 @@ func TestOwnerRefNamespacesParticipateInRestore(t *testing.T) {
 			require.True(t, errs.IsEmpty(), "%+v", errs)
 			require.True(t, warnings.IsEmpty(), "%+v", warnings)
 			records, queue := state.Freeze()
-			if mode == "existing different" {
+			if mode == "existing different" || mode == "synthesized" {
 				assert.NotContains(t, records, ns.UID)
 			} else {
 				require.Contains(t, records, ns.UID)
@@ -463,23 +510,53 @@ func TestOwnerRefNamespacesParticipateInRestore(t *testing.T) {
 				assert.False(t, records[ns.UID].Namespaced)
 				assert.NotEqual(t, ns.UID, records[ns.UID].LiveUID)
 			}
-			namespaceRequests := 0
+			require.Len(t, queue, 1, "only the Secret child should be queued, even when a namespace is ensured repeatedly")
 			for _, req := range queue {
-				if req.Kind == "Namespace" {
-					namespaceRequests++
-					assert.Equal(t, types.UID("created-work"), req.RestoredUID)
-					assert.Equal(t, ns.OwnerReferences, req.OwnerReferences)
-				} else if req.Name == "child" && mode != "existing different" {
+				assert.NotEqual(t, "Namespace", req.Kind)
+				if req.Name == "child" && mode != "existing different" && mode != "synthesized" {
 					resolved := resolveOwnerReferences(req, records, &warnings)
 					require.Len(t, resolved, 1)
 					assert.Equal(t, records[ns.UID].LiveUID, resolved[0].UID)
+					// A PVC uses the workload parent filter, not the child deny list.
+					pvc := req
+					pvc.Kind = "PersistentVolumeClaim"
+					require.True(t, scope.IsInScope(schema.GroupVersionKind{Version: "v1", Kind: pvc.Kind}))
+					resolved = resolveOwnerReferences(pvc, records, &warnings)
+					require.Len(t, resolved, 1)
+					assert.Equal(t, records[ns.UID].LiveUID, resolved[0].UID)
+					assert.True(t, warnings.IsEmpty(), "%+v", warnings)
 				}
 			}
+			live, err := h.KubeClient.CoreV1().Namespaces().Get(t.Context(), ns.Name, metav1.GetOptions{})
+			require.NoError(t, err)
 			if existing {
-				assert.Zero(t, namespaceRequests, "existing namespaces must not be relinked")
+				assert.Equal(t, []metav1.OwnerReference{{APIVersion: "example.io/v1", Kind: "ClusterOwner", Name: "live-owner", UID: "live-owner-uid"}}, live.OwnerReferences)
 			} else {
-				assert.Equal(t, 1, namespaceRequests, "ensuring a namespace again must not enqueue it twice")
+				assert.Empty(t, live.OwnerReferences, "new namespaces must retain stripped ownership")
+			}
+			if mode == "synthesized" {
+				assert.Len(t, records, 1, "without an archive Namespace, only the Secret has a backup UID mapping")
 			}
 		})
 	}
+}
+
+func TestOwnerRefPreviouslyPersistedNamespaceStillRetries(t *testing.T) {
+	parent := &corev1api.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "parent", UID: "parent-new"}}
+	child := &corev1api.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "child", UID: "child-uid"}}
+	c := newOwnerRefRestoreClient(t, parent, child)
+	r := newOwnerRefRestore()
+	pending := []velerov1.PendingPatchRef{{
+		Version: "v1", Kind: "Namespace", Name: child.Name, RestoredUID: child.UID,
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Namespace", Name: parent.Name, UID: "parent-old"}},
+	}}
+	require.NoError(t, ReconcilePendingPatchesConfigMap(t.Context(), c, r, pending))
+	saved, err := LoadPendingPatches(t.Context(), c, r)
+	require.NoError(t, err)
+	_, errs, remaining := RetryPendingPatches(t.Context(), c, r, saved)
+	assert.True(t, errs.IsEmpty(), "%+v", errs)
+	assert.Empty(t, remaining)
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(child), child))
+	require.Len(t, child.OwnerReferences, 1)
+	assert.Equal(t, parent.UID, child.OwnerReferences[0].UID)
 }
