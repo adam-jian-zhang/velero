@@ -32,6 +32,7 @@ import (
 )
 
 // Namespaces bypass restoreItem, including those ensured for additional items.
+// Register parent mappings only; child scope always excludes Namespace relinking.
 // Read source metadata from the archive because getNamespace strips UID and owners.
 func (ctx *restoreContext) registerOwnerRefNamespace(path string, desired *corev1api.Namespace, created bool) error {
 	key := path + "/" + desired.Name
