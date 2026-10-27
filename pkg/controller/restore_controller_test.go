@@ -35,7 +35,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/velero-io/velero/internal/resourcemodifiers"
 	"github.com/velero-io/velero/internal/volume"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/builder"
@@ -45,6 +44,7 @@ import (
 	"github.com/velero-io/velero/pkg/plugin/framework"
 	pluginmocks "github.com/velero-io/velero/pkg/plugin/mocks"
 	riav2 "github.com/velero-io/velero/pkg/plugin/velero/restoreitemaction/v2"
+	"github.com/velero-io/velero/pkg/resourcemodifiers"
 	pkgrestore "github.com/velero-io/velero/pkg/restore"
 	velerotest "github.com/velero-io/velero/pkg/test"
 	"github.com/velero-io/velero/pkg/util/logging"

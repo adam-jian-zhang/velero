@@ -43,7 +43,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/velero-io/velero/internal/hook"
-	"github.com/velero-io/velero/internal/resourcemodifiers"
 	"github.com/velero-io/velero/internal/resourcepolicies"
 	"github.com/velero-io/velero/internal/volume"
 	api "github.com/velero-io/velero/pkg/apis/velero/v1"
@@ -54,6 +53,7 @@ import (
 	"github.com/velero-io/velero/pkg/persistence"
 	"github.com/velero-io/velero/pkg/plugin/clientmgmt"
 	"github.com/velero-io/velero/pkg/plugin/framework"
+	"github.com/velero-io/velero/pkg/resourcemodifiers"
 	pkgrestore "github.com/velero-io/velero/pkg/restore"
 	"github.com/velero-io/velero/pkg/util/boolptr"
 	"github.com/velero-io/velero/pkg/util/collections"
