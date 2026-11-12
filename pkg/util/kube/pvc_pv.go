@@ -605,6 +605,23 @@ func MakePodPVCAttachment(volumeName string, volumeMode *corev1api.PersistentVol
 // GetPVForPVC returns the PersistentVolume backing a PVC
 // returns PV, error.
 // PV will be nil on error
+// GetPVForVolumePolicy permits PVC-only matching only when a claim has no
+// assigned volume and is not Bound. An assigned PV lookup must never silently
+// change the set of matching policy rules, even while binding is in progress.
+func GetPVForVolumePolicy(pvc *corev1api.PersistentVolumeClaim, client crclient.Client) (*corev1api.PersistentVolume, error) {
+	if pvc.Spec.VolumeName == "" {
+		if pvc.Status.Phase == corev1api.ClaimBound {
+			return nil, errors.Errorf("bound PVC %s/%s has no assigned PV", pvc.Namespace, pvc.Name)
+		}
+		return nil, nil
+	}
+	pv := new(corev1api.PersistentVolume)
+	if err := client.Get(context.Background(), crclient.ObjectKey{Name: pvc.Spec.VolumeName}, pv); err != nil {
+		return nil, errors.Wrapf(err, "failed to resolve PV %s for PVC %s/%s", pvc.Spec.VolumeName, pvc.Namespace, pvc.Name)
+	}
+	return pv, nil
+}
+
 func GetPVForPVC(
 	pvc *corev1api.PersistentVolumeClaim,
 	crClient crclient.Client,

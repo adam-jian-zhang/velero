@@ -91,6 +91,52 @@ func decodeStruct(r io.Reader, s any) error {
 	return dec.Decode(s)
 }
 
+// validateExcludeTypes checks YAML types before decoding into Go fields, where
+// scalars can otherwise be coerced to strings and null entries discarded.
+func validateExcludeTypes(data string) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(data), &document); err != nil {
+		return err
+	}
+	if len(document.Content) == 0 {
+		return nil
+	}
+	var policyFields struct {
+		VolumePolicies []map[string]yaml.Node `yaml:"volumePolicies"`
+	}
+	if err := document.Decode(&policyFields); err != nil {
+		return err
+	}
+	for i, fields := range policyFields.VolumePolicies {
+		if node, ok := fields[ExcludeParameter]; ok {
+			if node.Kind == yaml.AliasNode {
+				node = *node.Alias
+			}
+			if node.Kind != yaml.SequenceNode {
+				return fmt.Errorf("volumePolicies[%d].exclude must be a list of string patterns", i)
+			}
+			for j, entry := range node.Content {
+				// Resolve aliases while preserving the underlying scalar type.
+				if entry.Kind == yaml.AliasNode {
+					entry = entry.Alias
+				}
+				if entry.Kind != yaml.ScalarNode || entry.Tag != "!!str" {
+					return fmt.Errorf("volumePolicies[%d].exclude[%d] must be a string pattern", i, j)
+				}
+			}
+		}
+		if node, ok := fields[InheritExcludesParameter]; ok {
+			if node.Kind == yaml.AliasNode {
+				node = *node.Alias
+			}
+			if node.Kind != yaml.ScalarNode || node.Tag != "!!bool" {
+				return fmt.Errorf("volumePolicies[%d].inheritExcludes must be a boolean", i)
+			}
+		}
+	}
+	return nil
+}
+
 // validate check action format
 func (a *Action) validate() error {
 	// validate Type
@@ -145,7 +191,7 @@ func (a *Action) validate() error {
 }
 
 func (v *volPolicy) validate() error {
-	if v.exclude != nil {
+	if len(v.exclude) > 0 {
 		for _, pat := range v.exclude {
 			if strings.TrimSpace(pat) == "" {
 				return fmt.Errorf("%s must not contain empty entries", ExcludeParameter)

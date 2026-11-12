@@ -569,6 +569,17 @@ var _ = Describe(
 	ExcludeFilesSnapshotNoDataMoveTest,
 )
 
+var _ = Describe(
+	"Velero fs-backup preserves existing Kopia ignore-file precedence",
+	Label("ResourceFiltering", "ResourcePolicies", "FSBackup", "ExcludeFiles"),
+	ExcludeFilesFSIgnoreFileTest,
+)
+var _ = Describe(
+	"Velero CSI data movement preserves existing Kopia ignore-file precedence",
+	Label("ResourceFiltering", "ResourcePolicies", "CSIDataMover", "ExcludeFiles"),
+	ExcludeFilesCSIIgnoreFileTest,
+)
+
 // backup VolumeInfo test
 var _ = Describe(
 	"",

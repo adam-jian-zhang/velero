@@ -368,7 +368,7 @@ func TestGetMatchAction_PendingLostPVC(t *testing.T) {
 			require.NoError(t, err)
 			obj := &unstructured.Unstructured{Object: pvcData}
 
-			action, err := ib.getMatchAction(obj, kuberesource.PersistentVolumeClaims, csiBIAPluginName)
+			action, err := ib.getMatchAction(obj, kuberesource.PersistentVolumeClaims, csiBIAPluginName, logrus.New())
 			if tc.expectError {
 				require.Error(t, err)
 			} else {

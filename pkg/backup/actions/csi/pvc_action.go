@@ -341,13 +341,6 @@ func (p *pvcBackupItemAction) Execute(
 		return nil, nil, "", nil, err
 	}
 	if !shouldSnapshot {
-		if _, excludeDropped, excludeErr := vh.GetEffectiveExclude(item, kuberesource.PersistentVolumeClaims); excludeErr == nil && excludeDropped {
-			winningAction := "skip"
-			if matched, act, _, _ := vh.GetActionParameters(item, kuberesource.PersistentVolumeClaims); matched {
-				winningAction = act
-			}
-			p.log.Warnf("Volume policy exclusions from global baseline were dropped for volume %s: winning action %q cannot filter source data", pvc.Name, winningAction)
-		}
 		p.log.Debugf("CSI plugin skip snapshot for PVC %s according to the VolumeHelper setting.",
 			pvc.Namespace+"/"+pvc.Name)
 		return nil, nil, "", nil, err
@@ -364,10 +357,25 @@ func (p *pvcBackupItemAction) Execute(
 		}
 	}
 
-	policySnapshotClass, scErr := vh.GetSnapshotClass(item, kuberesource.PersistentVolumeClaims)
-	if scErr != nil {
-		p.log.WithError(scErr).Warn("failed to get snapshotClass from volume policy, proceeding without it")
-	} else if policySnapshotClass != "" {
+	// Resolve once so action, snapshot class, source mode, and patterns share
+	// the same PVC/PV metadata. Fail before creating a snapshot on lookup errors.
+	selectedAction, exclude, excludeDropped, err := vh.ResolveVolumePolicy(item, kuberesource.PersistentVolumeClaims, boolptr.IsSetToTrue(backup.Spec.SnapshotMoveData))
+	if err != nil {
+		return item, nil, "", nil, errors.Wrap(err, "failed to resolve volume policy exclusions")
+	}
+	policySnapshotClass := ""
+	dataMoverFromVolumePolicy := ""
+	if selectedAction != nil {
+		policySnapshotClass, err = selectedAction.GetSnapshotClass()
+		if err != nil {
+			return item, nil, "", nil, err
+		}
+		dataMoverFromVolumePolicy, err = selectedAction.GetDataMover()
+		if err != nil {
+			return item, nil, "", nil, err
+		}
+	}
+	if policySnapshotClass != "" {
 		p.log.Infof("Volume policy specifies snapshotClass=%s for PVC %s/%s", policySnapshotClass, pvc.Namespace, pvc.Name)
 	}
 
@@ -418,19 +426,6 @@ func (p *pvcBackupItemAction) Execute(
 			"Backup":         backup.Name,
 		})
 
-		dataMoverFromVolumePolicy := vh.GetDataMoverFromActionParameters(item, kuberesource.PersistentVolumeClaims)
-
-		exclude, excludeDropped, excludeErr := vh.GetEffectiveExclude(item, kuberesource.PersistentVolumeClaims)
-		if excludeErr != nil {
-			dataUploadLog.WithError(excludeErr).Error("failed to get exclude patterns from volume policies")
-			if deleteErr := p.crClient.Delete(ctx, vs); deleteErr != nil {
-				if !apierrors.IsNotFound(deleteErr) {
-					dataUploadLog.WithError(deleteErr).Error("fail to delete VolumeSnapshot")
-				}
-			}
-			return item, nil, "", nil, nil
-		}
-
 		effectiveMover := backup.Spec.DataMover
 		if dataMoverFromVolumePolicy != "" {
 			effectiveMover = dataMoverFromVolumePolicy
@@ -446,16 +441,11 @@ func (p *pvcBackupItemAction) Execute(
 		}
 
 		if excludeDropped {
-			// Inherited exclude patterns are dropped when the
-			// winning action cannot honor exclusions (skip/custom/velero-block).
-			winningAction := effectiveMover
-			if matched, act, _, _ := vh.GetActionParameters(item, kuberesource.PersistentVolumeClaims); matched {
-				winningAction = act
-				if act == string(resourcepolicies.Snapshot) && effectiveMover != "" {
-					winningAction = effectiveMover
-				}
+			reason := fmt.Sprintf("selected data mover %q", effectiveMover)
+			if effectiveMover != datamover.DataMoverTypeVeleroBlock {
+				reason = "raw-block source"
 			}
-			dataUploadLog.Warnf("Volume policy exclusions from global baseline were dropped for volume %s: winning action %q cannot filter source data", pvc.Name, winningAction)
+			dataUploadLog.Warnf("Volume policy exclusions from global baseline were dropped for PVC %s/%s: %s cannot filter source data", pvc.Namespace, pvc.Name, reason)
 		} else if len(exclude) > 0 {
 			// Log at the wiring point (server process) so the
 			// resolved list lands in the backup logs.
@@ -514,8 +504,8 @@ func (p *pvcBackupItemAction) Execute(
 		// No data movement: no uploader runs for this volume, so volume policy
 		// exclude patterns cannot be applied. Warn instead of silently capturing
 		// an unfiltered snapshot; the backup stays Completed.
-		if exclude, _, excludeErr := vh.GetEffectiveExclude(item, kuberesource.PersistentVolumeClaims); excludeErr != nil {
-			p.log.WithError(excludeErr).Warn("failed to get exclude patterns from volume policies")
+		if excludeDropped {
+			p.log.Warnf("Volume policy exclusions from global baseline were dropped for PVC %s/%s: selected snapshot action uses velero-block, which cannot filter source data; the volume is captured as a full CSI snapshot", pvc.Namespace, pvc.Name)
 		} else if len(exclude) > 0 {
 			p.log.WithField("exclude", exclude).Warnf(
 				"Volume policy exclude patterns are not applied to PVC %s/%s: the backup does not have SnapshotMoveData enabled, so the volume is captured as a full CSI snapshot",

@@ -859,7 +859,7 @@ func TestValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "empty exclude list on skip is rejected",
+			name: "empty exclude list on skip is accepted",
 			res: &ResourcePolicies{
 				Version: "v1",
 				VolumePolicies: []VolumePolicy{
@@ -872,10 +872,10 @@ func TestValidate(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
-			name: "empty exclude list on snapshot with velero-block is rejected",
+			name: "empty exclude list on snapshot with velero-block is accepted",
 			res: &ResourcePolicies{
 				Version: "v1",
 				VolumePolicies: []VolumePolicy{
@@ -891,7 +891,7 @@ func TestValidate(t *testing.T) {
 					},
 				},
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name: "exclude with empty-after-trim entry is rejected",

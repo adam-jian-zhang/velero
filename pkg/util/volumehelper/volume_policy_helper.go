@@ -20,6 +20,8 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/velero-io/velero/internal/resourcepolicies"
 )
 
 // PVCMustInclusionTracker provides read-only checks for whether a PVC is included
@@ -36,5 +38,7 @@ type VolumeHelper interface {
 	GetActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) (bool, string, map[string]any, error)
 	GetSnapshotClass(obj runtime.Unstructured, groupResource schema.GroupResource) (string, error)
 	GetDataMoverFromActionParameters(obj runtime.Unstructured, groupResource schema.GroupResource) string
-	GetEffectiveExclude(obj runtime.Unstructured, groupResource schema.GroupResource) (patterns []string, dropped bool, err error)
+	GetEffectiveExclude(obj runtime.Unstructured, groupResource schema.GroupResource, forDataMovement ...bool) (patterns []string, dropped bool, err error)
+	// ResolveVolumePolicy evaluates action and exclusions against one resolved source.
+	ResolveVolumePolicy(obj runtime.Unstructured, groupResource schema.GroupResource, forDataMovement bool) (*resourcepolicies.Action, []string, bool, error)
 }

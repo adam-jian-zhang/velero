@@ -244,6 +244,10 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 			// already backed up (this would be in a read-write-many scenario,
 			// where it's been backed up from another pod), since we don't need >1 backup per PVC.
 			for _, volume := range pod.Spec.Volumes {
+				if err := ib.checkPodVolumeExclusions(pod, &volume, log); err != nil {
+					backupErrs = append(backupErrs, err)
+					continue
+				}
 				shouldDoFSBackup, err := ib.volumeHelperImpl.ShouldPerformFSBackup(volume, *pod)
 
 				if err != nil {
@@ -415,7 +419,7 @@ func (ib *itemBackupper) executeActions(
 		}
 		log.Info("Executing custom action")
 		actionName := action.Name()
-		if act, err := ib.getMatchAction(obj, groupResource, actionName); err != nil {
+		if act, err := ib.getMatchAction(obj, groupResource, actionName, log); err != nil {
 			return nil, itemFiles, errors.WithStack(err)
 		} else if act != nil && act.Type == resourcepolicies.Skip {
 			log.Infof("Skip executing Backup Item Action: %s of resource %s: %s/%s for the matched resource policies", actionName, groupResource, namespace, name)
@@ -616,10 +620,29 @@ func (ib *itemBackupper) takePVSnapshot(obj runtime.Unstructured, log logrus.Fie
 	}
 
 	log = log.WithField("persistentVolume", pv.Name)
+	var policyVolume resourcepolicies.VolumeFilterData
+	var selectedAction *resourcepolicies.Action
+	if ib.backupRequest.ResPolicies != nil {
+		var err error
+		policyVolume, err = ib.policyVolumeForPV(pv)
+		if err != nil {
+			return err
+		}
+		selectedAction, err = ib.checkSkippedVolumeExclusions(policyVolume, log)
+		if err != nil {
+			return err
+		}
+	}
 
-	snapshotVolume, err := ib.volumeHelperImpl.ShouldPerformSnapshot(obj, kuberesource.PersistentVolumes)
-	if err != nil {
-		return err
+	snapshotVolume := false
+	var err error
+	if selectedAction != nil {
+		snapshotVolume = selectedAction.Type == resourcepolicies.Snapshot
+	} else {
+		snapshotVolume, err = ib.volumeHelperImpl.ShouldPerformSnapshot(obj, kuberesource.PersistentVolumes)
+		if err != nil {
+			return err
+		}
 	}
 
 	if !snapshotVolume {
@@ -648,35 +671,6 @@ func (ib *itemBackupper) takePVSnapshot(obj runtime.Unstructured, log logrus.Fie
 		if features.IsEnabled(velerov1api.CSIFeatureFlag) && pv.Spec.CSI == nil {
 			log.Warn("Cannot use CSI data mover to handle PV, because PV doesn't contain CSI in spec.",
 				" Fall back to Velero native snapshot.")
-		}
-	}
-
-	if ib.backupRequest.ResPolicies != nil {
-		pvc := new(corev1api.PersistentVolumeClaim)
-		if pv.Spec.ClaimRef != nil {
-			err = ib.kbClient.Get(context.Background(), kbClient.ObjectKey{
-				Namespace: pv.Spec.ClaimRef.Namespace,
-				Name:      pv.Spec.ClaimRef.Name},
-				pvc)
-			if err != nil {
-				return err
-			}
-		}
-		vfd := resourcepolicies.NewVolumeFilterData(pv, nil, pvc)
-		if action, err := ib.backupRequest.ResPolicies.GetMatchAction(vfd); err != nil {
-			log.WithError(err).Errorf("Error getting matched resource policies for pv %s", pv.Name)
-			return nil
-		} else if action != nil && action.Type == resourcepolicies.Skip {
-			log.Infof("skip snapshot of pv %s for the matched resource policies", pv.Name)
-			// at this point we are sure this object is PV therefore we'll call the tracker directly
-			pvcName := ""
-			pvcNamespace := ""
-			if pv.Spec.ClaimRef != nil {
-				pvcName = pv.Spec.ClaimRef.Name
-				pvcNamespace = pv.Spec.ClaimRef.Namespace
-			}
-			ib.backupRequest.SkippedVolumeTracker.Track(pv.Name, pvcName, pvcNamespace, volumeSnapshotApproach, "matched action is 'skip' in chosen resource policies")
-			return nil
 		}
 	}
 
@@ -768,6 +762,11 @@ func (ib *itemBackupper) takePVSnapshot(obj runtime.Unstructured, log logrus.Fie
 		pvcNamespace = pv.Spec.ClaimRef.Namespace
 	}
 	ib.backupRequest.SkippedVolumeTracker.Untrack(pv.Name, pvcName, pvcNamespace)
+	if ib.backupRequest.ResPolicies != nil {
+		if err := ib.warnUnappliedVolumeExclusions(policyVolume, log, "native snapshots do not filter source data; the snapshot contains the full volume"); err != nil {
+			return err
+		}
+	}
 	snapshotID, err := volumeSnapshotter.CreateSnapshot(snapshot.Spec.ProviderVolumeID, snapshot.Spec.VolumeAZ, tags)
 	if err != nil {
 		errs = append(errs, errors.Wrap(err, "error taking snapshot of volume"))
@@ -782,23 +781,18 @@ func (ib *itemBackupper) takePVSnapshot(obj runtime.Unstructured, log logrus.Fie
 	return kubeerrs.NewAggregate(errs)
 }
 
-func (ib *itemBackupper) getMatchAction(obj runtime.Unstructured, groupResource schema.GroupResource, backupItemActionName string) (*resourcepolicies.Action, error) {
+func (ib *itemBackupper) getMatchAction(obj runtime.Unstructured, groupResource schema.GroupResource, backupItemActionName string, log logrus.FieldLogger) (*resourcepolicies.Action, error) {
 	if ib.backupRequest.ResPolicies != nil && groupResource == kuberesource.PersistentVolumeClaims && (backupItemActionName == csiBIAPluginName || backupItemActionName == vsphereBIAPluginName) {
 		pvc := &corev1api.PersistentVolumeClaim{}
 		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), pvc); err != nil {
 			return nil, errors.WithStack(err)
 		}
 
-		var pv *corev1api.PersistentVolume
-		if pvName := pvc.Spec.VolumeName; pvName != "" {
-			pv = &corev1api.PersistentVolume{}
-			if err := ib.kbClient.Get(context.Background(), kbClient.ObjectKey{Name: pvName}, pv); err != nil {
-				return nil, errors.WithStack(err)
-			}
+		vfd, err := ib.policyVolumeForPVC(pvc)
+		if err != nil {
+			return nil, err
 		}
-		// If pv is nil for unbound PVCs - policy matching will use PVC-only conditions
-		vfd := resourcepolicies.NewVolumeFilterData(pv, nil, pvc)
-		return ib.backupRequest.ResPolicies.GetMatchAction(vfd)
+		return ib.checkSkippedVolumeExclusions(vfd, log)
 	}
 
 	return nil, nil

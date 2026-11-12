@@ -3705,7 +3705,7 @@ volumePolicies:
 		assert.Equal(t, []string{"*.tmp"}, got)
 	})
 
-	t.Run("skip winning action drops inherited exclude", func(t *testing.T) {
+	t.Run("skip selected action drops inherited exclude", func(t *testing.T) {
 		p := build(t, `version: v1
 volumePolicies:
 - conditions:
@@ -3726,7 +3726,7 @@ volumePolicies:
 		assert.Nil(t, got)
 	})
 
-	t.Run("velero-block winning action drops inherited exclude", func(t *testing.T) {
+	t.Run("velero-block selected action drops inherited exclude", func(t *testing.T) {
 		p := build(t, `version: v1
 volumePolicies:
 - conditions:
@@ -3772,7 +3772,7 @@ volumePolicies:
 		assert.Nil(t, got)
 	})
 
-	t.Run("skip winning action without any exclude does not report dropped", func(t *testing.T) {
+	t.Run("skip selected action without any exclude does not report dropped", func(t *testing.T) {
 		p := build(t, `version: v1
 volumePolicies:
 - conditions:

@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/velero-io/velero/internal/resourcepolicies"
+
 	"github.com/cockroachdb/errors"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -80,8 +82,8 @@ func (c *errorInjectingClient) Create(ctx context.Context, obj crclient.Object, 
 	return c.Client.Create(ctx, obj, opts...)
 }
 
-// stubVolumeHelper is a test double for vhutil.VolumeHelper used to reach
-// Execute branches that validated volume policies cannot (Phase-2 exclude guard).
+// stubVolumeHelper supplies resolved actions and exclusions to test DataUpload
+// preparation independently of policy parsing, including incompatible results.
 type stubVolumeHelper struct {
 	snapshot       bool
 	dataMover      string
@@ -107,36 +109,41 @@ func (s *stubVolumeHelper) GetSnapshotClass(runtime.Unstructured, schema.GroupRe
 func (s *stubVolumeHelper) GetDataMoverFromActionParameters(runtime.Unstructured, schema.GroupResource) string {
 	return s.dataMover
 }
-func (s *stubVolumeHelper) GetEffectiveExclude(runtime.Unstructured, schema.GroupResource) ([]string, bool, error) {
+func (s *stubVolumeHelper) GetEffectiveExclude(runtime.Unstructured, schema.GroupResource, ...bool) ([]string, bool, error) {
 	return s.exclude, s.excludeDropped, nil
+}
+
+func (s *stubVolumeHelper) ResolveVolumePolicy(runtime.Unstructured, schema.GroupResource, bool) (*resourcepolicies.Action, []string, bool, error) {
+	return &resourcepolicies.Action{Type: resourcepolicies.Snapshot, Parameters: map[string]any{resourcepolicies.DataMoverParameter: s.dataMover}}, s.exclude, s.excludeDropped, nil
 }
 
 func TestExecute(t *testing.T) {
 	boolTrue := true
 	tests := []struct {
-		name                 string
-		backup               *velerov1api.Backup
-		pvc                  *corev1api.PersistentVolumeClaim
-		pv                   *corev1api.PersistentVolume
-		sc                   *storagev1api.StorageClass
-		vsClass              *snapshotv1api.VolumeSnapshotClass
-		operationID          string
-		expectedErr          error
-		expectErr            bool // Use bool for cases where we just need to check for any error
-		expectedErrContains  string
-		expectedBackup       *velerov1api.Backup
-		expectedDataUpload   *velerov2alpha1.DataUpload
-		expectedPVC          *corev1api.PersistentVolumeClaim
-		resourcePolicy       *corev1api.ConfigMap
-		globalResourcePolicy *corev1api.ConfigMap
-		extraObjects         []runtime.Object
-		failVSCreate         bool
-		skipVSReadyUpdate    bool // New flag to control VS readiness
-		expectedVSClassName  string
-		volumeHelper         vhutil.VolumeHelper
-		expectNoDataUpload   bool
-		expectNoVS           bool
-		expectLogContains    string
+		name                   string
+		backup                 *velerov1api.Backup
+		pvc                    *corev1api.PersistentVolumeClaim
+		pv                     *corev1api.PersistentVolume
+		sc                     *storagev1api.StorageClass
+		vsClass                *snapshotv1api.VolumeSnapshotClass
+		operationID            string
+		expectedErr            error
+		expectErr              bool // Use bool for cases where we just need to check for any error
+		expectedErrContains    string
+		expectedBackup         *velerov1api.Backup
+		expectedDataUpload     *velerov2alpha1.DataUpload
+		expectedPVC            *corev1api.PersistentVolumeClaim
+		resourcePolicy         *corev1api.ConfigMap
+		globalResourcePolicy   *corev1api.ConfigMap
+		extraObjects           []runtime.Object
+		failVSCreate           bool
+		skipVSReadyUpdate      bool // New flag to control VS readiness
+		expectedVSClassName    string
+		volumeHelper           vhutil.VolumeHelper
+		expectNoDataUpload     bool
+		expectNoVS             bool
+		expectLogContains      string
+		expectNoDroppedWarning bool
 	}{
 		{
 			name:   "Skip PVC BIA when backup is in finalizing phase",
@@ -405,7 +412,7 @@ func TestExecute(t *testing.T) {
 			},
 		},
 		{
-			name:    "Phase-2 exclude guard deletes VolumeSnapshot and skips DataUpload",
+			name:    "incompatible resolved exclusions delete VolumeSnapshot and skip DataUpload",
 			backup:  builder.ForBackup("velero", "test").SnapshotMoveData(true).DataMover("velero-block").CSISnapshotTimeout(1 * time.Minute).Result(),
 			pvc:     builder.ForPersistentVolumeClaim("velero", "testPVC").VolumeName("testPV").StorageClass("testSC").Phase(corev1api.ClaimBound).Result(),
 			pv:      builder.ForPersistentVolume("testPV").CSI("hostpath", "testVolume").Result(),
@@ -429,7 +436,7 @@ func TestExecute(t *testing.T) {
 			expectNoVS:         true,
 		},
 		{
-			name:    "warns when inherited exclude is dropped for a velero-block winning action",
+			name:    "warns when inherited exclude is dropped for a velero-block selected action",
 			backup:  builder.ForBackup("velero", "test").SnapshotMoveData(true).DataMover("velero-block").CSISnapshotTimeout(1 * time.Minute).Result(),
 			pvc:     builder.ForPersistentVolumeClaim("velero", "testPVC").VolumeName("testPV").StorageClass("testSC").Phase(corev1api.ClaimBound).Result(),
 			pv:      builder.ForPersistentVolume("testPV").CSI("hostpath", "testVolume").Result(),
@@ -464,6 +471,64 @@ func TestExecute(t *testing.T) {
 			expectNoDataUpload: true,
 			expectLogContains:  "does not have SnapshotMoveData enabled",
 		},
+	}
+
+	// Reuse the real snapshot/data-upload fixture to exercise source mode and
+	// global-rule provenance through Execute, not a mocked helper.
+	for _, base := range tests {
+		if base.name != "exclude with snapshot velero-fs is copied onto DataUpload" {
+			continue
+		}
+		for _, name := range []string{"raw-block direct", "raw-block selected global", "raw-block inherited", "raw-block reset", "snapshot-only dropped block exclusions", "raw-block snapshot only"} {
+			tc := base
+			tc.name = name
+			tc.backup = base.backup.DeepCopy()
+			tc.pvc = base.pvc.DeepCopy()
+			tc.pv = base.pv.DeepCopy()
+			tc.pvc.Spec.VolumeMode = ptr.To(corev1api.PersistentVolumeBlock)
+			tc.pv.Spec.VolumeMode = ptr.To(corev1api.PersistentVolumeBlock)
+			tc.resourcePolicy = base.resourcePolicy.DeepCopy()
+			tc.expectedDataUpload = base.expectedDataUpload.DeepCopy()
+			tc.expectedDataUpload.Spec.DataMoverConfig = nil
+			if name != "raw-block direct" && name != "raw-block snapshot only" {
+				tc.globalResourcePolicy = base.resourcePolicy.DeepCopy()
+				tc.globalResourcePolicy.Name = "global-policy"
+				tc.backup.Annotations = map[string]string{velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation: "global-policy"}
+				tc.resourcePolicy.Data["policy"] = `{"version":"v1","volumePolicies":[{"conditions":{},"action":{"type":"snapshot","parameters":{"dataMover":"velero-fs"}}}]}`
+			}
+			switch name {
+			case "raw-block direct", "raw-block selected global":
+				if name == "raw-block selected global" {
+					tc.backup.Spec.ResourcePolicy = nil
+					tc.resourcePolicy = nil
+				}
+				tc.expectedDataUpload = nil
+				tc.expectNoDataUpload = true
+				tc.expectNoVS = true
+				tc.expectErr = true
+				tc.expectedErrContains = "raw-block"
+				tc.skipVSReadyUpdate = true
+			case "raw-block inherited":
+				tc.expectLogContains = "raw-block source cannot filter source data"
+			case "raw-block reset":
+				tc.resourcePolicy.Data["policy"] = `{"version":"v1","volumePolicies":[{"conditions":{},"action":{"type":"snapshot"},"inheritExcludes":false}]}`
+				tc.expectNoDroppedWarning = true
+			case "snapshot-only dropped block exclusions":
+				tc.backup.Spec.SnapshotMoveData = ptr.To(false)
+				tc.resourcePolicy.Data["policy"] = `{"version":"v1","volumePolicies":[{"conditions":{},"action":{"type":"snapshot","parameters":{"dataMover":"velero-block"}},"exclude":[]}]}`
+				tc.expectedDataUpload = nil
+				tc.expectNoDataUpload = true
+				tc.expectLogContains = "exclusions from global baseline were dropped"
+			case "raw-block snapshot only":
+				tc.backup.Spec.SnapshotMoveData = ptr.To(false)
+				tc.expectedDataUpload = nil
+				tc.expectNoDataUpload = true
+				tc.expectLogContains = "full CSI snapshot"
+				tc.expectNoDroppedWarning = true
+			}
+			tests = append(tests, tc)
+		}
+		break
 	}
 
 	for _, tc := range tests {
@@ -607,6 +672,12 @@ func TestExecute(t *testing.T) {
 				require.NoError(t, crClient.List(t.Context(), vsList, &crclient.ListOptions{Namespace: tc.pvc.Namespace}))
 				assert.Empty(t, vsList.Items, "VolumeSnapshot should be deleted when exclude is rejected")
 			}
+			if tc.expectNoDroppedWarning {
+				for _, entry := range logHook.AllEntries() {
+					require.NotContains(t, entry.Message, "exclusions from global baseline were dropped")
+				}
+			}
+
 			if tc.expectLogContains != "" {
 				found := false
 				for _, entry := range logHook.AllEntries() {

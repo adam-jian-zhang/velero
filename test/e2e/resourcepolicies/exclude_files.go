@@ -18,6 +18,7 @@ package resourcepolicies
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -54,6 +55,7 @@ type ExcludeFilesCase struct {
 	presentFiles       []string
 	absentFiles        []string
 	filesToWrite       []string
+	ignoreFiles        map[string]string
 }
 
 var ExcludeFilesFSBackupTest = TestFunc(&ExcludeFilesCase{
@@ -92,6 +94,25 @@ volumePolicies:
 	presentFiles: []string{excludeImportantDB},
 	absentFiles:  []string{excludeCacheFile, excludeLogFile},
 })
+
+// Exercise the existing in-volume filter through both real backup/restore paths.
+var ExcludeFilesFSIgnoreFileTest = TestFunc(excludeFilesIgnoreFileCase(false))
+var ExcludeFilesCSIIgnoreFileTest = TestFunc(excludeFilesIgnoreFileCase(true))
+
+func excludeFilesIgnoreFileCase(snapshot bool) *ExcludeFilesCase {
+	action := "fs-backup"
+	if snapshot {
+		action = "snapshot"
+	}
+	return &ExcludeFilesCase{
+		snapshotMoveData: snapshot,
+		yamlConfig:       fmt.Sprintf("version: v1\nvolumePolicies:\n- conditions: {}\n  action: {type: %s}\n  exclude: ['*.tmp']\n", action),
+		filesToWrite:     []string{excludeImportantDB, excludeKeepTmp, excludeOtherTmp, ".kopiaignore"},
+		ignoreFiles:      map[string]string{".kopiaignore": "!keep.tmp\nimportant.db\n"},
+		presentFiles:     []string{excludeKeepTmp},
+		absentFiles:      []string{excludeImportantDB, excludeOtherTmp},
+	}
+}
 
 var ExcludeFilesBlockRejectTest = TestFunc(&ExcludeFilesCase{
 	expectBackupFail: true,
@@ -309,6 +330,13 @@ func (e *ExcludeFilesCase) Backup() error {
 	veleroCfg := e.GetTestCase().VeleroCfg
 	By("Start backup expected to fail validation ......", func() {
 		Expect(VeleroBackupExec(e.Ctx, veleroCfg.VeleroCLI, veleroCfg.VeleroNamespace, e.BackupName, e.BackupArgs)).NotTo(Succeed())
+		out, err := exec.CommandContext(e.Ctx, veleroCfg.VeleroCLI, "--namespace", veleroCfg.VeleroNamespace, "backup", "get", e.BackupName, "-o", "json").Output()
+		Expect(err).NotTo(HaveOccurred())
+		var backup velerov1api.Backup
+		Expect(json.Unmarshal(out, &backup)).To(Succeed())
+		Expect(backup.Status.Phase).To(Equal(velerov1api.BackupPhaseFailedValidation))
+		Expect(strings.Join(backup.Status.ValidationErrors, "\n")).To(ContainSubstring("exclude"))
+		Expect(strings.Join(backup.Status.ValidationErrors, "\n")).To(ContainSubstring("velero-block"))
 	})
 	return nil
 }
@@ -393,6 +421,22 @@ func (e *ExcludeFilesCase) writeFiles(namespace, volName string) error {
 				e.VeleroCfg.WorkerOS,
 			); err != nil {
 				return err
+			}
+		}
+		for name, content := range e.ignoreFiles {
+			args := []string{"exec", "-i", "-n", namespace, "-c", "container-busybox", pod.Name, "--"}
+			path := fmt.Sprintf("/%s/%s", volName, name)
+			if e.VeleroCfg.WorkerOS == common.WorkerOSWindows {
+				path = fmt.Sprintf("C:\\%s\\%s", volName, strings.ReplaceAll(name, "/", "\\"))
+				script := fmt.Sprintf("[IO.File]::WriteAllBytes('%s',[Convert]::FromBase64String('%s'))", path, base64.StdEncoding.EncodeToString([]byte(content)))
+				args = append(args, "powershell", "-NoProfile", "-Command", script)
+			} else {
+				args = append(args, "sh", "-c", "cat > \"$1\"", "--", path)
+			}
+			cmd := exec.CommandContext(e.Ctx, "kubectl", args...)
+			cmd.Stdin = strings.NewReader(content)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("write ignore file %s: %w: %s", name, err, output)
 			}
 		}
 	}

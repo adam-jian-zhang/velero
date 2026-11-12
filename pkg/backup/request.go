@@ -109,6 +109,9 @@ type Request struct {
 	// NamespaceFilterCache memoizes the resolved filter for a given namespace.
 	// sync.Map is used because item backuppers access this concurrently.
 	NamespaceFilterCache sync.Map
+
+	// exclusionWarnings deduplicates warnings across items for one volume.
+	exclusionWarnings sync.Map
 }
 
 // NamespacedFilterPattern pairs a namespace pattern string with its pre-compiled

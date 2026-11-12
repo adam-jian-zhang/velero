@@ -214,9 +214,10 @@ func resultsKey(ns, name string) string {
 
 func (b *backupper) volumeFilterData(pvc *corev1api.PersistentVolumeClaim, volume *corev1api.Volume) (resourcepolicies.VolumeFilterData, error) {
 	if pvc != nil {
-		// Ignore err, if the PV is not available (Pending/Lost PVC or PV fetch failed) - try matching with PVC only
-		// GetPVForPVC returns nil for all error cases
-		pv, _ := kube.GetPVForPVC(pvc, b.crClient)
+		pv, err := kube.GetPVForVolumePolicy(pvc, b.crClient)
+		if err != nil {
+			return resourcepolicies.VolumeFilterData{}, err
+		}
 		return resourcepolicies.NewVolumeFilterData(pv, nil, pvc), nil
 	}
 
@@ -345,19 +346,19 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 				errs = append(errs, errors.Wrapf(err, "error getting match action for volume %s", volumeName))
 				continue
 			}
-			exclude, excludeDropped, err = resPolicies.GetEffectiveExclude(vfd)
+			exclude, excludeDropped, err = resPolicies.GetEffectiveExclude(vfd, true)
 			if err != nil {
 				errs = append(errs, errors.Wrapf(err, "error getting exclude patterns for volume %s", volumeName))
 				continue
 			}
 			if excludeDropped {
-				// The winning action (skip/custom/velero-block) cannot honor
+				// The selected action (skip/custom/velero-block) cannot honor
 				// exclusions; inherited patterns are dropped.
 				actionType := ""
 				if action != nil {
 					actionType = string(action.Type)
 				}
-				log.Warnf("Volume policy exclusions from global baseline were dropped for volume %s of pod %s/%s: winning action %q cannot filter source data", volumeName, pod.Namespace, pod.Name, actionType)
+				log.Warnf("Volume policy exclusions from global baseline were dropped for volume %s of pod %s/%s: selected action %q with source mode %q cannot filter source data", volumeName, pod.Namespace, pod.Name, actionType, vfd.VolumeMode())
 			} else if len(exclude) > 0 {
 				// Log at the wiring point (server process) so the
 				// resolved list lands in the backup logs.

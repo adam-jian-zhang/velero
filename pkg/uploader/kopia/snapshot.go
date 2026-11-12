@@ -168,6 +168,15 @@ func setupPolicy(ctx context.Context, rep repo.RepositoryWriter, sourceInfo snap
 func Backup(ctx context.Context, fsUploader SnapshotUploader, repoWriter repo.RepositoryWriter, sourcePath string, realSource string,
 	forceFull bool, parentSnapshot string, volMode uploader.PersistentVolumeMode, uploaderCfg map[string]string, tags map[string]string,
 	updater uploader.ProgressUpdater, log logrus.FieldLogger) (*uploader.SnapshotInfo, bool, error) {
+	if volMode == uploader.PersistentVolumeBlock {
+		patterns, err := uploaderutil.GetExclude(uploaderCfg)
+		if err != nil {
+			return nil, false, errors.Wrap(err, "failed to read Exclude uploader config")
+		}
+		if len(patterns) > 0 {
+			return nil, false, errors.New("exclude patterns are not supported for raw-block data movement")
+		}
+	}
 	if fsUploader == nil {
 		return nil, false, errors.New("get empty kopia uploader")
 	}
