@@ -1898,6 +1898,40 @@ func TestRestoreControllers_BackupInfoContextPropagation(t *testing.T) {
 	}
 }
 
+func TestRestoreOrderTransientConfigMapErrorRequeues(t *testing.T) {
+	restore := builder.ForRestore("velero", "restore-1").Backup("backup-1").Result()
+	restore.Finalizers = []string{ExternalResourcesFinalizer}
+	restore.Spec.ResourceRestoreOrderRef = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"}
+	cm := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "order"}, Data: map[string]string{restoreorder.ConfigMapKey: "version: v1\nresourceRestoreOrder: []"}}
+	location := builder.ForBackupStorageLocation("velero", "default").Provider("cloud").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	backup := defaultBackup().ObjectMeta(builder.WithName("backup-1")).StorageLocation("default").Phase(velerov1api.BackupPhaseCompleted).Result()
+	failing := true
+	c := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithObjects(restore, cm, location, backup).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1api.ConfigMap); ok && failing {
+				return apierrors.NewServiceUnavailable("api server restarting")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+	store := new(persistencemocks.BackupStore)
+	r := NewRestoreReconciler(t.Context(), "velero", new(fakeRestorer), c, velerotest.NewLogger(), logrus.InfoLevel,
+		func(logrus.FieldLogger) clientmgmt.Manager {
+			t.Fatal("must not start archive download or execution")
+			return nil
+		},
+		NewFakeSingleObjectBackupStoreGetter(store), metrics.NewServerMetrics(), logging.FormatText, time.Minute, time.Minute, false, c, time.Minute, "")
+
+	// A transient read error returns an error for requeue and leaves the Restore new.
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(restore)})
+	require.Error(t, err)
+	failing = false
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(restore), restore))
+	require.NotEqual(t, velerov1api.RestorePhaseFailedValidation, restore.Status.Phase)
+	require.Empty(t, restore.Status.ValidationErrors)
+	store.AssertNotCalled(t, "GetBackupContents", mock.Anything)
+}
+
 func TestRestoreOrderConfigMapFailureBeforeDownload(t *testing.T) {
 	for _, tc := range []struct{ name, namespace, kind, document string }{
 		{"missing", "other", "ConfigMap", "version: v1\nresourceRestoreOrder: []"},

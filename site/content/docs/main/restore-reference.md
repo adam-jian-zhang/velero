@@ -137,11 +137,21 @@ Choose either direction to suit controller behavior: child-first may allow adopt
 
 Server high and low lists and the dedicated CRD pass take precedence. Velero
 sorts unlisted types using all applicable pairs, with alphabetical order for
-ties. An absent archive endpoint is logged and its rule is skipped. Archived
-types still participate in validation when item filters exclude them. Cycles,
-ambiguous server priorities, and conflicting rules produce `FailedValidation`
-before restored-object writes. Use `velero restore describe` for diagnostics.
-Upgrade the server and installed Restore CRD before submitting rules.
+ties. An endpoint that is absent from the backup is logged, reported as a
+restore warning, and its rule is skipped. Names are matched literally, so use
+`deployments.apps`, not `deployments`; the warning suggests archived names that
+share the plural. Archived types still participate in validation when item
+filters exclude them. Cycles, ambiguous server priorities, and conflicting
+rules produce `FailedValidation` before restored-object writes. Use
+`velero restore describe` for diagnostics. Upgrade the server and installed
+Restore CRD before submitting rules.
+
+Because the server lists take precedence, a rule cannot move a type ahead of
+a type in an earlier tier or earlier on the same list. The default high list
+includes types such as `pods`, `replicasets.apps`, `services`, `secrets` and
+`persistentvolumeclaims`, so a rule that requires a type outside the high list
+to be restored before one of them is rejected. Adjust
+`--restore-resource-priorities` on the server to permit such an order.
 
 To reuse rules, set `spec.resourceRestoreOrderRef: {kind: ConfigMap, name: app-order}`
 or pass `--restore-order-configmap app-order`. The ConfigMap must be in the
@@ -149,7 +159,9 @@ Restore’s namespace and contain exactly one data key, `restore-order`, whose
 value is a single document with `version: v1` and a `resourceRestoreOrder` list
 of the same `before`/`after` entries. An explicitly empty list is allowed.
 ConfigMap rules combine with inline rules; neither source overrides the other.
-Missing, malformed, or conflicting configuration causes `FailedValidation`.
+A missing ConfigMap, a read that is forbidden, malformed content, or conflicting
+rules cause `FailedValidation`. A transient failure to read the ConfigMap, such as
+an API server error, retries the restore instead of failing it.
 Velero reads the ConfigMap once per preflight attempt and uses that snapshot
 through execution; later ConfigMap edits do not change an in-progress restore.
 

@@ -26,6 +26,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubetesting "k8s.io/client-go/testing"
 
 	"github.com/velero-io/velero/internal/restoreorder"
@@ -43,12 +44,40 @@ func TestArchivePriorityAliases(t *testing.T) {
 	p := PreparedBackup{resources: catalog}
 	index, err := p.aliases(nil)
 	require.NoError(t, err)
-	helper := test.NewFakeDiscoveryHelper(true, nil)
+	// Discovery cannot resolve these names, so archive and CRD identity applies.
+	helper := test.NewFakeDiscoveryHelper(false, nil)
 	keys, err := index.resolve([]string{"pods", "units", "unmatched", "widgets.example.net"}, catalog, helper)
 	require.NoError(t, err)
 	require.Equal(t, []string{"pods", "units.example.org", "widgets.example.net"}, keys)
 	_, err = index.resolve([]string{"widgets"}, catalog, helper)
 	require.ErrorContains(t, err, "widgets.example.net, widgets.example.org")
+}
+
+func TestDiscoveryResolvedPriorityIsNotRebound(t *testing.T) {
+	catalog := map[string]*archive.ResourceItems{}
+	for _, key := range []string{"pods.example.org", "pods.example.net", "units.example.org"} {
+		catalog[key] = &archive.ResourceItems{GroupResource: key}
+	}
+	p := PreparedBackup{resources: catalog}
+	index, err := p.aliases(nil)
+	require.NoError(t, err)
+
+	// Discovery resolves "pods" to the core type, which is absent from the archive.
+	// The entry is skipped rather than bound, or rejected as ambiguous, because
+	// other groups serve the same plural.
+	helper := test.NewFakeDiscoveryHelper(true, nil)
+	keys, err := index.resolve([]string{"pods", "units"}, catalog, helper)
+	require.NoError(t, err)
+	require.Empty(t, keys)
+
+	// A discovery result that is archived still binds, including a legacy short name.
+	catalog["pods"] = &archive.ResourceItems{GroupResource: "pods"}
+	helper = test.NewFakeDiscoveryHelper(false, map[schema.GroupVersionResource]schema.GroupVersionResource{
+		{Version: "v1", Resource: "po"}: {Version: "v1", Resource: "pods"},
+	})
+	keys, err = index.resolve([]string{"po"}, catalog, helper)
+	require.NoError(t, err)
+	require.Equal(t, []string{"pods"}, keys)
 }
 
 func TestPreparedCRDPassProgress(t *testing.T) {
@@ -120,4 +149,30 @@ func TestUnresolvedRestoreOrderReference(t *testing.T) {
 	r.Spec.ResourceRestoreOrderRef = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"}
 	_, errs := h.restorer.Restore(&Request{Log: h.log, Restore: r}, nil, nil)
 	require.Contains(t, errs.Velero[0], "controller-resolved")
+}
+
+func TestMissingEndpointHint(t *testing.T) {
+	catalog := map[string]*archive.ResourceItems{}
+	for _, key := range []string{"pods", "deployments.apps", "widgets.example.org", "widgets.example.net"} {
+		catalog[key] = &archive.ResourceItems{GroupResource: key}
+	}
+	p := PreparedBackup{resources: catalog}
+	require.Equal(t, " (did you mean deployments.apps?)", p.missingEndpointHint("deployments"))
+	require.Equal(t, " (did you mean widgets.example.net or widgets.example.org?)", p.missingEndpointHint("widgets"))
+	require.Empty(t, p.missingEndpointHint("missings"))
+	require.Empty(t, p.missingEndpointHint("deployments.extensions"))
+}
+
+func TestMissingEndpointWarning(t *testing.T) {
+	h := newHarness(t)
+	h.AddItems(t, test.ServiceAccounts())
+	r := defaultRestore().Result()
+	r.Spec.ResourceRestoreOrder = []api.ResourceRestoreOrder{{Before: "serviceaccount", After: "serviceaccounts"}, {Before: "missings", After: "serviceaccounts"}}
+	req := &Request{Log: h.log, Backup: defaultBackup().Result(), Restore: r,
+		BackupReader: test.NewTarWriter(t).AddItems("serviceaccounts", builder.ForServiceAccount("work", "sa").Result()).Done()}
+	w, e := h.restorer.Restore(req, nil, nil)
+	assertEmptyResults(t, e)
+	require.Len(t, w.Velero, 2)
+	require.Contains(t, w.Velero[0], "endpoint absent from backup: missings; rules naming it were skipped")
+	require.Contains(t, w.Velero[1], "endpoint absent from backup: serviceaccount;")
 }

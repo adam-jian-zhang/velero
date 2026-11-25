@@ -73,12 +73,12 @@ func TestMerge(t *testing.T) {
 		{
 			name:      "tier conflict",
 			rules:     []Rule{{Before: "low2", After: "a"}},
-			wantError: []string{"a -> low2 (server unlisted before low)", "low2 -> a (spec."},
+			wantError: []string{"a -> low2 (server priority: unlisted before low)", "low2 -> a (spec."},
 		},
 		{
 			name:      "CRD conflict",
 			rules:     []Rule{{Before: "a", After: CRDs}},
-			wantError: []string{CRDs + " -> a (server CRD before unlisted)", "a -> " + CRDs + " (spec."},
+			wantError: []string{CRDs + " -> a (server priority: CRD before unlisted)", "a -> " + CRDs + " (spec."},
 		},
 		{
 			name: "cycle excludes a blocked afterResource",
@@ -86,7 +86,7 @@ func TestMerge(t *testing.T) {
 				{Before: "b", After: "a"}, {Before: "c", After: "b"},
 				{Before: "a", After: "c"}, {Before: "b", After: "unrelated"},
 			},
-			wantError: []string{"a -> c (spec.resourceRestoreOrder[2])", "c -> b (spec.resourceRestoreOrder[1])", "b -> a (spec.resourceRestoreOrder[0])"},
+			wantError: []string{"Resource restore order cycle:\n  a -> c (spec.resourceRestoreOrder[2])\n  c -> b", "c -> b (spec.resourceRestoreOrder[1])", "b -> a (spec.resourceRestoreOrder[0])"},
 		},
 	}
 

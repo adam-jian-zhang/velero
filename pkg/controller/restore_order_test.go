@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -38,11 +39,13 @@ func TestResolveRestoreOrder(t *testing.T) {
 	for _, tc := range []struct {
 		name, namespace, data string
 		forbidden             bool
+		transient             bool
 		want                  string
 	}{
 		{name: "combined", namespace: "velero", data: "version: v1\nresourceRestoreOrder:\n- before: betas\n  after: gammas"},
 		{name: "other namespace", namespace: "other", data: "version: v1\nresourceRestoreOrder: []", want: "not found"},
 		{name: "forbidden", namespace: "velero", forbidden: true, want: "forbidden"},
+		{name: "transient", namespace: "velero", transient: true, want: "api server restarting"},
 		{name: "bad document", namespace: "velero", data: "version: v1\nresourceRestoreOrder: null", want: "require version"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,10 +58,13 @@ func TestResolveRestoreOrder(t *testing.T) {
 					if tc.forbidden {
 						return apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, key.Name, nil)
 					}
+					if tc.transient {
+						return apierrors.NewServiceUnavailable("api server restarting")
+					}
 					return c.Get(ctx, key, obj, opts...)
 				},
 			}).Build()
-			r := &restoreReconciler{kbClient: c, logger: velerotest.NewLogger()}
+			r := &restoreReconciler{kbClient: c, globalCrClient: c, logger: velerotest.NewLogger()}
 			restore := builder.ForRestore("velero", "restore").Result()
 			restore.Spec.ResourceRestoreOrder = []api.ResourceRestoreOrder{{Before: "alphas", After: "betas"}}
 			restore.Spec.ResourceRestoreOrderRef = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"}
@@ -66,6 +72,9 @@ func TestResolveRestoreOrder(t *testing.T) {
 			require.Equal(t, 1, reads)
 			if tc.want != "" {
 				require.ErrorContains(t, err, tc.want)
+				var transient *transientRestoreOrderError
+				// Only server-side read failures are retried; every other failure is a validation error.
+				require.Equal(t, tc.transient, errors.As(err, &transient))
 				return
 			}
 			require.NoError(t, err)
@@ -78,4 +87,24 @@ func TestResolveRestoreOrder(t *testing.T) {
 			require.Len(t, restore.Spec.ResourceRestoreOrder, 1)
 		})
 	}
+}
+
+func TestResolveRestoreOrderBypassesConfigMapCache(t *testing.T) {
+	cm := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "order"},
+		Data:       map[string]string{restoreorder.ConfigMapKey: "version: v1\nresourceRestoreOrder:\n- before: alphas\n  after: betas"},
+	}
+	// The ConfigMap exists on the API server but has not reached the cache.
+	cached := velerotest.NewFakeControllerRuntimeClientBuilder(t).Build()
+	uncached := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithObjects(cm).Build()
+	require.True(t, apierrors.IsNotFound(cached.Get(t.Context(), client.ObjectKeyFromObject(cm), new(corev1api.ConfigMap))))
+	r := &restoreReconciler{kbClient: cached, globalCrClient: uncached, logger: velerotest.NewLogger()}
+	restore := builder.ForRestore("velero", "restore").Result()
+	restore.Spec.ResourceRestoreOrderRef = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"}
+
+	rules, err := r.resolveRestoreOrder(t.Context(), restore)
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+	require.Equal(t, "alphas", rules[0].Before)
+	require.Equal(t, "betas", rules[0].After)
 }

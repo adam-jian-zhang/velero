@@ -755,7 +755,10 @@ func (ctx *restoreContext) execute() (results.Result, results.Result) {
 	} else {
 		ctx.log.Infof("Restore resource order: %s", strings.Join(prepared.plan.Order, ", "))
 		for _, key := range prepared.plan.MissingEndpoints {
-			ctx.log.Infof("Restore dependency endpoint absent from backup: %s", key)
+			ctx.log.Infof("Restore order endpoint absent from backup: %s", key)
+			warnings.AddVeleroError(errors.Errorf(
+				"restore order endpoint absent from backup: %s; rules naming it were skipped%s",
+				key, prepared.missingEndpointHint(key)))
 		}
 	}
 	if prepared.emptyWarning != nil {

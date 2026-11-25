@@ -48,9 +48,15 @@ func ConfigMapRules(cm *corev1api.ConfigMap) ([]Rule, error) {
 	if !ok || len(cm.Data) != 1 || len(cm.BinaryData) != 0 {
 		return nil, fmt.Errorf("%s: expected exactly one data entry named %q and no binaryData", source, ConfigMapKey)
 	}
+	// Decode into a private type with explicit yaml tags; the API type only has
+	// json tags and must not depend on yaml's field-name defaults.
+	type entry struct {
+		Before string `yaml:"before"`
+		After  string `yaml:"after"`
+	}
 	var doc struct {
-		Version string                     `yaml:"version"`
-		Rules   []api.ResourceRestoreOrder `yaml:"resourceRestoreOrder"`
+		Version string  `yaml:"version"`
+		Rules   []entry `yaml:"resourceRestoreOrder"`
 	}
 	decoder := yaml.NewDecoder(strings.NewReader(data))
 	decoder.KnownFields(true)
@@ -64,7 +70,11 @@ func ConfigMapRules(cm *corev1api.ConfigMap) ([]Rule, error) {
 	if doc.Version != "v1" || doc.Rules == nil {
 		return nil, fmt.Errorf("%s: require version v1 and a resourceRestoreOrder list (which may be empty)", source)
 	}
-	rules := InlineRules(doc.Rules)
+	entries := make([]api.ResourceRestoreOrder, len(doc.Rules))
+	for i, e := range doc.Rules {
+		entries[i] = api.ResourceRestoreOrder{Before: e.Before, After: e.After}
+	}
+	rules := InlineRules(entries)
 	for i := range rules {
 		rules[i].Source = fmt.Sprintf("%s.resourceRestoreOrder[%d]", source, i)
 	}

@@ -247,6 +247,12 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	backupScheduleName := restore.Spec.ScheduleName
 	rules, orderErr := r.resolveRestoreOrder(ctx, restore)
 	if orderErr != nil {
+		var transient *transientRestoreOrderError
+		if errors.As(orderErr, &transient) {
+			// Leave the Restore in phase New and retry with a fresh read.
+			log.WithError(orderErr).Warn("Unable to read the restore-order ConfigMap; requeueing")
+			return ctrl.Result{}, orderErr
+		}
 		restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, orderErr.Error())
 	}
 	var prepared *pkgrestore.PreparedBackup

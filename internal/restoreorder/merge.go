@@ -30,6 +30,11 @@ import (
 // CRDs identifies the resource handled by the dedicated first pass.
 const CRDs = "customresourcedefinitions.apiextensions.k8s.io"
 
+const (
+	cycleHeading = "Resource restore order cycle:"
+	priorityHint = "Server restore priorities take precedence; adjust --restore-resource-priorities to permit this order."
+)
+
 // Rule retains the origin of an ordering relationship for validation diagnostics.
 // An empty Source denotes the corresponding inline Restore spec index.
 type Rule struct {
@@ -145,8 +150,8 @@ func Merge(archive, high, low []string, rules []Rule) (Plan, error) {
 			if after.tier == before.tier {
 				precedence = fmt.Sprintf("%s list positions %d and %d", after.tier, after.rank+1, before.rank+1)
 			}
-			return Plan{}, fmt.Errorf("resource restore order cycle: %s -> %s (server %s), %s -> %s (%s)",
-				afterResource, beforeResource, precedence, beforeResource, afterResource, rule.source(index))
+			return Plan{}, fmt.Errorf("%s\n  %s -> %s (server priority: %s)\n  %s -> %s (%s)\n%s", cycleHeading,
+				afterResource, beforeResource, precedence, beforeResource, afterResource, rule.source(index), priorityHint)
 		}
 		if before.tier != middleTier || after.tier != middleTier {
 			continue
@@ -188,7 +193,7 @@ func Merge(archive, high, low []string, rules []Rule) (Plan, error) {
 			steps = append(steps, fmt.Sprintf("%s -> %s (%s)",
 				from, to, rules[ruleIndices[edge{from: from, to: to}]].source(ruleIndices[edge{from: from, to: to}])))
 		}
-		return Plan{}, fmt.Errorf("resource restore order cycle: %s", strings.Join(steps, ", "))
+		return Plan{}, fmt.Errorf("%s\n  %s", cycleHeading, strings.Join(steps, "\n  "))
 	}
 
 	plan := Plan{Order: slices.Concat(groups[crdTier], groups[highTier], orderedMiddle, groups[lowTier])}

@@ -71,6 +71,26 @@ func extractBackup(reader io.Reader, fs filesystem.Interface, log logrus.FieldLo
 	return p, nil
 }
 
+// missingEndpointHint suggests canonical names when an unqualified endpoint
+// matches the plural of an archived type in another API group, for example
+// "deployments" versus "deployments.apps".
+func (p *PreparedBackup) missingEndpointHint(name string) string {
+	if strings.Contains(name, ".") {
+		return ""
+	}
+	var matches []string
+	for key := range p.resources {
+		if gr := schema.ParseGroupResource(key); gr.Group != "" && gr.Resource == name {
+			matches = append(matches, key)
+		}
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	slices.Sort(matches)
+	return fmt.Sprintf(" (did you mean %s?)", strings.Join(matches, " or "))
+}
+
 // RestoreOrderError describes a rule or priority conflict suitable for status.validationErrors.
 type RestoreOrderError struct{ error }
 
@@ -173,19 +193,26 @@ func (index aliasIndex) resolve(entries []string, catalog map[string]*archive.Re
 				candidates[key.String()] = true
 			}
 		}
-		for key := range index[gr.Resource] {
-			add(schema.ParseGroupResource(key))
-		}
 		mapped, _, err := helper.ResourceFor(gr.WithVersion(""))
 		if err == nil {
-			add(mapped.GroupResource())
-		} else {
-			var ambiguous *meta.AmbiguousResourceError
-			if errors.As(err, &ambiguous) {
-				for _, candidate := range ambiguous.MatchingResources {
-					add(candidate.GroupResource())
-				}
+			// Target discovery is authoritative when it resolves the entry, as in the
+			// legacy traversal. An unarchived result skips the entry; it must not be
+			// rebound to a same-plural type from another API group.
+			if key := mapped.GroupResource().String(); catalog[key] != nil {
+				keys = append(keys, key)
 			}
+			continue
+		}
+		// Discovery cannot resolve the entry, for example because the API is
+		// served by a backed-up CRD. Fall back to archive and CRD identity.
+		var ambiguous *meta.AmbiguousResourceError
+		if errors.As(err, &ambiguous) {
+			for _, candidate := range ambiguous.MatchingResources {
+				add(candidate.GroupResource())
+			}
+		}
+		for key := range index[gr.Resource] {
+			add(schema.ParseGroupResource(key))
 		}
 		matches := slices.Sorted(maps.Keys(candidates))
 		switch len(matches) {

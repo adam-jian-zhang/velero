@@ -1,0 +1,1 @@
+Add per-restore resource-type ordering: Restore spec.resourceRestoreOrder and spec.resourceRestoreOrderRef (ConfigMap) with the repeatable `velero restore create --restore-before BEFORE:AFTER` and `--restore-order-configmap` flags, combined with the server restore priorities and validated before any restored-object write

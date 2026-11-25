@@ -42,6 +42,9 @@ func TestConfigMapRules(t *testing.T) {
 		{"invalid endpoint", strings.ReplaceAll(valid, "tasks.tekton.dev", "pods/status"), false},
 		{"multiple documents", valid + "---\nversion: v1\nresourceRestoreOrder: []", false},
 		{"duplicate key", valid + "version: v1", false},
+		{"duplicate rule key", strings.ReplaceAll(valid, "  after:", "  before: pods.\n  after:"), false},
+		{"json document", `{"version":"v1","resourceRestoreOrder":[{"before":"tasks.tekton.dev","after":"pipelines.tekton.dev"}]}`, true},
+		{"json unknown field", `{"version":"v1","resourceRestoreOrder":[{"before":"a","after":"b","extra":1}]}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cm := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "order"}, Data: map[string]string{ConfigMapKey: tc.data}}
