@@ -44,6 +44,7 @@ import (
 
 	"github.com/velero-io/velero/internal/hook"
 	"github.com/velero-io/velero/internal/resourcepolicies"
+	"github.com/velero-io/velero/internal/restoreorder"
 	"github.com/velero-io/velero/internal/volume"
 	api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/constant"
@@ -243,14 +244,29 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Validate the restore and fetch the backup
 	info, resourceModifiers, restoreResPolicies := r.validateAndComplete(ctx, restore)
 
-	// Register attempts after validation so we don't have to fetch the backup multiple times
 	backupScheduleName := restore.Spec.ScheduleName
-	r.metrics.RegisterRestoreAttempt(backupScheduleName)
-
+	rules, orderErr := r.resolveRestoreOrder(ctx, restore)
+	if orderErr != nil {
+		restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, orderErr.Error())
+	}
+	var prepared *pkgrestore.PreparedBackup
+	if len(restore.Status.ValidationErrors) == 0 && (len(rules) > 0 || restore.Spec.ResourceRestoreOrderRef != nil) {
+		prepared, err = r.prepareRestore(restore, info, rules)
+		var invalid *pkgrestore.RestoreOrderError
+		switch {
+		case err == nil:
+			defer prepared.Close()
+		case errors.As(err, &invalid):
+			restore.Status.ValidationErrors = append(restore.Status.ValidationErrors, invalid.Error())
+		default:
+			restore.Status.Phase = api.RestorePhaseFailed
+			restore.Status.FailureReason = fmt.Sprintf("restore preparation failed: %v", err)
+			restore.Status.CompletionTimestamp = &metav1.Time{Time: r.clock.Now()}
+		}
+	}
 	if len(restore.Status.ValidationErrors) > 0 {
 		restore.Status.Phase = api.RestorePhaseFailedValidation
-		r.metrics.RegisterRestoreValidationFailed(backupScheduleName)
-	} else {
+	} else if restore.Status.Phase != api.RestorePhaseFailed {
 		restore.Status.StartTimestamp = &metav1.Time{Time: r.clock.Now()}
 		restore.Status.Phase = api.RestorePhaseInProgress
 	}
@@ -264,8 +280,8 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// patch to update status and persist to API
-	// This is patching from "" or New, no retry needed
-	err = kubeutil.PatchResource(original, restore, r.kbClient)
+	// Bind the decision to the validated spec, including when the first rule is added.
+	err = r.kbClient.Patch(ctx, restore, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{}))
 	if err != nil {
 		// return the error so the restore can be re-processed; it's currently
 		// still in phase = New.
@@ -276,11 +292,17 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// store ref to just-updated item for creating patch
 	original = restore.DeepCopy()
 
-	if restore.Status.Phase == api.RestorePhaseFailedValidation {
+	r.metrics.RegisterRestoreAttempt(backupScheduleName)
+	switch restore.Status.Phase {
+	case api.RestorePhaseFailed:
+		r.metrics.RegisterRestoreFailed(backupScheduleName)
+		return ctrl.Result{}, nil
+	case api.RestorePhaseFailedValidation:
+		r.metrics.RegisterRestoreValidationFailed(backupScheduleName)
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.runValidatedRestore(ctx, restore, info, resourceModifiers, restoreResPolicies); err != nil {
+	if err := r.runValidatedRestore(ctx, restore, info, resourceModifiers, restoreResPolicies, prepared); err != nil {
 		log.WithError(err).Debug("Restore failed")
 		restore.Status.Phase = api.RestorePhaseFailed
 		restore.Status.FailureReason = fmt.Sprintf("restore execution failed: %v", err)
@@ -585,11 +607,27 @@ func fetchBackupInfoInternal(ctx context.Context, kbClient client.Client, namesp
 	}, nil
 }
 
+func (r *restoreReconciler) prepareRestore(restore *api.Restore, info backupInfo, rules []restoreorder.Rule) (*pkgrestore.PreparedBackup, error) {
+	log := r.logger.WithField("restore", kubeutil.NamespaceAndName(restore))
+	manager := r.newPluginManager(log)
+	defer manager.CleanupClients()
+	store, err := r.backupStoreGetter.Get(info.location, manager, log)
+	if err != nil {
+		return nil, err
+	}
+	file, err := downloadToTempFile(restore.Spec.BackupName, store, log)
+	if err != nil {
+		return nil, err
+	}
+	defer closeAndRemoveFile(file, log)
+	return r.restorer.Prepare(file, rules, log)
+}
+
 // runValidatedRestore takes a validated restore API object and executes the restore process.
 // The log and results files are uploaded to backup storage. Any error returned from this function
 // means that the restore failed. This function updates the restore API object with warning and error
 // counts, but *does not* update its phase or patch it via the API.
-func (r *restoreReconciler) runValidatedRestore(ctx context.Context, restore *api.Restore, info backupInfo, resourceModifiers *resourcemodifiers.ResourceModifiers, restoreResPolicies *resourcepolicies.Policies) error {
+func (r *restoreReconciler) runValidatedRestore(ctx context.Context, restore *api.Restore, info backupInfo, resourceModifiers *resourcemodifiers.ResourceModifiers, restoreResPolicies *resourcepolicies.Policies, prepared *pkgrestore.PreparedBackup) error {
 	// instantiate the per-restore logger that will output both to a temp file
 	// (for upload to object storage) and to stdout.
 	restoreLog, err := logging.NewTempFileLogger(r.restoreLogLevel, r.logFormat, nil, logrus.Fields{"restore": kubeutil.NamespaceAndName(restore)})
@@ -612,11 +650,15 @@ func (r *restoreReconciler) runValidatedRestore(ctx context.Context, restore *ap
 	}
 	actionsResolver := framework.NewRestoreItemActionResolverV2(actions)
 
-	backupFile, err := downloadToTempFile(restore.Spec.BackupName, backupStore, restoreLog)
-	if err != nil {
-		return errors.Wrap(err, "error downloading backup")
+	var reader io.Reader
+	if prepared == nil {
+		backupFile, err := downloadToTempFile(restore.Spec.BackupName, backupStore, restoreLog)
+		if err != nil {
+			return errors.Wrap(err, "error downloading backup")
+		}
+		defer closeAndRemoveFile(backupFile, r.logger)
+		reader = backupFile
 	}
-	defer closeAndRemoveFile(backupFile, r.logger)
 
 	listOpts := &client.ListOptions{
 		LabelSelector: labels.Set(map[string]string{
@@ -666,7 +708,8 @@ func (r *restoreReconciler) runValidatedRestore(ctx context.Context, restore *ap
 		Backup:                        info.backup,
 		PodVolumeBackups:              podVolumeBackups,
 		VolumeSnapshots:               volumeSnapshots,
-		BackupReader:                  backupFile,
+		BackupReader:                  reader,
+		Prepared:                      prepared,
 		ResourceModifiers:             resourceModifiers,
 		ResPolicies:                   restoreResPolicies,
 		DisableInformerCache:          r.disableInformerCache,

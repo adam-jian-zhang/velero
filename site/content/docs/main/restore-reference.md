@@ -116,6 +116,43 @@ packageinstalls.packaging.carvel.dev
 ```
 
 
+### Order resource types for one restore
+
+Use `--restore-before A:B` once per pair to restore A before B. For example:
+
+```shell
+velero restore create app --from-backup app-backup \
+  --restore-before tasks.tekton.dev:pipelines.tekton.dev \
+  --restore-before pipelines.tekton.dev:pipelineruns.tekton.dev
+```
+
+In a Restore manifest, set `spec.resourceRestoreOrder` to a list of objects with
+`before` and `after` fields. Use canonical plural names, including the
+API group for non-core types. The `before` type’s standard traversal pass
+finishes before the `after` type’s pass across the selected namespaces. Plugin
+additional items and on-demand namespace creation retain their existing timing.
+Asynchronous operations and application readiness can extend beyond a pass.
+
+Choose either direction to suit controller behavior: child-first may allow adoption, while another controller may need parent-first. Velero infers no order from references or ownership, implements no adoption, and does not guarantee application recovery. Reverse both example pairs to request PipelineRuns → Pipelines → Tasks.
+
+Server high and low lists and the dedicated CRD pass take precedence. Velero
+sorts unlisted types using all applicable pairs, with alphabetical order for
+ties. An absent archive endpoint is logged and its rule is skipped. Archived
+types still participate in validation when item filters exclude them. Cycles,
+ambiguous server priorities, and conflicting rules produce `FailedValidation`
+before restored-object writes. Use `velero restore describe` for diagnostics.
+Upgrade the server and installed Restore CRD before submitting rules.
+
+To reuse rules, set `spec.resourceRestoreOrderRef: {kind: ConfigMap, name: app-order}`
+or pass `--restore-order-configmap app-order`. The ConfigMap must be in the
+Restore’s namespace and contain exactly one data key, `restore-order`, whose
+value is a single document with `version: v1` and a `resourceRestoreOrder` list
+of the same `before`/`after` entries. An explicitly empty list is allowed.
+ConfigMap rules combine with inline rules; neither source overrides the other.
+Missing, malformed, or conflicting configuration causes `FailedValidation`.
+Velero reads the ConfigMap once per preflight attempt and uses that snapshot
+through execution; later ConfigMap edits do not change an in-progress restore.
+
 ## Restoring Persistent Volumes and Persistent Volume Claims
 
 Velero has three approaches when restoring a PV, depending on how the backup was taken.

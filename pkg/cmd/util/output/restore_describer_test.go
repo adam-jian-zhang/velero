@@ -465,7 +465,9 @@ func TestDescribeRestore(t *testing.T) {
 		ExistingVolumeDataPolicy(string(velerov1api.VolumeDataPolicyTypeFull)).
 		Result()
 
+	restore.Spec.ResourceRestoreOrderRef = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"}
 	out := DescribeRestore(context.Background(), kbClient, restore, nil, false, false, "")
+	assert.Contains(t, out, "velero/order (ConfigMap)")
 	assert.Contains(t, out, "Existing Resource Policy:      update")
 	assert.Contains(t, out, "Existing Volume Data Policy:   full")
 }

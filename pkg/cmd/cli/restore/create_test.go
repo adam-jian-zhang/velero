@@ -88,6 +88,7 @@ func TestCreateCommand(t *testing.T) {
 		o := NewCreateOptions()
 		o.BindFlags(flags)
 
+		require.NoError(t, flags.Parse([]string{"--restore-order-configmap", "app-order", "--restore-before", "configmaps:widgets.example.com", "--restore-before", "widgets.example.com:gadgets.example.com"}))
 		flags.Parse([]string{"--from-backup", backupName})
 		flags.Parse([]string{"--from-schedule", scheduleName})
 		flags.Parse([]string{"--restore-volumes", restoreVolumes})
@@ -130,6 +131,16 @@ func TestCreateCommand(t *testing.T) {
 		//cmd
 		e = o.Run(cmd, f)
 		require.NoError(t, e)
+
+		var stored velerov1api.Restore
+		require.NoError(t, client.Get(t.Context(), kbclient.ObjectKey{Namespace: f.Namespace(), Name: o.RestoreName}, &stored))
+		require.Equal(t, []velerov1api.ResourceRestoreOrder{{Before: "configmaps", After: "widgets.example.com"}, {Before: "widgets.example.com", After: "gadgets.example.com"}}, stored.Spec.ResourceRestoreOrder)
+		require.Equal(t, "app-order", stored.Spec.ResourceRestoreOrderRef.Name)
+		require.Equal(t, "ConfigMap", stored.Spec.ResourceRestoreOrderRef.Kind)
+		for _, bad := range []string{"pods", "pods:pods", "pods:secrets:configmaps", "/pods:secrets", "pods=secrets", ":pods", "pods:", " pods:secrets", "pods:secrets "} {
+			o.ResourceRestoreOrder = []string{bad}
+			require.Error(t, o.Run(cmd, f))
+		}
 
 		require.Equal(t, backupName, o.BackupName)
 		require.Equal(t, scheduleName, o.ScheduleName)

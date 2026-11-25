@@ -2637,12 +2637,35 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 		},
 	}
 
+	// Include one ordered restore with an action that pulls its dependent
+	// forward during the Pod pass, while the target namespace is created on demand.
+	ordered := defaultRestore().Result()
+	ordered.Spec.ResourceRestoreOrder = []velerov1api.ResourceRestoreOrder{{Before: "pods", After: "persistentvolumes"}}
+	orderedCase := tests[0]
+	orderedCase.name = "ordered Pod pass can restore a requested PV immediately"
+	orderedCase.restore = ordered
+	orderedCase.apiResources = []*test.APIResource{test.Pods(), test.PVs()}
+	orderedCase.tarball = test.NewTarWriter(t).AddItems("pods", builder.ForPod("ns-1", "pod-1").Result()).AddItems("persistentvolumes", builder.ForPersistentVolume("pv-1").Result()).Done()
+	orderedCase.actions = []riav2.RestoreItemAction{&pluggableAction{
+		selector: velero.ResourceSelector{IncludedResources: []string{"pods"}},
+		executeFunc: func(input *velero.RestoreItemActionExecuteInput) (*velero.RestoreItemActionExecuteOutput, error) {
+			return &velero.RestoreItemActionExecuteOutput{UpdatedItem: input.Item, AdditionalItems: []velero.ResourceIdentifier{{GroupResource: kuberesource.PersistentVolumes, Name: "pv-1"}}}, nil
+		},
+	}}
+	orderedCase.want = map[*test.APIResource][]string{test.Pods(): {"ns-1/pod-1"}, test.PVs(): {"/pv-1"}}
+	tests = append(tests, orderedCase)
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 
 			for _, r := range tc.apiResources {
 				h.AddItems(t, r)
+			}
+
+			recorder := &createRecorder{t: t}
+			if tc.restore == ordered {
+				h.DynamicClient.PrependReactor("create", "*", recorder.reactor())
 			}
 
 			data := &Request{
@@ -2661,6 +2684,11 @@ func TestRestoreActionAdditionalItems(t *testing.T) {
 
 			assertEmptyResults(t, warnings, errs)
 			assertAPIContents(t, h, tc.want)
+			if tc.restore == ordered {
+				assertResourceCreationOrder(t, []string{"persistentvolumes", "pods"}, recorder.resources)
+				_, err := h.KubeClient.CoreV1().Namespaces().Get(t.Context(), "ns-1", metav1.GetOptions{})
+				require.NoError(t, err)
+			}
 		})
 	}
 }

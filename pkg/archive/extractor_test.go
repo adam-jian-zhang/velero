@@ -145,7 +145,9 @@ func TestUnzipAndExtractBackupRejectsLargeFile(t *testing.T) {
 func TestUnzipAndExtractBackupRejectsManySmallFiles(t *testing.T) {
 	SetMaxExtractionSize(1024)
 	defer SetMaxExtractionSize(16 * 1024 * 1024 * 1024)
-	ext := NewExtractor(test.NewLogger(), test.NewFakeFileSystem())
+	temp := t.TempDir()
+	t.Setenv("TMPDIR", temp)
+	ext := NewExtractor(test.NewLogger(), filesystem.NewFileSystem())
 
 	var buf bytes.Buffer
 	gzw := gzip.NewWriter(&buf)
@@ -172,6 +174,9 @@ func TestUnzipAndExtractBackupRejectsManySmallFiles(t *testing.T) {
 	_, err := ext.UnzipAndExtractBackup(&buf)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "decompressed backup exceeds maximum allowed size")
+	entries, err := os.ReadDir(temp)
+	require.NoError(t, err)
+	require.Empty(t, entries, "partial extraction must be removed")
 }
 
 func TestSanitizeArchivePath(t *testing.T) {

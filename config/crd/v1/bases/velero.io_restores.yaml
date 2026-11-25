@@ -470,6 +470,50 @@ spec:
                 - name
                 type: object
                 x-kubernetes-map-type: atomic
+              resourceRestoreOrder:
+                description: ResourceRestoreOrder supplements server restore priorities
+                  with per-restore pass ordering.
+                items:
+                  description: ResourceRestoreOrder orders the standard restore passes
+                    of two canonical resource types.
+                  properties:
+                    after:
+                      description: After is the canonical resource whose pass must
+                        follow Before.
+                      type: string
+                    before:
+                      description: Before is the plural resource name whose pass must
+                        come first, qualified with its API group for non-core resources.
+                      type: string
+                  required:
+                  - after
+                  - before
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+              resourceRestoreOrderRef:
+                description: |-
+                  ResourceRestoreOrderRef references a ConfigMap in this Restore's namespace.
+                  Its restore-order data entry supplies rules combined with ResourceRestoreOrder.
+                nullable: true
+                properties:
+                  apiGroup:
+                    description: |-
+                      APIGroup is the group for the resource being referenced.
+                      If APIGroup is not specified, the specified Kind must be in the core API group.
+                      For any other third-party types, APIGroup is required.
+                    type: string
+                  kind:
+                    description: Kind is the type of resource being referenced
+                    type: string
+                  name:
+                    description: Name is the name of resource being referenced
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+                x-kubernetes-map-type: atomic
               restorePVs:
                 description: |-
                   RestorePVs specifies whether to restore all included

@@ -19,24 +19,31 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/velero-io/velero/internal/hook"
+	"github.com/velero-io/velero/internal/restoreorder"
 	"github.com/velero-io/velero/internal/volume"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/builder"
@@ -50,6 +57,7 @@ import (
 	"github.com/velero-io/velero/pkg/resourcemodifiers"
 	pkgrestore "github.com/velero-io/velero/pkg/restore"
 	velerotest "github.com/velero-io/velero/pkg/test"
+	priority "github.com/velero-io/velero/pkg/types"
 	"github.com/velero-io/velero/pkg/util/logging"
 	"github.com/velero-io/velero/pkg/util/results"
 )
@@ -302,6 +310,163 @@ func TestRestoreReconcile_CSISnapshotTimeoutDefaulting(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, tc.expectedCSITimeout, restorer.calledWithArg.Spec.CSISnapshotTimeout.Duration)
+		})
+	}
+}
+
+// preflightRestorer uses real archive preparation and records execution separately.
+type preflightRestorer struct {
+	pkgrestore.Restorer
+	executions int
+}
+
+func (r *preflightRestorer) RestoreWithResolvers(req *pkgrestore.Request, _ framework.RestoreItemActionResolverV2, _ pkgrestore.VolumeSnapshotterGetter) (results.Result, results.Result) {
+	r.executions++
+	if req.Prepared == nil || req.BackupReader != nil {
+		panic("expected the previously prepared archive")
+	}
+	return results.Result{}, results.Result{}
+}
+
+func TestRestorePreflightRevision(t *testing.T) {
+	valid := []velerov1api.ResourceRestoreOrder{{Before: "betas", After: "alphas"}}
+	cycle := append(append([]velerov1api.ResourceRestoreOrder{}, valid...), velerov1api.ResourceRestoreOrder{Before: "alphas", After: "betas"})
+	for _, tc := range []struct {
+		name                    string
+		initial, edited         []velerov1api.ResourceRestoreOrder
+		executions, downloads   int
+		badArchive              bool
+		configMap, snapshotOnly bool
+	}{
+		{"first rule added", nil, cycle, 0, 1, false, false, false},
+		{"valid becomes cyclic", valid, cycle, 0, 2, false, false, false},
+		{"cycle corrected", cycle, valid, 1, 2, false, false, false},
+		{"first rule added to unreadable backup", nil, valid, 0, 1, true, false, false},
+		{"ConfigMap valid becomes cyclic", valid, cycle, 0, 2, false, true, false},
+		{"ConfigMap cycle corrected", cycle, valid, 1, 2, false, true, false},
+		{"ConfigMap snapshot survives change", valid, cycle, 1, 1, false, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			temp := t.TempDir()
+			t.Setenv("TMPDIR", temp)
+			restore := builder.ForRestore("velero", "restore-1").Backup("backup-1").Result()
+			restore.Finalizers = []string{ExternalResourcesFinalizer}
+			restore.Spec.ResourceRestoreOrder = tc.initial
+			config := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "velero", Name: "order"}}
+			setRules := func(rules []velerov1api.ResourceRestoreOrder) {
+				data, err := json.Marshal(struct {
+					Version string                             `json:"version"`
+					Rules   []velerov1api.ResourceRestoreOrder `json:"resourceRestoreOrder"`
+				}{"v1", rules})
+				require.NoError(t, err)
+				config.Data = map[string]string{restoreorder.ConfigMapKey: string(data)}
+			}
+			setRules(tc.initial)
+			if tc.configMap {
+				restore.Spec.ResourceRestoreOrder = nil
+				restore.Spec.ResourceRestoreOrderRef = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"}
+			}
+			configReads := 0
+			location := builder.ForBackupStorageLocation("velero", "default").Provider("cloud").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+			backup := defaultBackup().ObjectMeta(builder.WithName("backup-1")).StorageLocation("default").Phase(velerov1api.BackupPhaseCompleted).Result()
+			edit := true
+			fakeClient := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithObjects(restore, backup, location, config).WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*corev1api.ConfigMap); ok && key.Name == "order" {
+						configReads++
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if edit {
+						edit = false
+						current := new(velerov1api.Restore)
+						require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(obj), current))
+						if tc.configMap {
+							require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(config), config))
+							setRules(tc.edited)
+							require.NoError(t, c.Update(ctx, config))
+							if tc.snapshotOnly {
+								return c.Patch(ctx, obj, patch, opts...)
+							}
+							current.Annotations = map[string]string{"force-revision-conflict": "true"}
+						} else {
+							current.Spec.ResourceRestoreOrder = tc.edited
+						}
+						require.NoError(t, c.Update(ctx, current))
+					}
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+			}).Build()
+			log := velerotest.NewLogger()
+			kr, err := pkgrestore.NewKubernetesRestorer(velerotest.NewFakeDiscoveryHelper(false, nil), nil, priority.Priorities{}, nil, nil, 0, 0, 0, log, nil, nil, nil, fakeClient, nil)
+			require.NoError(t, err)
+			restorer := &preflightRestorer{Restorer: kr}
+			store := new(persistencemocks.BackupStore)
+			data := velerotest.NewTarWriter(t).Add("resources/alphas/cluster/a.json", []byte("{}")).Add("resources/betas/cluster/b.json", []byte("{}")).Done().Bytes()
+			if tc.badArchive {
+				data = []byte("corrupt archive")
+			}
+			store.On("GetBackupContents", "backup-1").Return(func(string) io.ReadCloser { return io.NopCloser(bytes.NewReader(data)) }, nil).Times(tc.downloads)
+			manager := new(pluginmocks.Manager)
+			manager.On("CleanupClients").Return()
+			if tc.executions > 0 {
+				manager.On("GetRestoreItemActionsV2").Return(nil, nil)
+				store.On("GetCSIVolumeSnapshots", "backup-1").Return([]*snapshotv1api.VolumeSnapshot{}, nil)
+				store.On("GetBackupVolumeInfos", "backup-1").Return([]*volume.BackupVolumeInfo{}, nil)
+				store.On("GetBackupVolumeSnapshots", "backup-1").Return([]*volume.Snapshot{}, nil)
+				for _, method := range []string{"PutRestoreLog", "PutRestoreResults"} {
+					store.On(method, "backup-1", "restore-1", mock.Anything).Return(nil)
+				}
+				for _, method := range []string{"PutRestoredResourceList", "PutRestoreItemOperations", "PutRestoreVolumeInfo"} {
+					store.On(method, "restore-1", mock.Anything).Return(nil)
+				}
+			}
+			m := metrics.NewServerMetrics()
+			r := NewRestoreReconciler(t.Context(), "velero", restorer, fakeClient, log, logrus.InfoLevel, func(logrus.FieldLogger) clientmgmt.Manager { return manager }, NewFakeSingleObjectBackupStoreGetter(store), m, logging.FormatText, time.Minute, time.Minute, false, fakeClient, time.Minute, "")
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(restore)}
+			_, err = r.Reconcile(t.Context(), req)
+			if tc.snapshotOnly {
+				require.NoError(t, err)
+			} else {
+				require.True(t, apierrors.IsConflict(err), "%v", err)
+			}
+			attempt := m.Metrics()["restore_attempt_total"].(*prometheus.CounterVec).WithLabelValues("")
+			if !tc.snapshotOnly {
+				require.Zero(t, promtest.ToFloat64(attempt))
+				require.Zero(t, restorer.executions)
+				files, err := os.ReadDir(temp)
+				require.NoError(t, err)
+				require.Empty(t, files)
+				_, err = r.Reconcile(t.Context(), req)
+				require.NoError(t, err)
+			}
+			require.Equal(t, float64(1), promtest.ToFloat64(attempt))
+			require.Equal(t, tc.executions, restorer.executions)
+			require.NoError(t, fakeClient.Get(t.Context(), req.NamespacedName, restore))
+			if tc.badArchive {
+				require.Equal(t, velerov1api.RestorePhaseFailed, restore.Status.Phase)
+				require.NotEmpty(t, restore.Status.FailureReason)
+				require.NotNil(t, restore.Status.CompletionTimestamp)
+				require.Empty(t, restore.Status.ValidationErrors)
+			} else if tc.executions == 0 {
+				require.Equal(t, velerov1api.RestorePhaseFailedValidation, restore.Status.Phase)
+				require.Contains(t, restore.Status.ValidationErrors[0], "cycle")
+			} else {
+				require.Empty(t, restore.Status.ValidationErrors)
+			}
+			if tc.configMap {
+				expectedReads := 2
+				if tc.snapshotOnly {
+					expectedReads = 1
+				}
+				require.Equal(t, expectedReads, configReads)
+				require.Empty(t, restore.Spec.ResourceRestoreOrder)
+			}
+			remaining, err := os.ReadDir(temp)
+			require.NoError(t, err)
+			require.Empty(t, remaining)
+			store.AssertExpectations(t)
 		})
 	}
 }
@@ -1550,6 +1715,12 @@ type fakeRestorer struct {
 	kbClient       client.Client
 }
 
+func (r *fakeRestorer) Prepare(reader io.Reader, rules []restoreorder.Rule, log logrus.FieldLogger) (*pkgrestore.PreparedBackup, error) {
+	res := r.Called(reader, rules, log)
+	prepared, _ := res.Get(0).(*pkgrestore.PreparedBackup)
+	return prepared, res.Error(1)
+}
+
 func (r *fakeRestorer) Restore(
 	info *pkgrestore.Request,
 	actions []riav2.RestoreItemAction,
@@ -1723,6 +1894,37 @@ func TestRestoreControllers_BackupInfoContextPropagation(t *testing.T) {
 					assert.Equal(t, "sentinel", got.Value(restoreCtxKey{}), "%s should use the reconcile context", call)
 				}
 			}
+		})
+	}
+}
+
+func TestRestoreOrderConfigMapFailureBeforeDownload(t *testing.T) {
+	for _, tc := range []struct{ name, namespace, kind, document string }{
+		{"missing", "other", "ConfigMap", "version: v1\nresourceRestoreOrder: []"},
+		{"malformed", "velero", "ConfigMap", "["},
+		{"unsupported reference", "velero", "Secret", "version: v1\nresourceRestoreOrder: []"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := builder.ForRestore("velero", "restore-1").Backup("backup-1").Result()
+			restore.Finalizers = []string{ExternalResourcesFinalizer}
+			restore.Spec.ResourceRestoreOrderRef = &corev1api.TypedLocalObjectReference{Kind: tc.kind, Name: "order"}
+			cm := &corev1api.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: tc.namespace, Name: "order"}, Data: map[string]string{restoreorder.ConfigMapKey: tc.document}}
+			location := builder.ForBackupStorageLocation("velero", "default").Provider("cloud").Bucket("bucket").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+			backup := defaultBackup().ObjectMeta(builder.WithName("backup-1")).StorageLocation("default").Phase(velerov1api.BackupPhaseCompleted).Result()
+			c := velerotest.NewFakeControllerRuntimeClientBuilder(t).WithObjects(restore, cm, location, backup).Build()
+			store := new(persistencemocks.BackupStore)
+			r := NewRestoreReconciler(t.Context(), "velero", new(fakeRestorer), c, velerotest.NewLogger(), logrus.InfoLevel,
+				func(logrus.FieldLogger) clientmgmt.Manager {
+					t.Fatal("must not start archive download or execution")
+					return nil
+				},
+				NewFakeSingleObjectBackupStoreGetter(store), metrics.NewServerMetrics(), logging.FormatText, time.Minute, time.Minute, false, c, time.Minute, "")
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(restore)})
+			require.NoError(t, err)
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(restore), restore))
+			require.Equal(t, velerov1api.RestorePhaseFailedValidation, restore.Status.Phase)
+			require.NotEmpty(t, restore.Status.ValidationErrors)
+			store.AssertNotCalled(t, "GetBackupContents", mock.Anything)
 		})
 	}
 }

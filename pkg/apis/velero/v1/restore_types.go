@@ -22,8 +22,27 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// ResourceRestoreOrder orders the standard restore passes of two canonical resource types.
+type ResourceRestoreOrder struct {
+	// Before is the plural resource name whose pass must come first, qualified with its API group for non-core resources.
+	Before string `json:"before"`
+	// After is the canonical resource whose pass must follow Before.
+	After string `json:"after"`
+}
+
 // RestoreSpec defines the specification for a Velero restore.
 type RestoreSpec struct {
+	// ResourceRestoreOrder supplements server restore priorities with per-restore pass ordering.
+	// +optional
+	// +listType=atomic
+	ResourceRestoreOrder []ResourceRestoreOrder `json:"resourceRestoreOrder,omitempty"`
+
+	// ResourceRestoreOrderRef references a ConfigMap in this Restore's namespace.
+	// Its restore-order data entry supplies rules combined with ResourceRestoreOrder.
+	// +optional
+	// +nullable
+	ResourceRestoreOrderRef *corev1api.TypedLocalObjectReference `json:"resourceRestoreOrderRef,omitempty"`
+
 	// BackupName is the unique name of the Velero backup to restore
 	// from.
 	// +optional

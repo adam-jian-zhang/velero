@@ -172,6 +172,8 @@ func TestDescribeRestoreSpecInSF(t *testing.T) {
 			name: "included namespaces wildcard treated as all",
 			spec: velerov1api.RestoreSpec{
 				BackupName:               "backup-2",
+				ResourceRestoreOrderRef:  &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"},
+				ResourceRestoreOrder:     []velerov1api.ResourceRestoreOrder{{Before: "configmaps", After: "widgets.example.org"}},
 				IncludedNamespaces:       []string{"*"},
 				ExcludedNamespaces:       []string{"kube-system"},
 				IncludedResources:        []string{"pods", "configmaps"},
@@ -195,6 +197,8 @@ func TestDescribeRestoreSpecInSF(t *testing.T) {
 					"labelSelector":            emptyDisplay,
 					"orLabelSelectors":         emptyDisplay,
 					"restorePVs":               "auto",
+					"resourceRestoreOrderRef":  &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: "order"},
+					"resourceRestoreOrder":     []velerov1api.ResourceRestoreOrder{{Before: "configmaps", After: "widgets.example.org"}},
 					"existingResourcePolicy":   string(velerov1api.ResourcePolicyTypeUpdate),
 					"existingVolumeDataPolicy": string(velerov1api.VolumeDataPolicyTypeFull),
 					"itemOperationTimeout":     "0s",

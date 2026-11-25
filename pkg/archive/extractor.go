@@ -100,13 +100,20 @@ func sanitizeArchivePath(destDir, sourcePath string) (targetPath string, err err
 	return targetPath, nil
 }
 
-func (e *Extractor) readBackup(tarRdr *tar.Reader) (string, error) {
+func (e *Extractor) readBackup(tarRdr *tar.Reader) (out string, err error) {
 	dir, err := e.fs.TempDir("", "")
 	if err != nil {
 		e.log.Infof("error creating temp dir: %v", err)
 		return "", err
 	}
 
+	defer func() {
+		if err != nil {
+			if cleanupErr := e.fs.RemoveAll(dir); cleanupErr != nil {
+				e.log.WithError(cleanupErr).Warnf("removing partial backup directory %s", dir)
+			}
+		}
+	}()
 	for {
 		header, err := tarRdr.Next()
 

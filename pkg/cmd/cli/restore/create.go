@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -32,6 +33,7 @@ import (
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/velero-io/velero/internal/resourcepolicies"
+	"github.com/velero-io/velero/internal/restoreorder"
 	api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/client"
 	"github.com/velero-io/velero/pkg/cmd"
@@ -89,6 +91,8 @@ Notes:
 }
 
 type CreateOptions struct {
+	ResourceRestoreOrder        []string
+	RestoreOrderConfigMap       string
 	BackupName                  string
 	ScheduleName                string
 	RestoreName                 string
@@ -137,6 +141,8 @@ func NewCreateOptions() *CreateOptions {
 }
 
 func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
+	flags.StringVar(&o.RestoreOrderConfigMap, "restore-order-configmap", "", "ConfigMap in the Restore namespace containing restore-order rules (combined with --restore-before).")
+	flags.StringArrayVar(&o.ResourceRestoreOrder, "restore-before", nil, "Restore BEFORE before AFTER using BEFORE:AFTER pass ordering (repeatable, canonical resource names).")
 	flags.StringVar(&o.BackupName, "from-backup", "", "Backup to restore from")
 	flags.StringVar(&o.ScheduleName, "from-schedule", "", "Schedule to restore from")
 	flags.Var(&o.IncludeNamespaces, "include-namespaces", "Namespaces to include in the restore (use '*' for all namespaces)")
@@ -351,6 +357,23 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		}
 	}
 
+	var rules []api.ResourceRestoreOrder
+	for _, pair := range o.ResourceRestoreOrder {
+		before, after, ok := strings.Cut(pair, ":")
+		if !ok || before == "" || after == "" || strings.Contains(after, ":") {
+			return fmt.Errorf("invalid restore order %q: expected BEFORE:AFTER", pair)
+		}
+		rules = append(rules, api.ResourceRestoreOrder{Before: before, After: after})
+	}
+	if err := restoreorder.Validate(restoreorder.InlineRules(rules)); err != nil {
+		return err
+	}
+
+	var orderRef *corev1api.TypedLocalObjectReference
+	if o.RestoreOrderConfigMap != "" {
+		orderRef = &corev1api.TypedLocalObjectReference{Kind: "ConfigMap", Name: o.RestoreOrderConfigMap}
+	}
+
 	restore := &api.Restore{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   f.Namespace(),
@@ -359,6 +382,8 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 			Annotations: o.Annotations.Data(),
 		},
 		Spec: api.RestoreSpec{
+			ResourceRestoreOrder:        rules,
+			ResourceRestoreOrderRef:     orderRef,
 			BackupName:                  o.BackupName,
 			ScheduleName:                o.ScheduleName,
 			IncludedNamespaces:          o.IncludeNamespaces,

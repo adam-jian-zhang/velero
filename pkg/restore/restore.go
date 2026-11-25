@@ -57,6 +57,7 @@ import (
 	"github.com/velero-io/velero/internal/credentials"
 	"github.com/velero-io/velero/internal/hook"
 	"github.com/velero-io/velero/internal/resourcepolicies"
+	"github.com/velero-io/velero/internal/restoreorder"
 	"github.com/velero-io/velero/internal/volume"
 	velerov1api "github.com/velero-io/velero/pkg/apis/velero/v1"
 	"github.com/velero-io/velero/pkg/archive"
@@ -96,6 +97,7 @@ type VolumeSnapshotterGetter interface {
 
 // Restorer knows how to restore a backup.
 type Restorer interface {
+	Prepare(io.Reader, []restoreorder.Rule, logrus.FieldLogger) (*PreparedBackup, error)
 	// Restore restores the backup data from backupReader, returning warnings and errors.
 	Restore(req *Request,
 		actions []riav2.RestoreItemAction,
@@ -191,6 +193,22 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 	restoreItemActionResolver framework.RestoreItemActionResolverV2,
 	volumeSnapshotterGetter VolumeSnapshotterGetter,
 ) (results.Result, results.Result) {
+	// Direct callers can supply a reader instead of controller-prepared input.
+	prepared := req.Prepared
+	if prepared == nil && req.Restore.Spec.ResourceRestoreOrderRef != nil {
+		return results.Result{}, results.Result{Velero: []string{"resourceRestoreOrderRef requires controller-resolved, prepared restore input"}}
+	}
+	if prepared == nil && len(req.Restore.Spec.ResourceRestoreOrder) > 0 {
+		if err := restoreorder.Validate(restoreorder.InlineRules(req.Restore.Spec.ResourceRestoreOrder)); err != nil {
+			return results.Result{}, results.Result{Velero: []string{err.Error()}}
+		}
+		var err error
+		prepared, err = kr.Prepare(req.BackupReader, restoreorder.InlineRules(req.Restore.Spec.ResourceRestoreOrder), req.Log)
+		if err != nil {
+			return results.Result{}, results.Result{Velero: []string{err.Error()}}
+		}
+		defer prepared.Close()
+	}
 	// metav1.LabelSelectorAsSelector converts a nil LabelSelector to a
 	// Nothing Selector, i.e. a selector that matches nothing. We want
 	// a selector that matches everything. This can be accomplished by
@@ -334,6 +352,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 	restoreCtx := &restoreContext{
 		backup:                         req.Backup,
 		backupReader:                   req.BackupReader,
+		prepared:                       prepared,
 		restore:                        req.Restore,
 		resourceIncludesExcludes:       resourceIncludesExcludes,
 		resourceStatusIncludesExcludes: restoreStatusIncludesExcludes,
@@ -384,6 +403,7 @@ func (kr *kubernetesRestorer) RestoreWithResolvers(
 type restoreContext struct {
 	backup                         *velerov1api.Backup
 	backupReader                   io.Reader
+	prepared                       *PreparedBackup
 	restore                        *velerov1api.Restore
 	restoreDir                     string
 	resourceIncludesExcludes       *collections.IncludesExcludes
@@ -723,17 +743,27 @@ func (ctx *restoreContext) execute() (results.Result, results.Result) {
 
 	ctx.log.Infof("Starting restore of backup %s", kube.NamespaceAndName(ctx.backup))
 
-	dir, err := archive.NewExtractor(ctx.log, ctx.fileSystem).UnzipAndExtractBackup(ctx.backupReader)
-	if err != nil {
-		ctx.log.Infof("error unzipping and extracting: %v", err)
-		errs.AddVeleroError(err)
+	prepared := ctx.prepared
+	var err error
+	if prepared == nil {
+		prepared, err = extractBackup(ctx.backupReader, ctx.fileSystem, ctx.log)
+		if err != nil {
+			errs.AddVeleroError(err)
+			return warnings, errs
+		}
+		defer prepared.Close()
+	} else {
+		ctx.log.Infof("Restore resource order: %s", strings.Join(prepared.plan.Order, ", "))
+		for _, key := range prepared.plan.MissingEndpoints {
+			ctx.log.Infof("Restore dependency endpoint absent from backup: %s", key)
+		}
+	}
+	if prepared.emptyWarning != nil {
+		warnings.AddVeleroError(prepared.emptyWarning)
 		return warnings, errs
 	}
-	defer func() {
-		if err := ctx.fileSystem.RemoveAll(dir); err != nil {
-			ctx.log.Errorf("error removing temporary directory %s: %s", dir, err.Error())
-		}
-	}()
+	ctx.restoreDir = prepared.dir
+	backupResources := prepared.resources
 
 	// Need to stop all informers if enabled
 	if !ctx.disableInformerCache {
@@ -749,21 +779,6 @@ func (ctx *restoreContext) execute() (results.Result, results.Result) {
 			ctx.dynamicInformerFactory.cancel()
 			// After upgrading to client-go 0.27 or newer, also call Shutdown for each informer factory
 		}()
-	}
-
-	// Need to set this for additionalItems to be restored.
-	ctx.restoreDir = dir
-
-	backupResources, err := archive.NewParser(ctx.log, ctx.fileSystem).Parse(ctx.restoreDir)
-	// If ErrNotExist occurs, it implies that the backup to be restored includes zero items.
-	// Need to add a warning about it and jump out of the function.
-	if errors.Is(err, archive.ErrNotExist) {
-		warnings.AddVeleroError(errors.Wrap(err, "zero items to be restored"))
-		return warnings, errs
-	}
-	if err != nil {
-		errs.AddVeleroError(errors.Wrap(err, "error parsing backup contents"))
-		return warnings, errs
 	}
 
 	// Expand wildcard patterns in namespace includes/excludes if needed
@@ -821,12 +836,13 @@ func (ctx *restoreContext) execute() (results.Result, results.Result) {
 	// First restore CRDs. This is needed so that they are available in the cluster
 	// when getOrderedResourceCollection is called again on the whole backup and
 	// needs to validate all resources listed.
+	crdKey := "customresourcedefinitions"
+	planned := ctx.prepared != nil
+	if planned {
+		crdKey = restoreorder.CRDs
+	}
 	crdResourceCollection, processedResources, w, e := ctx.getOrderedResourceCollection(
-		backupResources,
-		make([]restoreableResource, 0),
-		sets.New[string](),
-		types.Priorities{HighPriorities: []string{"customresourcedefinitions"}},
-		false,
+		backupResources, nil, sets.New[string](), []string{crdKey}, planned,
 	)
 	warnings.Merge(&w)
 	errs.Merge(&e)
@@ -868,12 +884,20 @@ func (ctx *restoreContext) execute() (results.Result, results.Result) {
 	}
 
 	// Restore everything else
-	selectedResourceCollection, _, w, e := ctx.getOrderedResourceCollection(
-		backupResources,
-		crdResourceCollection,
-		processedResources,
-		ctx.resourcePriorities,
-		true,
+	var keys []string
+	var selectedResourceCollection []restoreableResource
+	if planned {
+		keys = prepared.plan.Order
+		if len(keys) > 0 && keys[0] == restoreorder.CRDs {
+			keys = keys[1:]
+		}
+	} else {
+		keys = getOrderedResources(ctx.resourcePriorities, backupResources)
+		selectedResourceCollection = crdResourceCollection
+		processedItems, totalItems = 0, 0
+	}
+	selectedResourceCollection, _, w, e = ctx.getOrderedResourceCollection(
+		backupResources, selectedResourceCollection, processedResources, keys, planned,
 	)
 	warnings.Merge(&w)
 	errs.Merge(&e)
@@ -905,9 +929,7 @@ func (ctx *restoreContext) execute() (results.Result, results.Result) {
 		ctx.dynamicInformerFactory.factory.WaitForCacheSync(ctx.dynamicInformerFactory.context.Done())
 	}
 
-	// reset processedItems and totalItems before processing full resource list
-	processedItems = 0
-	totalItems = 0
+	// Include the main collection in the progress estimate.
 	for _, selectedResource := range selectedResourceCollection {
 		totalItems += selectedResource.totalItems
 	}
@@ -2654,40 +2676,22 @@ func (ctx *restoreContext) getOrderedResourceCollection(
 	backupResources map[string]*archive.ResourceItems,
 	restoreResourceCollection []restoreableResource,
 	processedResources sets.Set[string],
-	resourcePriorities types.Priorities,
-	includeAllResources bool,
+	resourceList []string,
+	canonical bool,
 ) ([]restoreableResource, sets.Set[string], results.Result, results.Result) {
 	var warnings, errs results.Result
-	// Iterate through an ordered list of resources to restore, checking each
-	// one to see if it should be restored. Note that resources *may* be in this
-	// list twice, i.e. once due to being a prioritized resource, and once due
-	// to being in the backup tarball. We can't de-dupe this upfront, because
-	// it's possible that items in the prioritized resources list may not be
-	// fully resolved group-resource strings (e.g. may be specified as "po"
-	// instead of "pods"), and we don't want to fully resolve them via discovery
-	// until we reach them in the loop, because it is possible that the
-	// resource/API itself is being restored via a custom resource definition,
-	// meaning it's not available via discovery prior to beginning the restore.
-	//
-	// Since we keep track of the fully-resolved group-resources that we *have*
-	// restored, we won't try to restore a resource twice even if it's in the
-	// ordered list twice.
-	var resourceList []string
-	if includeAllResources {
-		resourceList = getOrderedResources(resourcePriorities, backupResources)
-	} else {
-		resourceList = resourcePriorities.HighPriorities
-	}
 	for _, resource := range resourceList {
 		groupResource := schema.ParseGroupResource(resource)
 		// try to resolve the resource via discovery to a complete group/version/resource
-		gvr, _, err := ctx.discoveryHelper.ResourceFor(groupResource.WithVersion(""))
-		if err != nil {
-			// don't skip if we can't resolve the resource via discovery, log it
-			// the gv of this resource may be changed in a RIA, we can try to get it after that
-			ctx.log.WithField("resource", resource).Infof("resource cannot be resolved via discovery")
-		} else {
-			groupResource = gvr.GroupResource()
+		if !canonical {
+			gvr, _, err := ctx.discoveryHelper.ResourceFor(groupResource.WithVersion(""))
+			if err != nil {
+				// don't skip if we can't resolve the resource via discovery, log it
+				// the gv of this resource may be changed in a RIA, we can try to get it after that
+				ctx.log.WithField("resource", resource).Infof("resource cannot be resolved via discovery")
+			} else {
+				groupResource = gvr.GroupResource()
+			}
 		}
 
 		// Check if we've already restored this resource (this would happen if

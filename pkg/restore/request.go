@@ -52,6 +52,7 @@ func resourceKey(obj runtime.Object) string {
 }
 
 type Request struct {
+	Prepared *PreparedBackup
 	*velerov1api.Restore
 
 	Log                           logrus.FieldLogger

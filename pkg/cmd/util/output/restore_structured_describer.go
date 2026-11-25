@@ -190,6 +190,12 @@ func describeRestoreSpecInSF(d *StructuredDescriber, spec velerov1api.RestoreSpe
 	specInfo["restorePVs"] = BoolPointerString(spec.RestorePVs, "false", "true", "auto")
 
 	// existing resource policy
+	if spec.ResourceRestoreOrderRef != nil {
+		specInfo["resourceRestoreOrderRef"] = spec.ResourceRestoreOrderRef
+	}
+	if len(spec.ResourceRestoreOrder) > 0 {
+		specInfo["resourceRestoreOrder"] = spec.ResourceRestoreOrder
+	}
 	if spec.ExistingResourcePolicy != "" {
 		specInfo["existingResourcePolicy"] = string(spec.ExistingResourcePolicy)
 	} else {

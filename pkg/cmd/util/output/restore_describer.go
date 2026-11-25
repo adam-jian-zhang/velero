@@ -187,6 +187,15 @@ func DescribeRestore(
 
 		d.Println()
 		s = emptyDisplay
+		if ref := restore.Spec.ResourceRestoreOrderRef; ref != nil {
+			d.Printf("Resource Restore Order Reference: %s/%s (%s)\n", restore.Namespace, ref.Name, ref.Kind)
+		}
+		if len(restore.Spec.ResourceRestoreOrder) > 0 {
+			d.Printf("Resource Restore Order:\n")
+			for _, rule := range restore.Spec.ResourceRestoreOrder {
+				d.Printf("  %s before %s\n", rule.Before, rule.After)
+			}
+		}
 		if restore.Spec.ExistingResourcePolicy != "" {
 			s = string(restore.Spec.ExistingResourcePolicy)
 		}
